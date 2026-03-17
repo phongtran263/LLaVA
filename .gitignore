@@ -24,6 +24,7 @@ output
 
 checkpoints
 ckpts*
+playground/data/LLaVA-Pretrain
 
 .ipynb_checkpoints
 *.ipynb
