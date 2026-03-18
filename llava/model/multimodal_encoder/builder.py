@@ -3,7 +3,7 @@ import os
 from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2
 from .pix2struct_encoder import Pix2StructVisionTower
 from .dinov2_encoder import DINOv2VisionTower
-from .codetr_encoder import CODETRVisionTower
+from .owl_encoder import OwlVisionTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
@@ -26,9 +26,9 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         dino_args.input_image_size = 1024
         return DINOv2VisionTower(vision_tower, args=dino_args, **kwargs)
 
-    if 'detr' in vision_tower:
+    if 'owl' in vision_tower:
         codetr_args = deepcopy(vision_tower_cfg)
         codetr_args.input_image_size = 1024
-        return CODETRVisionTower(vision_tower, args=codetr_args, **kwargs)
+        return OwlVisionTower(vision_tower, args=codetr_args, **kwargs)
 
     raise ValueError(f'Unknown vision tower: {vision_tower}')

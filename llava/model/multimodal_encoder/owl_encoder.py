@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import CLIPImageProcessor, Pix2StructForConditionalGeneration, Pix2StructConfig, AutoProcessor
+from transformers import CLIPImageProcessor, Owlv2Config, Owlv2ImageProcessor, Owlv2ForObjectDetection, Owlv2VisionModel
 
 cfg={
     "crop_size": 256,
@@ -24,7 +24,7 @@ cfg={
     "size": 256
 }
 
-class Pix2StructVisionTower(nn.Module):
+class OwlVisionTower(nn.Module):
     def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
 
@@ -39,7 +39,7 @@ class Pix2StructVisionTower(nn.Module):
         elif getattr(args, 'unfreeze_mm_vision_tower', False):
             self.load_model()
         else:
-            self.cfg_only = Pix2StructConfig.from_pretrained(self.vision_tower_name)
+            self.cfg_only = Owlv2Config.from_pretrained(self.vision_tower_name)
         
     def load_model(self, device_map=None):
         if self.is_loaded:
@@ -56,11 +56,9 @@ class Pix2StructVisionTower(nn.Module):
         self.image_mean = torch.tensor(self.image_processor.image_mean).view(1, 3, 1, 1)
         self.image_std = torch.tensor(self.image_processor.image_std).view(1, 3, 1, 1)
 
-        self.pix2struct_processor = AutoProcessor.from_pretrained(self.vision_tower_name)
-        self.pix2struct_processor.image_processor.is_vqa = False
+        self.owl_processor = Owlv2ImageProcessor.from_pretrained(self.vision_tower_name)
             
-        model = Pix2StructForConditionalGeneration.from_pretrained(self.vision_tower_name, device_map=device_map)
-        self.vision_tower = model.encoder
+        self.vision_tower = Owlv2VisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -80,12 +78,12 @@ class Pix2StructVisionTower(nn.Module):
         mean = self.image_mean.clone().view(1, 3, 1, 1).to(dtype=images.dtype, device=images.device)
         std = self.image_std.clone().view(1, 3, 1, 1).to(dtype=images.dtype, device=images.device)
         images = (images * std + mean) * 255.0
-        images = self.pix2struct_processor(images=images.float(), return_tensors="pt")
+        images = self.owl_processor(images=images.float(), return_tensors="pt")
 
         image_features = self.vision_tower(**(images.to(device=self.device, dtype=self.dtype)), output_hidden_states=True).last_hidden_state
         b_size, seq_len, feat_dim = image_features.shape
-        image_features = image_features[:,:2025,:]
-        image_features = image_features.transpose(1, 2).reshape(b_size, feat_dim, 45, 45)   
+        image_features = image_features[:,1:,:]
+        image_features = image_features.transpose(1, 2).reshape(b_size, feat_dim, 72, 72)   
         image_features = F.interpolate(image_features.float(), size=(32, 32), mode='bilinear', align_corners=True).to(dtype=image_features.dtype) 
         image_features = image_features.flatten(2).transpose(1, 2)
 
@@ -123,9 +121,3 @@ class Pix2StructVisionTower(nn.Module):
     @property
     def num_patches(self):
         return (self.config.image_size // self.config.patch_size) ** 2
-    
-
-
-    
-        
-        
