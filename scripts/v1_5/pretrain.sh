@@ -1,10 +1,10 @@
 #!/bin/bash
-# CLIP: openai/clip-vit-large-patch14-336
-# Pix2Struct: google/pix2struct-large
-# DINOv2: facebook/dinov2-with-registers-giant
-# SigLIP: google/siglip2-so400m-patch16-naflex
+# CLIP: openai/clip-vit-large-patch14-336 *
+# Pix2Struct: google/pix2struct-large *
+# DINOv2: facebook/dinov2-with-registers-giant *
+# SigLIP: google/siglip2-so400m-patch16-naflex 
 # CO-DETR: zongzhuofan/co-detr-vit-large-lvis-instance
-# Owl-ViT: google/owlv2-large-patch14-ensemble
+# Owl-ViT: google/owlv2-large-patch14-ensemble *
 # Med: google/medsiglip-448
 
 deepspeed llava/train/train_mem.py \
@@ -13,7 +13,7 @@ deepspeed llava/train/train_mem.py \
     --version plain \
     --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/data/LLaVA-Pretrain/images \
-    --vision_tower google/owlv2-large-patch14-ensemble \
+    --vision_tower google/pix2struct-large \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
     --mm_vision_select_layer -2 \
