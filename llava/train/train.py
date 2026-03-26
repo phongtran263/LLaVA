@@ -955,7 +955,12 @@ def train(attn_implementation=None):
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"✅ TRAINABLE: {name} | Shape: {list(param.shape)}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_params/total_params:.2%}")
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,

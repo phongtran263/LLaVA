@@ -12,7 +12,9 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
     is_absolute_path_exists = os.path.exists(vision_tower)
     use_s2 = getattr(vision_tower_cfg, 's2', False)
     if ',' in vision_tower:
-        return MultiEncoders(vision_tower, args=vision_tower_cfg, **kwargs)
+        mul_args = deepcopy(vision_tower_cfg)
+        mul_args.input_image_size = 1024
+        return MultiEncoders(vision_tower, args=mul_args, **kwargs)
     elif is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion") or "ShareGPT4V" in vision_tower:
         if use_s2:
             return CLIPVisionTowerS2(vision_tower, args=vision_tower_cfg, **kwargs)

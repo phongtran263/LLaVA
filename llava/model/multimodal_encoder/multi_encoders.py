@@ -1,46 +1,168 @@
 import torch
 import torch.nn as nn
 from copy import deepcopy
+import torch.nn.functional as F
 
-from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2
-from .pix2struct_encoder import Pix2StructVisionTower
-from .dinov2_encoder import DINOv2VisionTower
-from .owl_encoder import OwlVisionTower
+from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2, CLIPVisionConfig, CLIPImageProcessor
+from .pix2struct_encoder import Pix2StructVisionTower, Pix2StructConfig
+from .dinov2_encoder import DINOv2VisionTower, Dinov2Config
+from .owl_encoder import OwlVisionTower, Owlv2Config
+from ..multimodal_projector.builder import build_vision_projector
+
+cfg={
+    "crop_size": 256,
+    "do_center_crop": True,
+    "do_normalize": True,
+    "do_resize": True,
+    "feature_extractor_type": "CLIPFeatureExtractor",
+    "image_mean": [
+        0.48145466,
+        0.4578275,
+        0.40821073
+    ],
+    "image_std": [
+        0.26862954,
+        0.26130258,
+        0.27577711
+    ],
+    "resample": 3,
+    "size": 256
+}
+
+def get_w(weights, keyword):
+    return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+def load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, args):
+    tmp_args = deepcopy(args)
+    tmp_args.mm_hidden_size = vision_tower.config.hidden_size
+    mm_projector = build_vision_projector(tmp_args)
+    mm_projector_weights = torch.load(projector_ckpt, map_location='cpu')
+    mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+    return mm_projector
 
 class MultiEncoders(nn.Module):
     def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
 
-        self.vision_tower_name = vision_tower
+        self.vision_tower_names = vision_tower.split(',')
+        self.mm_projectors_chkpt = args.pretrain_mm_mlp_adapter.split(',')
         self.is_loaded = False
+        self.select_layer = args.mm_vision_select_layer
+        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        self.input_image_size = args.input_image_size
+        self.delay_load = delay_load
+        self.args = args
 
-        self.load_model()
-
+        if not delay_load:
+            self.load_model()
+        elif getattr(args, 'unfreeze_mm_vision_tower', False):
+            self.load_model()
+        else:
+            self.cfg_only = [CLIPVisionConfig.from_pretrained(name) if 'clip' in name else 
+                             Pix2StructConfig.from_pretrained(name) if 'pix2struct' in name else 
+                             Dinov2Config.from_pretrained(name) if 'dinov2' in name else 
+                             Owlv2Config.from_pretrained(name) if 'owl' in name else None
+                             for name in self.vision_tower_names]
+            
     def load_model(self, device_map=None):
-        self.vision_tower = []
-        if 'clip' in self.vision_tower_name:
-            self.clip_vision_tower = CLIPVisionTower(self.vision_tower_name, args=self.args, delay_load=False)
-            self.vision_tower.append(self.clip_vision_tower)
-        if 'pix2struct' in self.vision_tower_name:
-            pix_args = deepcopy(self.args)
-            pix_args.input_image_size = 1024
-            self.pix2struct_vision_tower = Pix2StructVisionTower(self.vision_tower_name, args=pix_args, delay_load=False)
-            self.vision_tower.append(self.pix2struct_vision_tower)
-        if 'dinov2' in self.vision_tower_name:
-            dino_args = deepcopy(self.args)
-            dino_args.input_image_size = 1024
-            self.dinov2_vision_tower = DINOv2VisionTower(self.vision_tower_name, args=dino_args, delay_load=False)
-            self.vision_tower.append(self.dinov2_vision_tower)
-        if 'owl' in self.vision_tower_name:
-            owl_args = deepcopy(self.args)
-            owl_args.input_image_size = 1024
-            self.owl_vision_tower = OwlVisionTower(self.vision_tower_name, args=owl_args, delay_load=False)
-            self.vision_tower.append(self.owl_vision_tower)
-    
+        if self.is_loaded:
+            print('MultiEncoders is already loaded, `load_model` called again, skipping.')
+            return
+        
+        self.vision_towers = nn.ModuleList()
+        self.mm_projectors = nn.ModuleList()
+        for i in range(len(self.vision_tower_names)):
+            vision_tower_name = self.vision_tower_names[i]
+            projector_ckpt = self.mm_projectors_chkpt[i] 
+            if 'clip' in vision_tower_name:
+                vision_tower = CLIPVisionTower(vision_tower_name, self.args, delay_load=False)
+                vision_tower.input_image_size = vision_tower.config.image_size
+                mm_projector = load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, self.args)
+            elif 'pix2struct' in vision_tower_name:
+                vision_tower = Pix2StructVisionTower(vision_tower_name, self.args, delay_load=False)
+                mm_projector = load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, self.args)
+            elif 'dinov2' in vision_tower_name:
+                vision_tower = DINOv2VisionTower(vision_tower_name, self.args, delay_load=False)
+                mm_projector = load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, self.args)
+            elif 'owl' in vision_tower_name:
+                vision_tower = OwlVisionTower(vision_tower_name, self.args, delay_load=False)
+                mm_projector = load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, self.args)
+            else:
+                raise ValueError(f'Unknown vision tower name: {vision_tower_name}')
+            self.vision_towers.append(vision_tower)
+            self.mm_projectors.append(mm_projector)
+
+        for vision_tower in self.vision_towers:
+            vision_tower.requires_grad_(False)
+        for mm_projector in self.mm_projectors:
+            mm_projector.requires_grad_(False)
+
+        self.image_processor = CLIPImageProcessor(**cfg)
+        if self.input_image_size is not None:
+            self.image_processor.size=self.input_image_size
+            self.image_processor.crop_size={
+                'height':self.input_image_size,
+                'width': self.input_image_size
+            }
+
+        self.is_loaded = True
+
     @torch.no_grad()
     def forward(self, images):
-        vision_outputs = []
-        for vision_tower in self.vision_tower:
-            vision_out = vision_tower(images)
-            vision_outputs.append(vision_out)
-        return vision_outputs
+        vision_tower_outputs = []
+        for i in range(len(self.vision_towers)):
+            if self.vision_towers[i].input_image_size != self.image_processor.size:
+                resized_images = F.interpolate(images, size=(self.vision_towers[i].input_image_size, self.vision_towers[i].input_image_size), mode='bilinear', align_corners=False).to(dtype=self.dtype, device=self.device)
+            else:
+                resized_images = images
+            vision_tower_output = self.vision_towers[i](resized_images)
+            vision_tower_output = self.mm_projectors[i](vision_tower_output)
+            if vision_tower_output.shape[1] == 576:
+                vision_tower_output = vision_tower_output.transpose(1, 2).reshape(vision_tower_output.shape[0], vision_tower_output.shape[2], 24, 24)
+                vision_tower_output = F.interpolate(vision_tower_output.float(), size=(32, 32), mode='bilinear', align_corners=True).to(dtype=vision_tower_output.dtype)
+                vision_tower_output = vision_tower_output.flatten(2).transpose(1, 2)
+            vision_tower_outputs.append(vision_tower_output)
+        vision_tower_outputs = torch.cat(vision_tower_outputs, dim=-1)
+        return vision_tower_outputs
+    
+    @property
+    def dummy_feature(self):
+        dummy_features = []
+        for vision_tower in self.vision_towers:
+            dummy_feature = vision_tower.dummy_feature
+            dummy_features.append(dummy_feature)
+        return dummy_features
+    
+    @property
+    def dtype(self):
+        return self.vision_towers[0].dtype if self.is_loaded else self.cfg_only[0].torch_dtype
+    
+    @property
+    def device(self):
+        return next(self.vision_towers[0].parameters()).device if self.is_loaded else torch.device('cpu')
+    
+    @property
+    def config(self):
+        if self.is_loaded:
+            return [vision_tower.config for vision_tower in self.vision_towers]
+        else:
+            return self.cfg_only
+        
+    @property
+    def hidden_size(self):
+        return self.args.hidden_size*len(self.vision_towers)
+        
+    @property
+    def num_patches_per_side(self):
+        if self.is_loaded:
+            return [vision_tower.config.image_size // vision_tower.config.patch_size for vision_tower in self.vision_towers]
+        else:
+            return [cfg.image_size // cfg.patch_size for cfg in self.cfg_only]
+        
+    @property
+    def num_patches(self):
+        if self.is_loaded:
+            return [(vision_tower.config.image_size // vision_tower.config.patch_size) ** 2 for vision_tower in self.vision_towers]
+        else:
+            return [(cfg.image_size // cfg.patch_size) ** 2 for cfg in self.cfg_only]
+

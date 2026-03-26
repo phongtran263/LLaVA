@@ -54,8 +54,8 @@ class LlavaMetaModel:
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
-
         if self.get_vision_tower() is None:
+            model_args.hidden_size = self.config.hidden_size
             vision_tower = build_vision_tower(model_args)
 
             if fsdp is not None and len(fsdp) > 0:
@@ -89,7 +89,7 @@ class LlavaMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
-        if pretrain_mm_mlp_adapter is not None:
+        if pretrain_mm_mlp_adapter is not None and ',' not in pretrain_mm_mlp_adapter:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
@@ -150,7 +150,7 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        if type(images) is list or images.ndim == 5:
+        if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
