@@ -137,10 +137,47 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+    def encode_images(self, images, text_features=None):
+        image_features = self.get_model().get_vision_tower()(images, text_features)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
+    
+    def extract_text_features(self, input_ids, attention_mask=None, exit_layer=6):
+        text_only_input_ids = []
+        text_only_mask = []
+
+        for batch_idx, cur_input_ids in enumerate(input_ids):
+            # .clone() — explicit copy, zero risk of aliasing
+            cur = cur_input_ids.clone()
+            keep = cur != IMAGE_TOKEN_INDEX
+            text_only_input_ids.append(cur[keep])
+            if attention_mask is not None:
+                text_only_mask.append(attention_mask[batch_idx][keep].clone())
+
+        text_only_input_ids = torch.stack(text_only_input_ids, dim=0)
+        text_only_mask = torch.stack(text_only_mask, dim=0) if text_only_mask else None
+
+        with torch.no_grad():
+            h = self.get_model().embed_tokens(text_only_input_ids)
+            h = h.to(self.get_model().layers[0].input_layernorm.weight.dtype)
+
+            for layer in self.get_model().layers[:exit_layer]:
+                h = layer(
+                    h,
+                    attention_mask=None,    
+                    position_ids=None,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                )[0]
+
+        if text_only_mask is not None:
+            last_pos = text_only_mask.sum(dim=1) - 1   # ← use text_only_mask, not original
+            text_feat = h[torch.arange(h.shape[0]), last_pos]
+        else:
+            text_feat = h[:, -1]
+
+        return text_feat.detach()
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
@@ -150,11 +187,15 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        input_ids_clone = input_ids
+        attention_mask_clone = attention_mask.clone() if attention_mask is not None else None
+        text_features = self.extract_text_features(input_ids_clone, attention_mask=attention_mask_clone, exit_layer=self.config.guided_text_select_layer)
+
         if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            image_features = self.encode_images(concat_images, text_features=text_features)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -199,7 +240,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images, text_features=text_features)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):

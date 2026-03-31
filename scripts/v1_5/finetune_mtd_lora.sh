@@ -16,6 +16,13 @@ deepspeed llava/train/train_mem.py \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336,google/pix2struct-large,facebook/dinov2-with-registers-large,google/owlv2-large-patch14-ensemble \
     --pretrain_mm_mlp_adapter ./checkpoints/llava-v1.5-3b-pretrain-openllama-clip/mm_projector.bin,./checkpoints/llava-v1.5-3b-pretrain-openllama-pix/mm_projector.bin,./checkpoints/llava-v1.5-3b-pretrain-openllama-dino/mm_projector.bin,./checkpoints/llava-v1.5-3b-pretrain-openllama-owl/mm_projector.bin \
+    --train_mtd True \
+    --student_vision_tower openai/clip-vit-large-patch14-336 \
+    --pretrain_student_mm_mlp_adapter ./checkpoints/llava-v1.5-3b-pretrain-openllama-clip/mm_projector.bin \
+    --router_hidden_size 512 \
+    --router_dropout 0.1 \
+    --guided_text_select_layer 6 \
+    --mtd_topk 2 \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -23,9 +30,9 @@ deepspeed llava/train/train_mem.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-3b-lora \
+    --output_dir ./checkpoints/llava-v1.5-3b-lora-mtd \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --evaluation_strategy "no" \

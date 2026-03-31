@@ -79,7 +79,7 @@ class DINOv2VisionTower(nn.Module):
         mean = self.image_mean.to(device=images.device, dtype=images.dtype)
         std = self.image_std.to(device=images.device, dtype=images.dtype)
         images = images * std + mean
-        images = self.dinov2_processor(images=images.float(), return_tensors="pt")
+        images = self.dinov2_processor(images=images.float().clamp(0, 1), return_tensors="pt")
 
         image_features = self.vision_tower(**(images.to(device=self.device, dtype=self.dtype)), output_hidden_states=True).last_hidden_state
         b_size, seq_len, feat_dim = image_features.shape

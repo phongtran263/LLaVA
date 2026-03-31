@@ -72,10 +72,9 @@ if __name__ == "__main__":
     questions = {question['question_id']: question for question in questions}
     answers = [json.loads(q) for q in open(args.result_file)]
     for file in os.listdir(args.annotation_dir):
-        assert file.startswith('coco_pope_')
-        assert file.endswith('.json')
-        category = file[10:-5]
-        cur_answers = [x for x in answers if questions[x['question_id']]['category'] == category]
-        print('Category: {}, # samples: {}'.format(category, len(cur_answers)))
-        eval_pope(cur_answers, os.path.join(args.annotation_dir, file))
-        print("====================================")
+        if file.startswith('coco_pope_') and file.endswith('.json'):
+            category = file[10:-5]
+            cur_answers = [x for x in answers if questions[x['question_id']]['category'] == category]
+            print('Category: {}, # samples: {}'.format(category, len(cur_answers)))
+            eval_pope(cur_answers, os.path.join(args.annotation_dir, file))
+            print("====================================")

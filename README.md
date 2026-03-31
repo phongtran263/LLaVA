@@ -385,6 +385,8 @@ In LLaVA-1.5, we evaluate models on a diverse set of 12 benchmarks. To ensure th
 
 See [Evaluation.md](https://github.com/haotian-liu/LLaVA/blob/main/docs/Evaluation.md).
 
+run merge lora script
+
 ### GPT-assisted Evaluation
 
 Our GPT-assisted evaluation pipeline for multimodal modeling is provided for a comprehensive understanding of the capabilities of vision-language models.  Please see our paper for more details.

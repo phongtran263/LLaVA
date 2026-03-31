@@ -1,14 +1,14 @@
 #!/bin/bash
 
 python -m llava.eval.model_vqa_loader \
-    --model-path liuhaotian/llava-v1.5-7b \
-    --question-file ./playground/data/eval/pope/llava_pope_test.jsonl \
+    --model-path checkpoints/llava-v1.5-3b-lora-mul-merged \
+    --question-file ./playground/data/eval/pope/coco/coco_pope_test.jsonl \
     --image-folder ./playground/data/eval/pope/val2014 \
-    --answers-file ./playground/data/eval/pope/answers/llava-v1.5-7b.jsonl \
+    --answers-file ./playground/data/eval/pope/answers/llava-v1.5-3b-lora-mul-merged.jsonl \
     --temperature 0 \
     --conv-mode vicuna_v1
 
 python llava/eval/eval_pope.py \
     --annotation-dir ./playground/data/eval/pope/coco \
-    --question-file ./playground/data/eval/pope/llava_pope_test.jsonl \
-    --result-file ./playground/data/eval/pope/answers/llava-v1.5-7b.jsonl
+    --question-file ./playground/data/eval/pope/coco/coco_pope_test.jsonl \
+    --result-file ./playground/data/eval/pope/answers/llava-v1.5-3b-lora-mul-merged.jsonl

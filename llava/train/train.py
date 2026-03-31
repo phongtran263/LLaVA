@@ -64,6 +64,13 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    train_mtd: bool = field(default=False)
+    student_vision_tower: Optional[str] = field(default=None)
+    pretrain_student_mm_mlp_adapter: Optional[str] = field(default=None)
+    router_hidden_size: Optional[int] = field(default=None)
+    router_dropout: Optional[float] = field(default=None)
+    guided_text_select_layer: Optional[int] = field(default=None)
+    mtd_topk: Optional[int] = field(default=None)
 
 
 @dataclass
@@ -840,6 +847,9 @@ def train(attn_implementation=None):
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
+    model.config.train_mtd = model_args.train_mtd
+    model.config.guided_text_select_layer = model_args.guided_text_select_layer
+    model_args.text_hidden_size = model.config.hidden_size
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)

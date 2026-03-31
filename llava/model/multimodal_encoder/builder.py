@@ -6,7 +6,6 @@ from .dinov2_encoder import DINOv2VisionTower
 from .owl_encoder import OwlVisionTower
 from .multi_encoders import MultiEncoders
 
-
 def build_vision_tower(vision_tower_cfg, **kwargs):
     vision_tower = getattr(vision_tower_cfg, 'mm_vision_tower', getattr(vision_tower_cfg, 'vision_tower', None))
     is_absolute_path_exists = os.path.exists(vision_tower)
@@ -14,7 +13,7 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
     if ',' in vision_tower:
         mul_args = deepcopy(vision_tower_cfg)
         mul_args.input_image_size = 1024
-        return MultiEncoders(vision_tower, args=mul_args, **kwargs)
+        return MultiEncoders(vision_tower, args=mul_args, **kwargs).to(device='cuda')
     elif is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion") or "ShareGPT4V" in vision_tower:
         if use_s2:
             return CLIPVisionTowerS2(vision_tower, args=vision_tower_cfg, **kwargs)
