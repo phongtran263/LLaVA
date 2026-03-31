@@ -122,7 +122,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         if self.get_model().training:
             lb_loss = lb_loss.to(output.loss.device)
-            print(lb_loss, output.loss)
             
             return CausalLMOutputWithPast(
                 loss=output.loss + 0.001 * lb_loss,
