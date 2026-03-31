@@ -67,9 +67,12 @@ def build_teacher_mixture(teacher_features, router_alphas):
     return mixed_teacher_feature
 
 def load_balance_loss(router_alphas):
+    num_experts = router_alphas.size(-1)
     mean_alphas = router_alphas.mean(dim=0)
-    entropy = (mean_alphas * (mean_alphas + 1e-8).log()).sum()
-    return entropy
+    neg_entropy = (mean_alphas * mean_alphas.clamp(min=1e-8).log()).sum()
+    log_n = torch.log(torch.tensor(num_experts, device=router_alphas.device))
+    loss = (neg_entropy + log_n) / log_n
+    return loss
 
 class MultiEncoders(nn.Module):
     def __init__(self, vision_tower, args, delay_load=False):
@@ -166,12 +169,11 @@ class MultiEncoders(nn.Module):
             alpha = self.router(text_features)
 
             if self.training:
-                print('Router alphas:', alpha)
-                print(len(vision_tower_outputs), 'vision tower outputs')
                 stacked = torch.stack(vision_tower_outputs, dim=1)
                 weights = alpha.unsqueeze(-1).unsqueeze(-1)
                 mixed = (weights * stacked).sum(dim=1)
-                return mixed
+                lb_loss = load_balance_loss(alpha)
+                return mixed, lb_loss
             else:
                 topk = self.args.mtd_topk if self.args.mtd_topk is not None else 2
                 topk_vals, topk_idx = torch.topk(alpha, topk, dim=-1) # [B, top_k]

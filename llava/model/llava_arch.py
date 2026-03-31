@@ -138,6 +138,11 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images, text_features=None):
+        if self.get_model().training:
+            image_features, lb_loss = self.get_model().get_vision_tower()(images, text_features)
+            image_features = self.get_model().mm_projector(image_features)
+            return image_features, lb_loss
+        
         image_features = self.get_model().get_vision_tower()(images, text_features)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
@@ -240,7 +245,10 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images, text_features=text_features)
+            if self.get_model().training:
+                image_features, lb_loss = self.encode_images(images, text_features=text_features)
+            else:
+                image_features = self.encode_images(images, text_features=text_features)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -362,6 +370,8 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
+        if self.get_model().training:
+            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, lb_loss
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
