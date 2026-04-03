@@ -51,7 +51,7 @@ class TextGuidedRouter(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, num_experts)
         )
-        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.01)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, text_features):
@@ -70,7 +70,7 @@ def load_balance_loss(router_alphas):
     num_experts = router_alphas.size(-1)
     mean_alphas = router_alphas.mean(dim=0)
     neg_entropy = (mean_alphas * mean_alphas.clamp(min=1e-8).log()).sum()
-    log_n = torch.log(torch.tensor(num_experts, device=router_alphas.device))
+    log_n = router_alphas.new_tensor(num_experts).log()
     loss = (neg_entropy + log_n) / log_n
     return loss
 
@@ -123,6 +123,7 @@ class MultiEncoders(nn.Module):
                 mm_projector = load_mm_projector_from_checkpoint(vision_tower, projector_ckpt, self.args)
             else:
                 raise ValueError(f'Unknown vision tower name: {vision_tower_name}')
+
             self.vision_towers.append(vision_tower)
             self.mm_projectors.append(mm_projector)
 
@@ -150,23 +151,42 @@ class MultiEncoders(nn.Module):
 
         self.is_loaded = True
 
-    @torch.no_grad()
     def forward(self, images, text_features=None):
         vision_tower_outputs = []
-        for i in range(len(self.vision_towers)):
-            if self.vision_towers[i].input_image_size != self.image_processor.size:
-                resized_images = F.interpolate(images, size=(self.vision_towers[i].input_image_size, self.vision_towers[i].input_image_size), mode='bilinear', align_corners=False).to(dtype=self.dtype, device=self.device)
-            else:
-                resized_images = images
-            vision_tower_output = self.vision_towers[i](resized_images)
-            vision_tower_output = self.mm_projectors[i](vision_tower_output)
-            if vision_tower_output.shape[1] == 1024:
-                vision_tower_output = vision_tower_output.transpose(1, 2).reshape(vision_tower_output.shape[0], vision_tower_output.shape[2], 32, 32)
-                vision_tower_output = F.interpolate(vision_tower_output.float(), size=(24, 24), mode='bilinear', align_corners=True).to(dtype=vision_tower_output.dtype)
-                vision_tower_output = vision_tower_output.flatten(2).transpose(1, 2)
-            vision_tower_outputs.append(vision_tower_output)
+        resized_images_cache = {}
+        self.router_last_stats = None
+        with torch.no_grad():
+            for i in range(len(self.vision_towers)):
+                target_size = self.vision_towers[i].input_image_size
+                if target_size == self.image_processor.size:
+                    resized_images = images
+                else:
+                    resized_images = resized_images_cache.get(target_size)
+                    if resized_images is None:
+                        resized_images = F.interpolate(
+                            images,
+                            size=(target_size, target_size),
+                            mode='bilinear',
+                            align_corners=False,
+                        ).to(dtype=self.dtype, device=self.device)
+                        resized_images_cache[target_size] = resized_images
+                vision_tower_output = self.vision_towers[i](resized_images)
+                vision_tower_output = self.mm_projectors[i](vision_tower_output)
+                if vision_tower_output.shape[1] == 1024:
+                    vision_tower_output = vision_tower_output.transpose(1, 2).reshape(vision_tower_output.shape[0], vision_tower_output.shape[2], 32, 32)
+                    vision_tower_output = F.interpolate(vision_tower_output.float(), size=(24, 24), mode='bilinear', align_corners=True).to(dtype=vision_tower_output.dtype)
+                    vision_tower_output = vision_tower_output.flatten(2).transpose(1, 2)
+                vision_tower_outputs.append(vision_tower_output)
         if self.args.train_mtd and text_features is not None:
             alpha = self.router(text_features)
+            entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(dim=-1).mean().detach()
+            top1 = alpha.argmax(dim=-1)
+            top1_hist = torch.bincount(top1, minlength=alpha.size(-1)).float() / top1.numel()
+            self.router_last_stats = {
+                "router/entropy": entropy,
+                **{f"router/weight_{i}": alpha[:, i].mean().detach() for i in range(alpha.size(-1))},
+                **{f"router/top1_frac_{i}": top1_hist[i].detach() for i in range(alpha.size(-1))},
+            }
 
             if self.training:
                 stacked = torch.stack(vision_tower_outputs, dim=1)
@@ -179,12 +199,13 @@ class MultiEncoders(nn.Module):
                 topk_vals, topk_idx = torch.topk(alpha, topk, dim=-1) # [B, top_k]
                 topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
 
+                stacked = torch.stack(vision_tower_outputs, dim=0)
                 B, N, D = vision_tower_outputs[0].shape
+                batch_indices = torch.arange(B, device=topk_idx.device)
                 mixed = torch.zeros(B, N, D, dtype=self.dtype, device=self.device)
                 for k in range(topk):
-                    for b in range(B):
-                        enc_idx = topk_idx[b, k].item()
-                        mixed[b] += topk_weights[b, k] * vision_tower_outputs[enc_idx][b]
+                    selected = stacked[topk_idx[:, k], batch_indices]
+                    mixed = mixed + topk_weights[:, k].unsqueeze(-1).unsqueeze(-1) * selected
                 return mixed
         vision_tower_outputs = torch.cat(vision_tower_outputs, dim=-1)
         return vision_tower_outputs

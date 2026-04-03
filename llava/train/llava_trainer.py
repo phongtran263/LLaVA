@@ -132,6 +132,44 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def _collect_router_stats(self):
+        queue = [self.model]
+        visited = set()
+
+        while queue:
+            model = queue.pop(0)
+            if model is None or id(model) in visited:
+                continue
+            visited.add(id(model))
+
+            router_stats = getattr(model, "router_last_stats", None)
+            if router_stats:
+                return router_stats, model
+
+            for attr in ("get_model", "get_vision_tower", "vision_tower", "base_model", "model", "module"):
+                if not hasattr(model, attr):
+                    continue
+
+                candidate = getattr(model, attr)
+                child = candidate() if attr in ("get_model", "get_vision_tower") and callable(candidate) else candidate
+
+                if isinstance(child, (list, tuple)):
+                    queue.extend(child)
+                else:
+                    queue.append(child)
+
+        return None, None
+
+    def log(self, logs):
+        router_stats, router_source = self._collect_router_stats()
+        if router_stats:
+            logs = dict(logs)
+            for key, value in router_stats.items():
+                logs[key] = value.item() if torch.is_tensor(value) else value
+            router_source.router_last_stats = None
+
+        return super().log(logs)
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None

@@ -1,6 +1,6 @@
 from copy import deepcopy
 import os
-from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2
+from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2, CLIPVisionConfig
 from .pix2struct_encoder import Pix2StructVisionTower
 from .dinov2_encoder import DINOv2VisionTower
 from .owl_encoder import OwlVisionTower
@@ -12,7 +12,11 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
     use_s2 = getattr(vision_tower_cfg, 's2', False)
     if ',' in vision_tower:
         mul_args = deepcopy(vision_tower_cfg)
-        mul_args.input_image_size = 1024
+        clip_vision_tower = next((name for name in vision_tower.split(',') if 'clip' in name or 'openai' in name or 'laion' in name or 'ShareGPT4V' in name), None)
+        if clip_vision_tower is not None:
+            mul_args.input_image_size = CLIPVisionConfig.from_pretrained(clip_vision_tower).image_size
+        else:
+            mul_args.input_image_size = 576
         return MultiEncoders(vision_tower, args=mul_args, **kwargs).to(device='cuda')
     elif is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion") or "ShareGPT4V" in vision_tower:
         if use_s2:

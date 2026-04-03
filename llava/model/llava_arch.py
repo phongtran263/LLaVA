@@ -148,41 +148,36 @@ class LlavaMetaForCausalLM(ABC):
         return image_features
     
     def extract_text_features(self, input_ids, attention_mask=None, exit_layer=6):
-        text_only_input_ids = []
-        text_only_mask = []
-
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            # .clone() — explicit copy, zero risk of aliasing
-            cur = cur_input_ids.clone()
-            keep = cur != IMAGE_TOKEN_INDEX
-            text_only_input_ids.append(cur[keep])
-            if attention_mask is not None:
-                text_only_mask.append(attention_mask[batch_idx][keep].clone())
-
-        text_only_input_ids = torch.stack(text_only_input_ids, dim=0)
-        text_only_mask = torch.stack(text_only_mask, dim=0) if text_only_mask else None
-
         with torch.no_grad():
-            h = self.get_model().embed_tokens(text_only_input_ids)
-            h = h.to(self.get_model().layers[0].input_layernorm.weight.dtype)
+            text_features = []
 
-            for layer in self.get_model().layers[:exit_layer]:
-                h = layer(
-                    h,
-                    attention_mask=None,    
-                    position_ids=None,
-                    past_key_value=None,
-                    output_attentions=False,
-                    use_cache=False,
-                )[0]
+            for batch_idx, cur_input_ids in enumerate(input_ids):
+                cur = cur_input_ids.clone()
+                keep = cur != IMAGE_TOKEN_INDEX
+                if attention_mask is not None:
+                    keep = keep & attention_mask[batch_idx].bool()
+                cur = cur[keep].unsqueeze(0)
 
-        if text_only_mask is not None:
-            last_pos = text_only_mask.sum(dim=1) - 1   # ← use text_only_mask, not original
-            text_feat = h[torch.arange(h.shape[0]), last_pos]
-        else:
-            text_feat = h[:, -1]
+                if cur.shape[1] == 0:
+                    text_features.append(torch.zeros(self.get_model().config.hidden_size, device=cur_input_ids.device, dtype=self.get_model().layers[0].input_layernorm.weight.dtype))
+                    continue
 
-        return text_feat.detach()
+                h = self.get_model().embed_tokens(cur)
+                h = h.to(self.get_model().layers[0].input_layernorm.weight.dtype)
+
+                for layer in self.get_model().layers[:exit_layer]:
+                    h = layer(
+                        h,
+                        attention_mask=None,
+                        position_ids=None,
+                        past_key_value=None,
+                        output_attentions=False,
+                        use_cache=False,
+                    )[0]
+
+                text_features.append(h[0, -1].detach())
+
+        return torch.stack(text_features, dim=0)
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
