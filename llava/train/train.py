@@ -53,6 +53,7 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    force_download: bool = field(default=False)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
@@ -822,12 +823,17 @@ def train(attn_implementation=None):
 
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
-            config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+            config = transformers.AutoConfig.from_pretrained(
+                model_args.model_name_or_path,
+                trust_remote_code=True,
+                force_download=model_args.force_download,
+            )
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
             model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
+                force_download=model_args.force_download,
                 **bnb_model_from_pretrained_args
             )
         else:
@@ -836,6 +842,7 @@ def train(attn_implementation=None):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                force_download=model_args.force_download,
                 **bnb_model_from_pretrained_args
             )
     else:
@@ -844,8 +851,15 @@ def train(attn_implementation=None):
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            force_download=model_args.force_download,
             **bnb_model_from_pretrained_args
         )
+
+    if attn_implementation == "flash_attention_2" and training_args.bits not in [4, 8]:
+        if not torch.cuda.is_available():
+            raise ValueError("Flash Attention 2.0 requires CUDA, but CUDA is not available.")
+        model.to(training_args.device)
+
     model.config.use_cache = False
     model.config.train_mtd = model_args.train_mtd
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
@@ -890,7 +904,8 @@ def train(attn_implementation=None):
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
-            padding_side="right"
+            padding_side="right",
+            force_download=model_args.force_download,
         )
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -899,6 +914,7 @@ def train(attn_implementation=None):
             model_max_length=training_args.model_max_length,
             padding_side="right",
             use_fast=False,
+            force_download=model_args.force_download,
         )
 
     if model_args.version == "v0":

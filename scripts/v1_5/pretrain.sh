@@ -1,7 +1,7 @@
 #!/bin/bash
-# CLIP: openai/clip-vit-large-patch14-336 *
-# Pix2Struct: google/pix2struct-large *
-# DINOv2: facebook/dinov2-with-registers-giant *
+# CLIP: openai/clip-vit-large-patch14-336 * 300M
+# Pix2Struct: google/pix2struct-base * 282M
+# DINOv2: facebook/dinov2-large * 
 # SigLIP: google/siglip2-so400m-patch16-naflex 
 # CO-DETR: zongzhuofan/co-detr-vit-large-lvis-instance
 # Owl-ViT: google/owlv2-large-patch14-ensemble *
@@ -9,22 +9,23 @@
 
 deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path lmsys/vicuna-7b-v1.5 \
+    --model_name_or_path mtgv/MobileLLaMA-1.4B-Chat \
+    --force_download False \
     --version plain \
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/LLaVA-Pretrain/images \
-    --vision_tower google/pix2struct-large \
+    --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-pretrain \
+    --output_dir ./checkpoints/llava-v1.5-mobile-pretrain \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 16 \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 24000 \

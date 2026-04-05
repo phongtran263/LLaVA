@@ -138,12 +138,15 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images, text_features=None):
-        if self.get_model().training:
+        if self.get_model().training and self.get_model().config.train_mtd:
             image_features, lb_loss = self.get_model().get_vision_tower()(images, text_features)
             image_features = self.get_model().mm_projector(image_features)
             return image_features, lb_loss
         
-        image_features = self.get_model().get_vision_tower()(images, text_features)
+        if self.get_model().config.train_mtd:
+            image_features = self.get_model().get_vision_tower()(images, text_features)
+        else:
+            image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
@@ -187,9 +190,10 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        input_ids_clone = input_ids
-        attention_mask_clone = attention_mask.clone() if attention_mask is not None else None
-        text_features = self.extract_text_features(input_ids_clone, attention_mask=attention_mask_clone, exit_layer=self.config.guided_text_select_layer)
+        if self.get_model().config.train_mtd:
+            input_ids_clone = input_ids
+            attention_mask_clone = attention_mask.clone() if attention_mask is not None else None
+            text_features = self.extract_text_features(input_ids_clone, attention_mask=attention_mask_clone, exit_layer=self.config.guided_text_select_layer)
 
         if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
@@ -240,10 +244,12 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            if self.get_model().training:
+            if self.get_model().training and self.get_model().config.train_mtd:
                 image_features, lb_loss = self.encode_images(images, text_features=text_features)
-            else:
+            elif self.get_model().config.train_mtd:
                 image_features = self.encode_images(images, text_features=text_features)
+            else:
+                image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -365,7 +371,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        if self.get_model().training:
+        if self.get_model().training and self.get_model().config.train_mtd:
             return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, lb_loss
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 

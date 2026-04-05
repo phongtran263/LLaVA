@@ -71,7 +71,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
-            if self.get_model().training:
+            if self.get_model().training and self.get_model().config.train_mtd:
                 (
                     input_ids,
                     position_ids,
@@ -120,7 +120,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return_dict=return_dict
         )
 
-        if self.get_model().training:
+        if self.get_model().training and self.get_model().config.train_mtd:
             lb_loss = lb_loss.to(output.loss.device)
             
             return CausalLMOutputWithPast(
