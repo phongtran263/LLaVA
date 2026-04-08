@@ -167,6 +167,20 @@ class LLaVATrainer(Trainer):
             for key, value in router_stats.items():
                 logs[key] = value.item() if torch.is_tensor(value) else value
             router_source.router_last_stats = None
+        
+        # Log CKA loss and text loss separately
+        logs = dict(logs)
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+
+        cka_loss = getattr(model, 'last_cka_loss', None)
+        text_loss = getattr(model, 'last_text_loss', None)
+
+        if cka_loss is not None:
+            logs['loss/cka_loss'] = cka_loss.item() if torch.is_tensor(cka_loss) else float(cka_loss)
+            if text_loss is not None:
+                logs['loss/text_loss'] = text_loss.item() if torch.is_tensor(text_loss) else float(text_loss)
+            # model.last_cka_loss = None
+            # model.last_text_loss = None
 
         return super().log(logs)
 

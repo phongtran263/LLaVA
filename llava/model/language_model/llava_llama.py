@@ -71,7 +71,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
-            if self.get_model().training and self.get_model().config.train_mtd:
+            if self.get_model().training and self.get_model().config.cka_loss:
                 (
                     input_ids,
                     position_ids,
@@ -79,7 +79,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     past_key_values,
                     inputs_embeds,
                     labels,
-                    lb_loss
+                    cka_loss
                 ) = self.prepare_inputs_labels_for_multimodal(
                     input_ids,
                     position_ids,
@@ -120,11 +120,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return_dict=return_dict
         )
 
-        if self.get_model().training and self.get_model().config.train_mtd:
-            lb_loss = lb_loss.to(output.loss.device)
+        if self.get_model().training and self.get_model().config.cka_loss:
+            cka_loss = cka_loss.to(output.loss.device)
+            # Store losses for logging
+            self.last_cka_loss = cka_loss.detach()
+            self.last_text_loss = output.loss.detach()
             
             return CausalLMOutputWithPast(
-                loss=output.loss + 0.001 * lb_loss,
+                loss=output.loss + self.get_model().config.cka_loss_weight * cka_loss,
                 logits=output.logits,
                 past_key_values=output.past_key_values,
                 hidden_states=output.hidden_states,

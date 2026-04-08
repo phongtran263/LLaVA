@@ -25,6 +25,83 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
+def compute_linear_cka_loss(x, y, eps=1e-8):
+    """
+    Compute per-sample Linear CKA loss.
+    For each batch element, treats tokens/patches as samples and features as dimensions.
+    
+    Args:
+        x, y: Shape (B, L, D) where B=batch, L=sequence length (tokens/patches), D=features
+              If 2D, treats as (B, L*D)
+        eps: numerical stability constant
+        
+    Returns:
+        Scalar loss (mean of per-sample CKA losses)
+    """
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(f"Batch size mismatch: {x.shape[0]} vs {y.shape[0]}")
+
+    B = x.shape[0]
+    x = x.float()
+    y = y.float()
+    
+    cka_losses = []
+    
+    # Compute per-sample CKA
+    if x.ndim == 3:
+        # Already (B, L, D) - tokens as samples, features as dimensions
+        for i in range(B):
+            x_i = x[i]  # (L, D)
+            y_i = y[i]  # (L, D)
+            
+            # Center features
+            x_i = x_i - x_i.mean(dim=0, keepdim=True)
+            y_i = y_i - y_i.mean(dim=0, keepdim=True)
+            
+            # Gram matrices: (L, D) @ (D, L) = (L, L)
+            xx = x_i @ x_i.T
+            yy = y_i @ y_i.T
+            
+            # CKA computation
+            hsic_xy = (xx * yy).sum()
+            hsic_xx = xx.square().sum()
+            hsic_yy = yy.square().sum()
+            
+            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
+            cka_i = hsic_xy / denom
+            cka_i = cka_i.clamp(0.0, 1.0)
+            
+            cka_losses.append(1.0 - cka_i)
+    else:
+        # 2D input (B, L*D) - flatten approach
+        x = x.flatten(1)
+        y = y.flatten(1)
+        
+        for i in range(B):
+            x_i = x[i].unsqueeze(1)  # (L*D, 1) - treat flattened as single sample
+            y_i = y[i].unsqueeze(1)  # (L*D, 1)
+            
+            # Center
+            x_i = x_i - x_i.mean()
+            y_i = y_i - y_i.mean()
+            
+            # Gram matrices: (L*D, 1) @ (1, L*D) = (L*D, L*D)
+            xx = x_i @ x_i.T
+            yy = y_i @ y_i.T
+            
+            # CKA computation
+            hsic_xy = (xx * yy).sum()
+            hsic_xx = xx.square().sum()
+            hsic_yy = yy.square().sum()
+            
+            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
+            cka_i = hsic_xy / denom
+            cka_i = cka_i.clamp(0.0, 1.0)
+            
+            cka_losses.append(1.0 - cka_i)
+    
+    # Return mean loss across batch
+    return torch.stack(cka_losses).mean()
 
 class LlavaMetaModel:
 
@@ -147,9 +224,14 @@ class LlavaMetaForCausalLM(ABC):
             image_features = self.get_model().get_vision_tower()(images, text_features)
         else:
             image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
-    
+        projected_image_features = self.get_model().mm_projector(image_features)
+
+        if self.get_model().training and self.get_model().config.cka_loss:
+            cka_loss = compute_linear_cka_loss(image_features, projected_image_features)
+            return projected_image_features, cka_loss
+
+        return projected_image_features
+
     def extract_text_features(self, input_ids, attention_mask=None, exit_layer=6):
         with torch.no_grad():
             text_features = []
@@ -189,11 +271,6 @@ class LlavaMetaForCausalLM(ABC):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
-
-        if self.get_model().config.train_mtd:
-            input_ids_clone = input_ids
-            attention_mask_clone = attention_mask.clone() if attention_mask is not None else None
-            text_features = self.extract_text_features(input_ids_clone, attention_mask=attention_mask_clone, exit_layer=self.config.guided_text_select_layer)
 
         if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
@@ -244,10 +321,8 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            if self.get_model().training and self.get_model().config.train_mtd:
-                image_features, lb_loss = self.encode_images(images, text_features=text_features)
-            elif self.get_model().config.train_mtd:
-                image_features = self.encode_images(images, text_features=text_features)
+            if self.get_model().training and self.get_model().config.cka_loss:
+                image_features, cka_loss = self.encode_images(images)
             else:
                 image_features = self.encode_images(images)
 
@@ -371,8 +446,8 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        if self.get_model().training and self.get_model().config.train_mtd:
-            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, lb_loss
+        if self.get_model().training and self.get_model().config.cka_loss:
+            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, cka_loss
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

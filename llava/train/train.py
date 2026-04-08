@@ -72,6 +72,8 @@ class ModelArguments:
     router_dropout: Optional[float] = field(default=None)
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
+    cka_loss: bool = field(default=False)
+    cka_loss_weight: float = field(default=1.0)
 
 
 @dataclass
@@ -864,6 +866,8 @@ def train(attn_implementation=None):
     model.config.train_mtd = model_args.train_mtd
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
+    model.config.cka_loss = model_args.cka_loss
+    model.config.cka_loss_weight = model_args.cka_loss_weight
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
