@@ -65,7 +65,6 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
-    train_mtd: bool = field(default=False)
     student_vision_tower: Optional[str] = field(default=None)
     pretrain_student_mm_mlp_adapter: Optional[str] = field(default=None)
     router_hidden_size: Optional[int] = field(default=None)
@@ -74,6 +73,7 @@ class ModelArguments:
     mtd_topk: Optional[int] = field(default=None)
     cka_loss: bool = field(default=False)
     cka_loss_weight: float = field(default=1.0)
+    cka_loss_layers: Optional[str] = field(default="0", metadata={"help": "Comma-separated list of LLM layers to compare CKA loss with image features (e.g., '1,6,12' or 'all'). Layer 0=input embeddings, layer 1+=transformer output. Defaults to layer 1."})
 
 
 @dataclass
@@ -863,11 +863,22 @@ def train(attn_implementation=None):
         model.to(training_args.device)
 
     model.config.use_cache = False
-    model.config.train_mtd = model_args.train_mtd
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
     model.config.cka_loss_weight = model_args.cka_loss_weight
+    # Parse cka_loss_layers: can be "all", "1", or "1,6,12"
+    if model_args.cka_loss_layers:
+        if model_args.cka_loss_layers.lower() == "all":
+            model.config.cka_loss_layers = "all"
+        else:
+            try:
+                model.config.cka_loss_layers = [int(x.strip()) for x in model_args.cka_loss_layers.split(",")]
+            except ValueError:
+                rank0_print(f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', defaulting to [1]")
+                model.config.cka_loss_layers = [1]
+    else:
+        model.config.cka_loss_layers = [1]
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)

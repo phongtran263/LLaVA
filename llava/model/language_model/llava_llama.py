@@ -54,6 +54,45 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    def _compute_masked_linear_cka_loss(
+        self,
+        projected_features: torch.FloatTensor,
+        layer_hidden_states: torch.FloatTensor,
+        vision_feature_mask: torch.BoolTensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        projected_features = projected_features.float()
+        layer_hidden_states = layer_hidden_states.float()
+        vision_feature_mask = vision_feature_mask.bool()
+
+        cka_losses = []
+        for i in range(projected_features.shape[0]):
+            cur_mask = vision_feature_mask[i]
+            if cur_mask.sum() < 2:
+                continue
+
+            x_i = projected_features[i][cur_mask]
+            y_i = layer_hidden_states[i][cur_mask]
+
+            x_i = x_i - x_i.mean(dim=0, keepdim=True)
+            y_i = y_i - y_i.mean(dim=0, keepdim=True)
+
+            xx = x_i @ x_i.T
+            yy = y_i @ y_i.T
+
+            hsic_xy = (xx * yy).sum()
+            hsic_xx = xx.square().sum()
+            hsic_yy = yy.square().sum()
+
+            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
+            cka_i = (hsic_xy / denom).clamp(0.0, 1.0)
+            cka_losses.append(1.0 - cka_i)
+
+        if len(cka_losses) == 0:
+            return projected_features.new_zeros(())
+
+        return torch.stack(cka_losses).mean()
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -69,9 +108,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        cka_enabled = self.get_model().training and self.get_model().config.cka_loss
+        vision_feature_mask = None
+        pre_post_cka_loss = None
 
         if inputs_embeds is None:
-            if self.get_model().training and self.get_model().config.cka_loss:
+            if cka_enabled:
                 (
                     input_ids,
                     position_ids,
@@ -79,7 +121,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     past_key_values,
                     inputs_embeds,
                     labels,
-                    cka_loss
+                    vision_feature_mask,
+                    pre_post_cka_loss,
                 ) = self.prepare_inputs_labels_for_multimodal(
                     input_ids,
                     position_ids,
@@ -107,6 +150,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     image_sizes
                 )
 
+        should_output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        if cka_enabled:
+            should_output_hidden_states = True
+
         output =  super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -116,21 +163,89 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=should_output_hidden_states,
             return_dict=return_dict
         )
 
-        if self.get_model().training and self.get_model().config.cka_loss:
-            cka_loss = cka_loss.to(output.loss.device)
+        if cka_enabled and output.loss is not None:
+            cka_loss = output.loss.new_zeros(())
+            cka_component_count = 0
+            if pre_post_cka_loss is not None:
+                cka_loss = cka_loss + pre_post_cka_loss.to(output.loss.device)
+                cka_component_count += 1
+
+            cka_layers_loss = output.loss.new_zeros(())
+            cka_loss_layers = getattr(self.get_model().config, 'cka_loss_layers', [1])
+            
+            # Parse cka_loss_layers: can be "all", list, or None
+            if isinstance(cka_loss_layers, str):
+                if cka_loss_layers.lower() == "all" and output.hidden_states is not None:
+                    target_layers = list(range(len(output.hidden_states)))
+                else:
+                    target_layers = []
+            else:
+                target_layers = cka_loss_layers if cka_loss_layers else []
+            
+            if (
+                vision_feature_mask is not None
+                and output.hidden_states is not None
+                and inputs_embeds is not None
+                and target_layers
+            ):
+                per_layer_losses = {}
+                valid_layer_count = 0
+                for layer_idx in target_layers:
+                    if layer_idx < 0 or layer_idx >= len(output.hidden_states):
+                        continue
+                    
+                    # Compare layer_idx with layer_idx-1 (or inputs_embeds if layer_idx == 0)
+                    layer_n_hidden = output.hidden_states[layer_idx]
+                    
+                    if layer_idx == 0:
+                        # Compare layer 0 with projected image features (inputs_embeds)
+                        # Detach to prevent gradients from flowing to the reference layer
+                        layer_n_minus_1_hidden = inputs_embeds.detach()
+                        loss_key = "0"
+                    else:
+                        # Compare layer_idx with layer_idx-1
+                        # Detach to prevent gradients from flowing to the reference layer
+                        layer_n_minus_1_hidden = output.hidden_states[layer_idx - 1].detach()
+                        loss_key = f"{layer_idx}_{layer_idx-1}"
+                    
+                    layer_cka = self._compute_masked_linear_cka_loss(
+                        projected_features=layer_n_hidden,
+                        layer_hidden_states=layer_n_minus_1_hidden,
+                        vision_feature_mask=vision_feature_mask,
+                    ).to(output.loss.device)
+                    per_layer_losses[loss_key] = layer_cka.detach()
+                    cka_layers_loss = cka_layers_loss + layer_cka
+                    valid_layer_count += 1
+                
+                # Store per-layer losses for logging
+                self.last_cka_per_layer_losses = per_layer_losses
+                cka_loss = cka_loss + cka_layers_loss
+                cka_component_count += valid_layer_count
+            else:
+                self.last_cka_per_layer_losses = {}
+
+            if cka_component_count > 0:
+                cka_loss = cka_loss / cka_component_count
+
             # Store losses for logging
             self.last_cka_loss = cka_loss.detach()
             self.last_text_loss = output.loss.detach()
+            self.last_cka_pre_post_loss = (
+                pre_post_cka_loss.detach() if pre_post_cka_loss is not None else output.loss.new_zeros(()).detach()
+            )
+            self.last_cka_layers_loss = cka_layers_loss.detach()
+
+            final_hidden_states = output.hidden_states if should_output_hidden_states else None
             
             return CausalLMOutputWithPast(
                 loss=output.loss + self.get_model().config.cka_loss_weight * cka_loss,
                 logits=output.logits,
                 past_key_values=output.past_key_values,
-                hidden_states=output.hidden_states,
+                hidden_states=final_hidden_states,
                 attentions=output.attentions,
             )
         else:

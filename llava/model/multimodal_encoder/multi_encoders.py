@@ -132,15 +132,6 @@ class MultiEncoders(nn.Module):
         for mm_projector in self.mm_projectors:
             mm_projector.requires_grad_(False)
 
-        if self.args.train_mtd:
-        #     self.student_vision_tower = CLIPVisionTower(self.args.student_vision_tower, self.args, delay_load=False)
-        #     self.student_vision_tower.input_image_size = self.student_vision_tower.config.image_size
-        #     self.student_mm_projector = load_mm_projector_from_checkpoint(self.student_vision_tower, self.args.pretrain_student_mm_mlp_adapter, self.args)
-        #     self.student_vision_tower.requires_grad_(True)
-        #     self.student_mm_projector.requires_grad_(True)
-            self.router = TextGuidedRouter(text_hidden_size=self.args.text_hidden_size, num_experts=len(self.vision_tower_names), hidden_size=self.args.router_hidden_size, dropout=self.args.router_dropout)
-            self.router.requires_grad_(True)
-
         self.image_processor = CLIPImageProcessor(**cfg)
         if self.input_image_size is not None:
             self.image_processor.size=self.input_image_size
@@ -151,7 +142,7 @@ class MultiEncoders(nn.Module):
 
         self.is_loaded = True
 
-    def forward(self, images, text_features=None):
+    def forward(self, images):
         vision_tower_outputs = []
         resized_images_cache = {}
         self.router_last_stats = None
@@ -177,36 +168,6 @@ class MultiEncoders(nn.Module):
                     vision_tower_output = F.interpolate(vision_tower_output.float(), size=(24, 24), mode='bilinear', align_corners=True).to(dtype=vision_tower_output.dtype)
                     vision_tower_output = vision_tower_output.flatten(2).transpose(1, 2)
                 vision_tower_outputs.append(vision_tower_output)
-        if self.args.train_mtd and text_features is not None:
-            alpha = self.router(text_features)
-            entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(dim=-1).mean().detach()
-            top1 = alpha.argmax(dim=-1)
-            top1_hist = torch.bincount(top1, minlength=alpha.size(-1)).float() / top1.numel()
-            self.router_last_stats = {
-                "router/entropy": entropy,
-                **{f"router/weight_{i}": alpha[:, i].mean().detach() for i in range(alpha.size(-1))},
-                **{f"router/top1_frac_{i}": top1_hist[i].detach() for i in range(alpha.size(-1))},
-            }
-
-            if self.training:
-                stacked = torch.stack(vision_tower_outputs, dim=1)
-                weights = alpha.unsqueeze(-1).unsqueeze(-1)
-                mixed = (weights * stacked).sum(dim=1)
-                lb_loss = load_balance_loss(alpha)
-                return mixed, lb_loss
-            else:
-                topk = self.args.mtd_topk if self.args.mtd_topk is not None else 2
-                topk_vals, topk_idx = torch.topk(alpha, topk, dim=-1) # [B, top_k]
-                topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
-
-                stacked = torch.stack(vision_tower_outputs, dim=0)
-                B, N, D = vision_tower_outputs[0].shape
-                batch_indices = torch.arange(B, device=topk_idx.device)
-                mixed = torch.zeros(B, N, D, dtype=self.dtype, device=self.device)
-                for k in range(topk):
-                    selected = stacked[topk_idx[:, k], batch_indices]
-                    mixed = mixed + topk_weights[:, k].unsqueeze(-1).unsqueeze(-1) * selected
-                return mixed
         vision_tower_outputs = torch.cat(vision_tower_outputs, dim=-1)
         return vision_tower_outputs
     
@@ -235,8 +196,6 @@ class MultiEncoders(nn.Module):
         
     @property
     def hidden_size(self):
-        if self.args.train_mtd:
-            return self.args.hidden_size
         return self.args.hidden_size*len(self.vision_towers)
         
     @property
