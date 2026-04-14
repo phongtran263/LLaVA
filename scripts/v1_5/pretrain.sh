@@ -21,7 +21,7 @@ deepspeed --include localhost:4,5,6,7 llava/train/train_mem.py \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-mobile-pretrain-cka-all \
+    --output_dir ./checkpoints/llava-v1.5-mobile-pretrain-cka-decay \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
@@ -41,6 +41,11 @@ deepspeed --include localhost:4,5,6,7 llava/train/train_mem.py \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
+    --run_name llava-mobile-pretrain-cka-decay \
     --cka_loss True \
     --cka_loss_weight 0.1 \
-    --cka_loss_layers "all"
+    --cka_loss_layers "all" \
+    --cka_loss_exclude_last_layers 0 \
+    --cka_loss_layer_decay 0.97 \
+    # --cka_loss_subset_select_layer 8 \
+    # --cka_loss_subset_ratio 0.5

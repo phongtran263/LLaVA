@@ -466,8 +466,9 @@ class LlavaMetaForCausalLM(ABC):
         else:
             new_labels = new_labels_padded
 
+        keep_attention_mask_for_cka = self.get_model().training and self.get_model().config.cka_loss and getattr(self.get_model().config, 'cka_loss_subset_select_layer', None) is not None
         if _attention_mask is None:
-            attention_mask = None
+            attention_mask = attention_mask if keep_attention_mask_for_cka else None
         else:
             attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 

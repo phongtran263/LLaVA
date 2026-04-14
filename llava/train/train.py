@@ -74,6 +74,10 @@ class ModelArguments:
     cka_loss: bool = field(default=False)
     cka_loss_weight: float = field(default=1.0)
     cka_loss_layers: Optional[str] = field(default="0", metadata={"help": "Comma-separated list of LLM layers to compare CKA loss with image features (e.g., '1,6,12' or 'all'). Layer 0=input embeddings, layer 1+=transformer output. Defaults to layer 1."})
+    cka_loss_exclude_last_layers: int = field(default=0, metadata={"help": "Number of last LLM layers to exclude from CKA loss. For example, 1 skips the final transformer layer."})
+    cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Exponential decay for consecutive LLM-layer CKA weights. 1.0 means equal weights; lower values down-weight deeper consecutive terms."})
+    cka_loss_subset_select_layer: Optional[int] = field(default=None, metadata={"help": "LLM transformer layer index (1-based) whose text-to-image attention is used to select important image tokens for later CKA layers."})
+    cka_loss_subset_ratio: float = field(default=0.5, metadata={"help": "Fraction of image tokens kept when selecting the CKA subset from attention at cka_loss_subset_select_layer."})
 
 
 @dataclass
@@ -867,6 +871,10 @@ def train(attn_implementation=None):
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
     model.config.cka_loss_weight = model_args.cka_loss_weight
+    model.config.cka_loss_exclude_last_layers = max(0, int(model_args.cka_loss_exclude_last_layers))
+    model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
+    model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
+    model.config.cka_loss_subset_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_ratio)))
     # Parse cka_loss_layers: can be "all", "1", or "1,6,12"
     if model_args.cka_loss_layers:
         if model_args.cka_loss_layers.lower() == "all":
