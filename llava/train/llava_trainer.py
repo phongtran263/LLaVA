@@ -166,11 +166,17 @@ class LLaVATrainer(Trainer):
 
         cka_loss = getattr(model, 'last_cka_loss', None)
         text_loss = getattr(model, 'last_text_loss', None)
+        cka_projector_loss = getattr(model, 'last_cka_pre_post_loss', None)
+        cka_layers_loss = getattr(model, 'last_cka_layers_loss', None)
 
         if cka_loss is not None:
             logs['loss/cka_loss'] = cka_loss.item() if torch.is_tensor(cka_loss) else float(cka_loss)
         if text_loss is not None:
             logs['loss/text_loss'] = text_loss.item() if torch.is_tensor(text_loss) else float(text_loss)
+        if cka_projector_loss is not None:
+            logs['loss/cka_projector_loss'] = cka_projector_loss.item() if torch.is_tensor(cka_projector_loss) else float(cka_projector_loss)
+        if cka_layers_loss is not None:
+            logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
 
         return super().log(logs)
 

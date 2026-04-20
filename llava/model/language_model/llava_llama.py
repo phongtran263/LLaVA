@@ -253,11 +253,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 subset_vision_feature_mask = vision_feature_mask
 
         if cka_enabled and output.loss is not None:
-            cka_loss = output.loss.new_zeros(())
-            cka_component_weight_sum = 0.0
+            projector_cka_loss = output.loss.new_zeros(())
             if pre_post_cka_loss is not None:
-                cka_loss = cka_loss + pre_post_cka_loss.to(output.loss.device)
-                cka_component_weight_sum += 1.0
+                projector_cka_loss = pre_post_cka_loss.to(output.loss.device)
 
             cka_layers_loss = output.loss.new_zeros(())
             cka_loss_layers = getattr(self.get_model().config, 'cka_loss_layers', [1])
@@ -327,20 +325,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 # Store per-layer losses for logging
                 self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
-                cka_loss = cka_loss + cka_layers_loss
-                cka_component_weight_sum += valid_layer_weight_sum
+                if valid_layer_weight_sum > 0:
+                    cka_layers_loss = cka_layers_loss / valid_layer_weight_sum
             else:
                 self.last_cka_per_layer_losses = {}
                 self.last_cka_subset_vision_feature_mask = subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
 
-            if cka_component_weight_sum > 0:
-                cka_loss = cka_loss / cka_component_weight_sum
+            # Keep projector CKA and layer CKA as separate terms.
+            cka_loss = projector_cka_loss + cka_layers_loss
 
             # Store losses for logging
             self.last_cka_loss = cka_loss.detach()
             self.last_text_loss = output.loss.detach()
             self.last_cka_pre_post_loss = (
-                pre_post_cka_loss.detach() if pre_post_cka_loss is not None else output.loss.new_zeros(()).detach()
+                projector_cka_loss.detach()
             )
             self.last_cka_layers_loss = cka_layers_loss.detach()
 
