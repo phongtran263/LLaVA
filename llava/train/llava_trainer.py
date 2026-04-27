@@ -132,6 +132,125 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            unwrapped_model = unwrap_model(model)
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if not self.model.config.cka_loss:
+            return (loss, outputs) if return_outputs else loss
+         
+        aux_losses = outputs["aux_losses"]
+        return (loss, aux_losses, outputs) if return_outputs else (loss, aux_losses)
+
+    def pc_backward(self, loss, aux_losses):
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if not params:
+            return
+
+        prev_grads = [p.grad.detach().clone() if p.grad is not None else None for p in params]
+        for p in params:
+            p.grad = None
+
+        self.accelerator.backward(loss, retain_graph=True)
+        text_grads = [
+            p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
+            for p in params
+        ]
+        for p in params:
+            p.grad = None
+
+        text_norm_sq = sum((g ** 2).sum() for g in text_grads).clamp(min=1e-12)
+        text_norm = torch.sqrt(text_norm_sq)
+        max_aux_norm = self.model.config.cka_loss_weight * text_norm
+
+        aux_projected_grads = []
+        for idx, aux_loss in enumerate(aux_losses):
+            if self.accelerator.scaler is not None:
+                aux_loss = self.accelerator.scaler.scale(aux_loss)
+            
+            aux_grads = torch.autograd.grad(aux_loss, params, retain_graph=(idx < len(aux_losses) - 1), allow_unused=True)
+            aux_grads = [
+                g.detach() if g is not None else torch.zeros_like(p)
+                for g, p in zip(aux_grads, params)
+            ]
+            with torch.no_grad():
+                dot = sum((t * a).sum().item() for t, a in zip(text_grads, aux_grads))
+                if dot < 0:
+                    coeeff = dot / text_norm_sq
+                    aux_grads = [a - coeeff * t for a, t in zip(aux_grads, text_grads)]
+                # aux_grads_norm = torch.sqrt(sum((g ** 2).sum() for g in aux_grads).clamp(min=1e-12))
+                # if aux_grads_norm > max_aux_norm:
+                #     ratio = max_aux_norm / aux_grads_norm
+                #     aux_grads = [a * ratio for a in aux_grads]
+            aux_projected_grads.append(aux_grads)
+
+        with torch.no_grad():
+            for i,p in enumerate(params):
+                final = text_grads[i] + sum(aux_grads[i] for aux_grads in aux_projected_grads)
+                if prev_grads[i] is not None:
+                    p.grad = final + prev_grads[i]
+                else:
+                    p.grad = final                    
+
+    def training_step(self, model, inputs):
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.compute_loss_context_manager():
+            if not self.model.config.cka_loss:
+                loss = self.compute_loss(model, inputs)
+            else:
+                loss, aux_losses = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  
+        if self.model.config.cka_loss and self.args.n_gpu > 1:
+            aux_losses = [aux_loss.mean() for aux_loss in aux_losses]
+
+        if not self.model.config.use_pcgrad and self.model.config.cka_loss:
+            loss = loss + sum(aux_losses)
+        elif self.model.config.use_pcgrad and self.model.config.cka_loss:
+            self.pc_backward(loss, aux_losses)
+            return (loss + sum(aux_losses)).detach() / self.args.gradient_accumulation_steps
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
     def _collect_router_stats(self):
         queue = [self.model]
         visited = set()

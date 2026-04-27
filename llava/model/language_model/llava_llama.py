@@ -14,6 +14,7 @@
 
 
 from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import math
 import torch
@@ -38,6 +39,9 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
+@dataclass
+class CausalLMOutputWithPastAux(CausalLMOutputWithPast):
+    aux_losses: Optional[List[torch.Tensor]] = None
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
@@ -171,8 +175,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         cka_enabled = self.get_model().training and self.get_model().config.cka_loss
+        use_pcgrad = getattr(self.get_model().config, 'use_pcgrad', False)
         vision_feature_mask = None
-        subset_vision_feature_mask = None
         pre_post_cka_loss = None
 
         if inputs_embeds is None:
@@ -212,16 +216,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     images,
                     image_sizes
                 )
-
-        should_output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        if cka_enabled:
-            should_output_hidden_states = True
-
-        should_output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
-        if cka_enabled and subset_select_layer is not None:
-            should_output_attentions = True
-
+        should_output_hidden_states = cka_enabled and self.get_model().config.cka_loss_layers != [-1]
         output =  super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -230,27 +225,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds=inputs_embeds,
             labels=labels,
             use_cache=use_cache,
-            output_attentions=should_output_attentions,
+            output_attentions=output_attentions,
             output_hidden_states=should_output_hidden_states,
             return_dict=return_dict
         )
-
-        if (
-            cka_enabled
-            and subset_select_layer is not None
-            and vision_feature_mask is not None
-            and output.attentions is not None
-        ):
-            subset_ratio = getattr(self.get_model().config, 'cka_loss_subset_ratio', 0.5)
-            subset_vision_feature_mask = self._select_vision_feature_subset_from_attention(
-                attentions=output.attentions,
-                vision_feature_mask=vision_feature_mask,
-                attention_mask=attention_mask,
-                select_layer=subset_select_layer,
-                subset_ratio=subset_ratio,
-            )
-            if subset_vision_feature_mask is None:
-                subset_vision_feature_mask = vision_feature_mask
 
         if cka_enabled and output.loss is not None:
             projector_cka_loss = output.loss.new_zeros(())
@@ -258,12 +236,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 projector_cka_loss = pre_post_cka_loss.to(output.loss.device)
 
             cka_layers_loss = output.loss.new_zeros(())
-            cka_loss_layers = getattr(self.get_model().config, 'cka_loss_layers', [1])
+            cka_loss_layers = getattr(self.get_model().config, 'cka_loss_layers', [0])
             
             # Parse cka_loss_layers: can be "all", list, or None
             if isinstance(cka_loss_layers, str):
                 if cka_loss_layers.lower() == "all" and output.hidden_states is not None:
-                    target_layers = list(range(len(output.hidden_states)))
+                    target_layers = list(range(1, len(output.hidden_states)))
                 else:
                     target_layers = []
             else:
@@ -273,7 +251,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if exclude_last_layers > 0 and output.hidden_states is not None:
                 max_allowed_layer_idx = len(output.hidden_states) - exclude_last_layers - 1
                 target_layers = [layer_idx for layer_idx in target_layers if layer_idx <= max_allowed_layer_idx]
-            
+
             if (
                 vision_feature_mask is not None
                 and output.hidden_states is not None
@@ -284,7 +262,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 valid_layer_weight_sum = 0.0
                 filtered_target_layers = []
                 for layer_idx in target_layers:
-                    if 0 <= layer_idx < len(output.hidden_states):
+                    if 1 <= (layer_idx+1) < len(output.hidden_states):
                         filtered_target_layers.append(layer_idx)
 
                 layer_decay = float(getattr(self.get_model().config, 'cka_loss_layer_decay', 1.0))
@@ -298,20 +276,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     # first selected layer vs projected image, later layers vs previous selected layer.
                     layer_n_hidden = output.hidden_states[layer_idx]
 
-                    if i == 0:
-                        # Compare first selected layer with projected image features.
-                        layer_n_minus_1_hidden = inputs_embeds.detach()
-                        loss_key = f"{layer_idx}_proj"
-                    else:
-                        prev_layer_idx = filtered_target_layers[i - 1]
-                        # Detach to prevent gradients from flowing to the reference layer.
-                        layer_n_minus_1_hidden = output.hidden_states[prev_layer_idx].detach()
-                        loss_key = f"{layer_idx}_{prev_layer_idx}"
+                    prev_layer_idx = filtered_target_layers[i - 1]
+                    # Detach to prevent gradients from flowing to the reference layer.
+                    layer_n_minus_1_hidden = output.hidden_states[prev_layer_idx].detach()
+                    loss_key = f"{layer_idx}_{prev_layer_idx}"
 
                     layer_mask = vision_feature_mask
-                    if subset_vision_feature_mask is not None and subset_select_layer is not None and layer_idx > subset_select_layer:
-                        layer_mask = subset_vision_feature_mask
-                    
+
                     layer_cka = self._compute_masked_linear_cka_loss(
                         projected_features=layer_n_hidden,
                         layer_hidden_states=layer_n_minus_1_hidden,
@@ -324,12 +295,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 
                 # Store per-layer losses for logging
                 self.last_cka_per_layer_losses = per_layer_losses
-                self.last_cka_subset_vision_feature_mask = subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
                 if valid_layer_weight_sum > 0:
                     cka_layers_loss = cka_layers_loss / valid_layer_weight_sum
             else:
                 self.last_cka_per_layer_losses = {}
-                self.last_cka_subset_vision_feature_mask = subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
 
             # Keep projector CKA and layer CKA as separate terms.
             cka_loss = projector_cka_loss + cka_layers_loss
@@ -341,15 +310,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 projector_cka_loss.detach()
             )
             self.last_cka_layers_loss = cka_layers_loss.detach()
-
-            final_hidden_states = output.hidden_states if should_output_hidden_states else None
+            self._aux_losses = [cka_loss]
             
-            return CausalLMOutputWithPast(
-                loss=output.loss + self.get_model().config.cka_loss_weight * cka_loss,
+            return CausalLMOutputWithPastAux(
+                loss=output.loss,
                 logits=output.logits,
                 past_key_values=output.past_key_values,
-                hidden_states=final_hidden_states,
+                hidden_states=None,
                 attentions=output.attentions,
+                aux_losses=self._aux_losses
             )
         else:
             return output

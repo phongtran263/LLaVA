@@ -72,6 +72,7 @@ class ModelArguments:
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
     cka_loss: bool = field(default=False)
+    use_pcgrad: bool = field(default=False)
     cka_loss_weight: float = field(default=1.0)
     cka_loss_layers: Optional[str] = field(default="0", metadata={"help": "Comma-separated list of LLM layers to compare CKA loss with image features (e.g., '1,6,12' or 'all'). Layer 0=input embeddings, layer 1+=transformer output. Defaults to layer 1."})
     cka_loss_exclude_last_layers: int = field(default=0, metadata={"help": "Number of last LLM layers to exclude from CKA loss. For example, 1 skips the final transformer layer."})
@@ -124,6 +125,11 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    debug_compare_cka: bool = field(default=False, metadata={"help": "Run a single-batch cka_loss off/on comparison and exit."})
+    debug_compare_batch_size: int = field(default=1, metadata={"help": "Number of dataset items to collate for the CKA debug comparison."})
+    debug_compare_batch_start: int = field(default=0, metadata={"help": "Starting dataset index for the CKA debug comparison batch."})
+    debug_compare_seed: int = field(default=1234, metadata={"help": "Random seed reused for both CKA-off and CKA-on debug passes."})
+    debug_compare_grad_param: Optional[str] = field(default=None, metadata={"help": "Optional substring used to choose a reference parameter when comparing gradients."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -799,6 +805,27 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
+def run_cka_debug_compare(trainer: LLaVATrainer, training_args: TrainingArguments) -> Dict:
+    dataset = trainer.train_dataset
+    if dataset is None or len(dataset) == 0:
+        raise ValueError("CKA debug compare requires a non-empty train_dataset.")
+
+    batch_size = max(1, int(training_args.debug_compare_batch_size))
+    start_index = max(0, int(training_args.debug_compare_batch_start))
+    indices = [(start_index + offset) % len(dataset) for offset in range(batch_size)]
+    instances = [dataset[idx] for idx in indices]
+    batch = trainer.data_collator(instances)
+
+    results = trainer.debug_compare_cka(
+        batch=batch,
+        seed=training_args.debug_compare_seed,
+        grad_param_name=training_args.debug_compare_grad_param,
+    )
+    results["batch_indices"] = indices
+    results["debug_seed"] = training_args.debug_compare_seed
+    return results
+
+
 def train(attn_implementation=None):
     global local_rank
 
@@ -870,6 +897,7 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    model.config.use_pcgrad = model_args.use_pcgrad
     model.config.cka_loss_weight = model_args.cka_loss_weight
     model.config.cka_loss_exclude_last_layers = max(0, int(model_args.cka_loss_exclude_last_layers))
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
@@ -1016,6 +1044,24 @@ def train(attn_implementation=None):
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+    if training_args.debug_compare_cka:
+        if hasattr(trainer, "_move_model_to_device"):
+            trainer._move_model_to_device(trainer.model, training_args.device)
+        else:
+            trainer.model.to(training_args.device)
+        if hasattr(trainer.model, "get_model"):
+            inner_model = trainer.model.get_model()
+            mm_projector = getattr(inner_model, "mm_projector", None)
+            if mm_projector is not None:
+                if training_args.bf16:
+                    mm_projector.to(dtype=torch.bfloat16, device=training_args.device)
+                elif training_args.fp16:
+                    mm_projector.to(dtype=torch.float16, device=training_args.device)
+        debug_results = run_cka_debug_compare(trainer, training_args)
+        if training_args.local_rank in (-1, 0):
+            print(json.dumps(debug_results, indent=2, sort_keys=True))
+        return
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
