@@ -105,8 +105,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         attention_mask: Optional[torch.Tensor],
         select_layer: Optional[int],
         subset_ratio: float,
+        min_keep_tokens: int = 2,
     ) -> Optional[torch.BoolTensor]:
+        """
+        Select a subset of image tokens using text-to-image attention at one LLM layer.
+
+        For each sample, we compute an importance score for every image token by averaging
+        the attention mass coming from all valid text tokens and all heads. Then we keep
+        the top-k image tokens.
+        """
         if attentions is None or vision_feature_mask is None or select_layer is None:
+            return None
+
+        if not isinstance(attentions, (list, tuple)) or len(attentions) == 0:
             return None
 
         if select_layer < 1:
@@ -125,35 +136,40 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             attention_mask = attention_mask.bool()
 
+        subset_ratio = float(max(0.0, min(1.0, subset_ratio)))
+        if subset_ratio <= 0.0:
+            return vision_feature_mask.clone()
+
         layer_attn = layer_attn.float()
         selected_masks = []
-        subset_ratio = float(max(0.0, min(1.0, subset_ratio)))
 
         for batch_idx in range(layer_attn.shape[0]):
-            cur_valid_mask = attention_mask[batch_idx]
-            cur_vision_mask = vision_feature_mask[batch_idx] & cur_valid_mask
-            cur_text_mask = (~vision_feature_mask[batch_idx]) & cur_valid_mask
+            valid_mask = attention_mask[batch_idx]
+            image_mask = vision_feature_mask[batch_idx] & valid_mask
+            text_mask = (~vision_feature_mask[batch_idx]) & valid_mask
 
-            image_token_count = int(cur_vision_mask.sum().item())
-            text_token_count = int(cur_text_mask.sum().item())
-            if image_token_count < 2 or text_token_count == 0 or subset_ratio <= 0.0:
-                selected_masks.append(cur_vision_mask.clone())
+            image_token_count = int(image_mask.sum().item())
+            text_token_count = int(text_mask.sum().item())
+            if image_token_count < min_keep_tokens or text_token_count == 0:
+                selected_masks.append(image_mask.clone())
                 continue
 
-            keep_count = max(2, int(math.ceil(image_token_count * subset_ratio)))
+            keep_count = max(min_keep_tokens, int(math.ceil(image_token_count * subset_ratio)))
             keep_count = min(keep_count, image_token_count)
 
-            attn_i = layer_attn[batch_idx]  # [heads, seq, seq]
-            text_to_image = attn_i[:, cur_text_mask][:, :, cur_vision_mask]
+            # attn_i: [heads, seq, seq]
+            attn_i = layer_attn[batch_idx]
+            text_to_image = attn_i[:, text_mask][:, :, image_mask]
             if text_to_image.numel() == 0:
-                selected_masks.append(cur_vision_mask.clone())
+                selected_masks.append(image_mask.clone())
                 continue
 
+            # Score each image token by average attention received from text queries.
             image_scores = text_to_image.mean(dim=(0, 1))
             topk_indices = torch.topk(image_scores, k=keep_count, largest=True).indices
 
-            selected_mask = torch.zeros_like(cur_vision_mask)
-            image_positions = torch.where(cur_vision_mask)[0]
+            selected_mask = torch.zeros_like(image_mask)
+            image_positions = torch.where(image_mask)[0]
             selected_mask[image_positions[topk_indices]] = True
             selected_masks.append(selected_mask)
 
@@ -177,6 +193,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         cka_enabled = self.get_model().training and self.get_model().config.cka_loss
         use_pcgrad = getattr(self.get_model().config, 'use_pcgrad', False)
         vision_feature_mask = None
+        subset_vision_feature_mask = None
         pre_post_cka_loss = None
 
         if inputs_embeds is None:
@@ -217,6 +234,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     image_sizes
                 )
         should_output_hidden_states = cka_enabled and self.get_model().config.cka_loss_layers != [-1]
+        should_output_attentions = output_attentions
+        subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
+        if cka_enabled and subset_select_layer is not None:
+            should_output_attentions = True
+
         output =  super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -225,10 +247,27 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds=inputs_embeds,
             labels=labels,
             use_cache=use_cache,
-            output_attentions=output_attentions,
+            output_attentions=should_output_attentions,
             output_hidden_states=should_output_hidden_states,
             return_dict=return_dict
         )
+
+        if (
+            cka_enabled
+            and subset_select_layer is not None
+            and vision_feature_mask is not None
+            and output.attentions is not None
+        ):
+            subset_ratio = getattr(self.get_model().config, 'cka_loss_subset_ratio', 0.5)
+            subset_vision_feature_mask = self._select_vision_feature_subset_from_attention(
+                attentions=output.attentions,
+                vision_feature_mask=vision_feature_mask,
+                attention_mask=attention_mask,
+                select_layer=subset_select_layer,
+                subset_ratio=subset_ratio,
+            )
+            if subset_vision_feature_mask is None:
+                subset_vision_feature_mask = vision_feature_mask
 
         if cka_enabled and output.loss is not None:
             projector_cka_loss = output.loss.new_zeros(())
@@ -262,7 +301,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 valid_layer_weight_sum = 0.0
                 filtered_target_layers = []
                 for layer_idx in target_layers:
-                    if 1 <= (layer_idx+1) < len(output.hidden_states):
+                    if 0 <= layer_idx < len(output.hidden_states):
                         filtered_target_layers.append(layer_idx)
 
                 layer_decay = float(getattr(self.get_model().config, 'cka_loss_layer_decay', 1.0))
@@ -276,12 +315,22 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     # first selected layer vs projected image, later layers vs previous selected layer.
                     layer_n_hidden = output.hidden_states[layer_idx]
 
-                    prev_layer_idx = filtered_target_layers[i - 1]
-                    # Detach to prevent gradients from flowing to the reference layer.
-                    layer_n_minus_1_hidden = output.hidden_states[prev_layer_idx].detach()
-                    loss_key = f"{layer_idx}_{prev_layer_idx}"
+                    if i == 0:
+                        layer_n_minus_1_hidden = inputs_embeds.detach()
+                        loss_key = f"{layer_idx}_proj"
+                    else:
+                        prev_layer_idx = filtered_target_layers[i - 1]
+                        # Detach to prevent gradients from flowing to the reference layer.
+                        layer_n_minus_1_hidden = output.hidden_states[prev_layer_idx].detach()
+                        loss_key = f"{layer_idx}_{prev_layer_idx}"
 
                     layer_mask = vision_feature_mask
+                    if (
+                        subset_vision_feature_mask is not None
+                        and subset_select_layer is not None
+                        and layer_idx > subset_select_layer
+                    ):
+                        layer_mask = subset_vision_feature_mask
 
                     layer_cka = self._compute_masked_linear_cka_loss(
                         projected_features=layer_n_hidden,
@@ -295,10 +344,16 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 
                 # Store per-layer losses for logging
                 self.last_cka_per_layer_losses = per_layer_losses
+                self.last_cka_subset_vision_feature_mask = (
+                    subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
+                )
                 if valid_layer_weight_sum > 0:
                     cka_layers_loss = cka_layers_loss / valid_layer_weight_sum
             else:
                 self.last_cka_per_layer_losses = {}
+                self.last_cka_subset_vision_feature_mask = (
+                    subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
+                )
 
             # Keep projector CKA and layer CKA as separate terms.
             cka_loss = projector_cka_loss + cka_layers_loss
@@ -317,7 +372,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 logits=output.logits,
                 past_key_values=output.past_key_values,
                 hidden_states=None,
-                attentions=output.attentions,
+                attentions=None,
                 aux_losses=self._aux_losses
             )
         else:
