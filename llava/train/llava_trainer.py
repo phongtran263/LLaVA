@@ -165,8 +165,9 @@ class LLaVATrainer(Trainer):
         if not self.model.config.cka_loss:
             return (loss, outputs) if return_outputs else loss
          
+        projector_cka_loss = outputs["projector_cka_loss"]
         aux_losses = outputs["aux_losses"]
-        return (loss, aux_losses, outputs) if return_outputs else (loss, aux_losses)
+        return (loss, projector_cka_loss, aux_losses, outputs) if return_outputs else (loss, projector_cka_loss, aux_losses)
 
     def pc_backward(self, loss, aux_losses):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -228,20 +229,31 @@ class LLaVATrainer(Trainer):
 
         with self.compute_loss_context_manager():
             if not self.model.config.cka_loss:
-                loss = self.compute_loss(model, inputs)
+                text_loss = self.compute_loss(model, inputs)
+                projector_cka_loss = None
+                aux_losses = None
             else:
-                loss, aux_losses = self.compute_loss(model, inputs)
+                text_loss, projector_cka_loss, aux_losses = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
-            loss = loss.mean()  
+            text_loss = text_loss.mean()
+            if projector_cka_loss is not None:
+                projector_cka_loss = projector_cka_loss.mean()
         if self.model.config.cka_loss and self.args.n_gpu > 1:
             aux_losses = [aux_loss.mean() for aux_loss in aux_losses]
+
+        loss = text_loss
+        if self.model.config.cka_loss:
+            if projector_cka_loss is not None:
+                loss = loss + projector_cka_loss
 
         if not self.model.config.use_pcgrad and self.model.config.cka_loss:
             loss = loss + sum(aux_losses)
         elif self.model.config.use_pcgrad and self.model.config.cka_loss:
-            self.pc_backward(loss, aux_losses)
-            return (loss + sum(aux_losses)).detach() / self.args.gradient_accumulation_steps
+            if projector_cka_loss is not None:
+                self.accelerator.backward(projector_cka_loss, retain_graph=True)
+            self.pc_backward(text_loss, aux_losses)
+            return (text_loss + (projector_cka_loss if projector_cka_loss is not None else 0) + sum(aux_losses)).detach() / self.args.gradient_accumulation_steps
 
         if self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
@@ -285,7 +297,7 @@ class LLaVATrainer(Trainer):
 
         cka_loss = getattr(model, 'last_cka_loss', None)
         text_loss = getattr(model, 'last_text_loss', None)
-        cka_projector_loss = getattr(model, 'last_cka_pre_post_loss', None)
+        cka_projector_loss = getattr(model, 'last_cka_projector_loss', getattr(model, 'last_cka_pre_post_loss', None))
         cka_layers_loss = getattr(model, 'last_cka_layers_loss', None)
 
         if cka_loss is not None:

@@ -41,6 +41,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
 @dataclass
 class CausalLMOutputWithPastAux(CausalLMOutputWithPast):
+    projector_cka_loss: Optional[torch.Tensor] = None
     aux_losses: Optional[List[torch.Tensor]] = None
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
@@ -191,10 +192,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         cka_enabled = self.get_model().training and self.get_model().config.cka_loss
-        use_pcgrad = getattr(self.get_model().config, 'use_pcgrad', False)
         vision_feature_mask = None
         subset_vision_feature_mask = None
         pre_post_cka_loss = None
+        self.last_cka_loss = None
+        self.last_cka_projector_loss = None
+        self.last_cka_pre_post_loss = None
+        self.last_cka_layers_loss = None
+        self.last_cka_per_layer_losses = {}
+        self.last_cka_subset_vision_feature_mask = None
 
         if inputs_embeds is None:
             if cka_enabled:
@@ -350,22 +356,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 if valid_layer_weight_sum > 0:
                     cka_layers_loss = cka_layers_loss / valid_layer_weight_sum
             else:
-                self.last_cka_per_layer_losses = {}
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
                 )
 
-            # Keep projector CKA and layer CKA as separate terms.
+            # Keep projector CKA and LLM CKA as separate terms.
             cka_loss = projector_cka_loss + cka_layers_loss
 
             # Store losses for logging
             self.last_cka_loss = cka_loss.detach()
+            self.last_cka_projector_loss = projector_cka_loss.detach()
             self.last_text_loss = output.loss.detach()
-            self.last_cka_pre_post_loss = (
-                projector_cka_loss.detach()
-            )
+            self.last_cka_pre_post_loss = projector_cka_loss.detach()
             self.last_cka_layers_loss = cka_layers_loss.detach()
-            self._aux_losses = [cka_loss]
+            self._aux_losses = [cka_layers_loss]
             
             return CausalLMOutputWithPastAux(
                 loss=output.loss,
@@ -373,6 +377,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values=output.past_key_values,
                 hidden_states=None,
                 attentions=None,
+                projector_cka_loss=projector_cka_loss,
                 aux_losses=self._aux_losses
             )
         else:
