@@ -204,6 +204,38 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
     return input_ids
 
 
+
+def get_generation_config_kwargs(model):
+    generation_config = getattr(model, "generation_config", None)
+    eos_token_id = getattr(generation_config, "eos_token_id", None) if generation_config is not None else None
+    pad_token_id = getattr(generation_config, "pad_token_id", None) if generation_config is not None else None
+
+    if eos_token_id is None:
+        eos_token_id = getattr(model.config, "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(model.config, "pad_token_id", None)
+
+    kwargs = {
+        "use_cache": True,
+        "output_attentions": False,
+        "output_hidden_states": False,
+    }
+    if eos_token_id is not None:
+        kwargs["eos_token_id"] = eos_token_id
+    if pad_token_id is not None:
+        kwargs["pad_token_id"] = pad_token_id
+    return kwargs
+
+
+def maybe_override_qwen_conv_mode(args, model_name):
+    if "qwen" not in str(model_name).lower():
+        return
+
+    if getattr(args, "conv_mode", None) in (None, "llava_v1", "vicuna_v1", "llava_v0"):
+        args.conv_mode = "qwen2"
+        print("Auto switching conversation mode to qwen2 for Qwen model.")
+
+
 def get_model_name_from_path(model_path):
     model_path = model_path.strip("/")
     model_paths = model_path.split("/")

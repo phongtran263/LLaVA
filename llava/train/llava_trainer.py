@@ -12,7 +12,46 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
     logger,
 )
+from transformers.modeling_utils import unwrap_model
 from typing import List, Optional
+
+
+def sanitize_generation_config_for_save(model):
+    model_to_save = unwrap_model(model)
+    generation_config = getattr(model_to_save, "generation_config", None)
+    if generation_config is None:
+        return
+
+    if getattr(generation_config, "do_sample", None) is False:
+        for attr, default in {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "typical_p": 1.0,
+            "top_k": 50,
+            "epsilon_cutoff": 0.0,
+            "eta_cutoff": 0.0,
+        }.items():
+            if hasattr(generation_config, attr):
+                setattr(generation_config, attr, default)
+
+    if getattr(generation_config, "num_beams", None) in (None, 1):
+        for attr, default in {
+            "num_beams": 1,
+            "early_stopping": False,
+            "num_beam_groups": 1,
+            "diversity_penalty": 0.0,
+            "length_penalty": 1.0,
+            "constraints": None,
+        }.items():
+            if hasattr(generation_config, attr):
+                setattr(generation_config, attr, default)
+
+    if (
+        getattr(generation_config, "do_sample", None) is False
+        and getattr(generation_config, "num_beams", None) == 1
+        and getattr(generation_config, "num_return_sequences", None) != 1
+    ):
+        generation_config.num_return_sequences = 1
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -164,60 +203,12 @@ class LLaVATrainer(Trainer):
 
         if not self.model.config.cka_loss:
             return (loss, outputs) if return_outputs else loss
-         
+
+        # Model output splits CKA into the projector term and auxiliary LLM-hidden terms
+        # so they can be weighted and logged separately.
         projector_cka_loss = outputs["projector_cka_loss"]
         aux_losses = outputs["aux_losses"]
         return (loss, projector_cka_loss, aux_losses, outputs) if return_outputs else (loss, projector_cka_loss, aux_losses)
-
-    def pc_backward(self, loss, aux_losses):
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if not params:
-            return
-
-        prev_grads = [p.grad.detach().clone() if p.grad is not None else None for p in params]
-        for p in params:
-            p.grad = None
-
-        self.accelerator.backward(loss, retain_graph=True)
-        text_grads = [
-            p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
-            for p in params
-        ]
-        for p in params:
-            p.grad = None
-
-        text_norm_sq = sum((g ** 2).sum() for g in text_grads).clamp(min=1e-12)
-        text_norm = torch.sqrt(text_norm_sq)
-        max_aux_norm = self.model.config.cka_loss_weight * text_norm
-
-        aux_projected_grads = []
-        for idx, aux_loss in enumerate(aux_losses):
-            if self.accelerator.scaler is not None:
-                aux_loss = self.accelerator.scaler.scale(aux_loss)
-            
-            aux_grads = torch.autograd.grad(aux_loss, params, retain_graph=(idx < len(aux_losses) - 1), allow_unused=True)
-            aux_grads = [
-                g.detach() if g is not None else torch.zeros_like(p)
-                for g, p in zip(aux_grads, params)
-            ]
-            with torch.no_grad():
-                dot = sum((t * a).sum().item() for t, a in zip(text_grads, aux_grads))
-                if dot < 0:
-                    coeeff = dot / text_norm_sq
-                    aux_grads = [a - coeeff * t for a, t in zip(aux_grads, text_grads)]
-                # aux_grads_norm = torch.sqrt(sum((g ** 2).sum() for g in aux_grads).clamp(min=1e-12))
-                # if aux_grads_norm > max_aux_norm:
-                #     ratio = max_aux_norm / aux_grads_norm
-                #     aux_grads = [a * ratio for a in aux_grads]
-            aux_projected_grads.append(aux_grads)
-
-        with torch.no_grad():
-            for i,p in enumerate(params):
-                final = text_grads[i] + sum(aux_grads[i] for aux_grads in aux_projected_grads)
-                if prev_grads[i] is not None:
-                    p.grad = final + prev_grads[i]
-                else:
-                    p.grad = final                    
 
     def training_step(self, model, inputs):
         model.train()
@@ -246,14 +237,8 @@ class LLaVATrainer(Trainer):
         if self.model.config.cka_loss:
             if projector_cka_loss is not None:
                 loss = loss + projector_cka_loss
-
-        if not self.model.config.use_pcgrad and self.model.config.cka_loss:
+            # Auxiliary CKA currently contains the final LLM hidden vs pre-projector term.
             loss = loss + sum(aux_losses)
-        elif self.model.config.use_pcgrad and self.model.config.cka_loss:
-            if projector_cka_loss is not None:
-                self.accelerator.backward(projector_cka_loss, retain_graph=True)
-            self.pc_backward(text_loss, aux_losses)
-            return (text_loss + (projector_cka_loss if projector_cka_loss is not None else 0) + sum(aux_losses)).detach() / self.args.gradient_accumulation_steps
 
         if self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
@@ -298,6 +283,7 @@ class LLaVATrainer(Trainer):
         cka_loss = getattr(model, 'last_cka_loss', None)
         text_loss = getattr(model, 'last_text_loss', None)
         cka_projector_loss = getattr(model, 'last_cka_projector_loss', getattr(model, 'last_cka_pre_post_loss', None))
+        cka_pre_final_loss = getattr(model, 'last_cka_pre_final_loss', None)
         cka_layers_loss = getattr(model, 'last_cka_layers_loss', None)
 
         if cka_loss is not None:
@@ -306,6 +292,8 @@ class LLaVATrainer(Trainer):
             logs['loss/text_loss'] = text_loss.item() if torch.is_tensor(text_loss) else float(text_loss)
         if cka_projector_loss is not None:
             logs['loss/cka_projector_loss'] = cka_projector_loss.item() if torch.is_tensor(cka_projector_loss) else float(cka_projector_loss)
+        if cka_pre_final_loss is not None:
+            logs['loss/cka_pre_final_loss'] = cka_pre_final_loss.item() if torch.is_tensor(cka_pre_final_loss) else float(cka_pre_final_loss)
         if cka_layers_loss is not None:
             logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
 
@@ -431,4 +419,5 @@ class LLaVATrainer(Trainer):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
         else:
+            sanitize_generation_config_for_save(self.model)
             super(LLaVATrainer, self)._save(output_dir, state_dict)

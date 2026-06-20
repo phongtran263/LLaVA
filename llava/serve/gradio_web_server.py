@@ -163,31 +163,34 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
 
     if len(state.messages) == state.offset + 2:
         # First round of conversation
-        if "llava" in model_name.lower():
-            if 'llama-2' in model_name.lower():
+        model_name_lower = model_name.lower()
+        if "qwen" in model_name_lower:
+            template_name = "qwen2"
+        elif "llava" in model_name_lower:
+            if 'llama-2' in model_name_lower:
                 template_name = "llava_llama_2"
-            elif "mistral" in model_name.lower() or "mixtral" in model_name.lower():
-                if 'orca' in model_name.lower():
+            elif "mistral" in model_name_lower or "mixtral" in model_name_lower:
+                if 'orca' in model_name_lower:
                     template_name = "mistral_orca"
-                elif 'hermes' in model_name.lower():
+                elif 'hermes' in model_name_lower:
                     template_name = "chatml_direct"
                 else:
                     template_name = "mistral_instruct"
-            elif 'llava-v1.6-34b' in model_name.lower():
+            elif 'llava-v1.6-34b' in model_name_lower:
                 template_name = "chatml_direct"
-            elif "v1" in model_name.lower():
-                if 'mmtag' in model_name.lower():
+            elif "v1" in model_name_lower:
+                if 'mmtag' in model_name_lower:
                     template_name = "v1_mmtag"
-                elif 'plain' in model_name.lower() and 'finetune' not in model_name.lower():
+                elif 'plain' in model_name_lower and 'finetune' not in model_name_lower:
                     template_name = "v1_mmtag"
                 else:
                     template_name = "llava_v1"
-            elif "mpt" in model_name.lower():
+            elif "mpt" in model_name_lower:
                 template_name = "mpt"
             else:
-                if 'mmtag' in model_name.lower():
+                if 'mmtag' in model_name_lower:
                     template_name = "v0_mmtag"
-                elif 'plain' in model_name.lower() and 'finetune' not in model_name.lower():
+                elif 'plain' in model_name_lower and 'finetune' not in model_name_lower:
                     template_name = "v0_mmtag"
                 else:
                     template_name = "llava_v0"

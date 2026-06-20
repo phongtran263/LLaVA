@@ -8,6 +8,7 @@ import shortuuid
 
 from llava.conversation import default_conversation
 from llava.utils import disable_torch_init
+from llava.mm_utils import get_generation_config_kwargs
 
 
 @torch.inference_mode()
@@ -34,7 +35,7 @@ def eval_model(model_name, questions_file, answers_file):
         output_ids = model.generate(
             input_ids,
             do_sample=True,
-            use_cache=True,
+            **get_generation_config_kwargs(model),
             temperature=0.7,
             max_new_tokens=1024,)
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]

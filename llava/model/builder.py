@@ -23,8 +23,42 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
+def _is_qwen_model(*names):
+    return any(name is not None and 'qwen' in str(name).lower() for name in names)
+
+
+def _set_qwen_pad_token(tokenizer, model):
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    if tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return
+
+    eos_ids = generation_config.eos_token_id
+    if eos_ids is None:
+        eos_ids = tokenizer.eos_token_id
+    if eos_ids is not None and not isinstance(eos_ids, (list, tuple)):
+        eos_ids = [eos_ids]
+    eos_ids = list(eos_ids or [])
+    for token_id in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+        if token_id is not None and token_id not in eos_ids:
+            eos_ids.append(token_id)
+    if eos_ids:
+        generation_config.eos_token_id = eos_ids
+
+    if tokenizer.pad_token_id is not None:
+        generation_config.pad_token_id = tokenizer.pad_token_id
+    generation_config.use_cache = True
+    generation_config.output_attentions = False
+    generation_config.output_hidden_states = False
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
+    is_qwen = _is_qwen_model(model_name, model_path, model_base)
 
     if device != "cuda":
         kwargs['device_map'] = {"": device}
@@ -50,11 +84,18 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
         if 'lora' in model_name.lower() and model_base is not None:
-            from llava.model.language_model.llava_llama import LlavaConfig
-            lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            print('Loading LLaVA from base model...')
-            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            if is_qwen:
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig
+                lora_cfg_pretrained = LlavaQwenConfig.from_pretrained(model_path)
+                tokenizer = AutoTokenizer.from_pretrained(model_base)
+                print('Loading LLaVA-Qwen from base model...')
+                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            else:
+                from llava.model.language_model.llava_llama import LlavaConfig
+                lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                print('Loading LLaVA from base model...')
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
@@ -93,6 +134,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=True)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                 model = LlavaMptForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+            elif is_qwen:
+                tokenizer = AutoTokenizer.from_pretrained(model_base)
+                cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
@@ -105,6 +150,13 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
                 model = LlavaMptForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            elif is_qwen:
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                model = LlavaQwenForCausalLM.from_pretrained(
+                    model_path,
+                    low_cpu_mem_usage=True,
+                    **kwargs
+                )
             elif 'mistral' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path)
                 model = LlavaMistralForCausalLM.from_pretrained(
@@ -124,7 +176,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if model_base is not None:
             # PEFT model
             from peft import PeftModel
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            if is_qwen:
+                tokenizer = AutoTokenizer.from_pretrained(model_base)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
@@ -137,9 +192,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+            elif is_qwen:
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+
+    if is_qwen:
+        _set_qwen_pad_token(tokenizer, model)
 
     image_processor = None
 

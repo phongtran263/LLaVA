@@ -14,44 +14,53 @@
 
 
 from typing import List, Optional, Tuple, Union
-from dataclasses import dataclass
-
+import inspect
 import math
+
 import torch
 import torch.nn as nn
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
-                         LlamaConfig, LlamaModel, LlamaForCausalLM
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+                         Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from .llava_llama import CausalLMOutputWithPastAux, LlavaLlamaForCausalLM
 
 
-class LlavaConfig(LlamaConfig):
-    model_type = "llava_llama"
+_QWEN2_FORWARD_SUPPORTS_CACHE_POSITION = (
+    "cache_position" in inspect.signature(Qwen2ForCausalLM.forward).parameters
+)
 
 
-class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
-    config_class = LlavaConfig
+class LlavaQwenConfig(Qwen2Config):
+    model_type = "llava_qwen"
 
-    def __init__(self, config: LlamaConfig):
-        super(LlavaLlamaModel, self).__init__(config)
 
-@dataclass
-class CausalLMOutputWithPastAux(CausalLMOutputWithPast):
-    projector_cka_loss: Optional[torch.Tensor] = None
-    aux_losses: Optional[List[torch.Tensor]] = None
+class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
+    config_class = LlavaQwenConfig
 
-class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
-    config_class = LlavaConfig
+    def __init__(self, config: Qwen2Config):
+        super(LlavaQwenModel, self).__init__(config)
+
+
+class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
+    config_class = LlavaQwenConfig
+
+    _compute_masked_linear_cka_loss = LlavaLlamaForCausalLM._compute_masked_linear_cka_loss
+    _get_cka_attention_subset_kwargs = LlavaLlamaForCausalLM._get_cka_attention_subset_kwargs
+    _fallback_keep_count_from_attention_mass = LlavaLlamaForCausalLM._fallback_keep_count_from_attention_mass
+    _otsu_keep_count_from_log_probs = LlavaLlamaForCausalLM._otsu_keep_count_from_log_probs
+    _select_topk_indices_from_attention_scores = LlavaLlamaForCausalLM._select_topk_indices_from_attention_scores
+    _select_vision_feature_subset_from_attention = LlavaLlamaForCausalLM._select_vision_feature_subset_from_attention
 
     def __init__(self, config):
-        super(LlamaForCausalLM, self).__init__(config)
-        self.model = LlavaLlamaModel(config)
-        self.pretraining_tp = config.pretraining_tp
+        config.model_type = "llava_qwen"
+        super(Qwen2ForCausalLM, self).__init__(config)
+        self.model = LlavaQwenModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -60,266 +69,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
-
-    def _compute_masked_linear_cka_loss(
-        self,
-        projected_features: torch.FloatTensor,
-        layer_hidden_states: torch.FloatTensor,
-        vision_feature_mask: torch.BoolTensor,
-        eps: float = 1e-8,
-    ) -> torch.Tensor:
-        """
-        CKA term between aligned image-token features.
-
-        The current caller passes final LLM hidden states as `projected_features`
-        and detached pre-projector vision features as `layer_hidden_states`.
-        Only positions marked by `vision_feature_mask` participate.
-        """
-        projected_features = projected_features.float()
-        layer_hidden_states = layer_hidden_states.float()
-        vision_feature_mask = vision_feature_mask.bool()
-
-        cka_losses = []
-        for i in range(projected_features.shape[0]):
-            cur_mask = vision_feature_mask[i]
-            if cur_mask.sum() < 2:
-                continue
-
-            x_i = projected_features[i][cur_mask]
-            y_i = layer_hidden_states[i][cur_mask]
-
-            x_i = x_i - x_i.mean(dim=0, keepdim=True)
-            y_i = y_i - y_i.mean(dim=0, keepdim=True)
-
-            xx = x_i @ x_i.T
-            yy = y_i @ y_i.T
-
-            hsic_xy = (xx * yy).sum()
-            hsic_xx = xx.square().sum()
-            hsic_yy = yy.square().sum()
-
-            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
-            cka_i = (hsic_xy / denom).clamp(0.0, 1.0)
-            cka_losses.append(1.0 - cka_i)
-
-        if len(cka_losses) == 0:
-            return projected_features.new_zeros(())
-
-        return torch.stack(cka_losses).mean()
-
-    def _get_cka_attention_subset_kwargs(self):
-        config = self.get_model().config
-        legacy_max_ratio = getattr(config, 'cka_loss_subset_ratio', 1.0)
-        max_keep_ratio = getattr(config, 'cka_loss_subset_max_ratio', None)
-        if max_keep_ratio is None:
-            max_keep_ratio = legacy_max_ratio
-
-        min_keep_ratio = float(getattr(config, 'cka_loss_subset_min_ratio', 0.1) or 0.0)
-        max_keep_ratio = float(max_keep_ratio or 0.0)
-        fallback_mass = float(getattr(config, 'cka_loss_subset_fallback_mass', 0.75) or 0.0)
-        otsu_min_separability = float(getattr(config, 'cka_loss_subset_otsu_min_separability', 0.05) or 0.0)
-
-        min_keep_ratio = max(0.0, min(1.0, min_keep_ratio))
-        max_keep_ratio = max(0.0, min(1.0, max_keep_ratio))
-        if max_keep_ratio > 0.0:
-            max_keep_ratio = max(min_keep_ratio, max_keep_ratio)
-
-        return {
-            "min_keep_ratio": min_keep_ratio,
-            "max_keep_ratio": max_keep_ratio,
-            "fallback_mass": max(0.0, min(1.0, fallback_mass)),
-            "otsu_min_separability": max(0.0, min(1.0, otsu_min_separability)),
-        }
-
-    def _fallback_keep_count_from_attention_mass(
-        self,
-        probabilities: torch.Tensor,
-        fallback_mass: float,
-    ) -> int:
-        token_count = int(probabilities.numel())
-        if token_count <= 1:
-            return token_count
-
-        fallback_mass = float(max(0.0, min(1.0, fallback_mass)))
-        if fallback_mass <= 0.0:
-            return 1
-        if fallback_mass >= 1.0:
-            return token_count
-
-        sorted_probabilities = torch.sort(probabilities, descending=True).values
-        cumulative_mass = torch.cumsum(sorted_probabilities, dim=0)
-        threshold = cumulative_mass.new_tensor(fallback_mass)
-        keep_count = int(torch.searchsorted(cumulative_mass, threshold, right=False).item()) + 1
-        return max(1, min(token_count, keep_count))
-
-    def _otsu_keep_count_from_log_probs(
-        self,
-        log_probabilities: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> Tuple[int, float]:
-        token_count = int(log_probabilities.numel())
-        if token_count <= 1:
-            return token_count, 0.0
-
-        sorted_values = torch.sort(log_probabilities).values
-        total_variance = torch.mean((sorted_values - sorted_values.mean()).square())
-        if float(total_variance.item()) <= eps:
-            return token_count, 0.0
-
-        prefix_sum = torch.cumsum(sorted_values, dim=0)
-        split_counts = torch.arange(
-            1,
-            token_count,
-            device=sorted_values.device,
-            dtype=sorted_values.dtype,
-        )
-        left_weight = split_counts / token_count
-        right_weight = 1.0 - left_weight
-        left_mean = prefix_sum[:-1] / split_counts
-        right_mean = (prefix_sum[-1] - prefix_sum[:-1]) / (token_count - split_counts)
-        between_class_variance = left_weight * right_weight * (left_mean - right_mean).square()
-
-        best_split = int(torch.argmax(between_class_variance).item())
-        separability = float((between_class_variance[best_split] / total_variance.clamp_min(eps)).item())
-        # Sorted values are ascending log-probs. Keep the high-prob side as a top-k count.
-        keep_count = token_count - (best_split + 1)
-        return max(1, min(token_count, keep_count)), separability
-
-    def _select_topk_indices_from_attention_scores(
-        self,
-        image_scores: torch.Tensor,
-        min_keep_tokens: int,
-        min_keep_ratio: float,
-        max_keep_ratio: float,
-        fallback_mass: float,
-        otsu_min_separability: float,
-        eps: float = 1e-8,
-    ) -> torch.LongTensor:
-        """
-        Convert per-image-token attention scores into a top-k subset.
-
-        The selection is per sample: detach scores, normalize over image tokens,
-        run Otsu on log-probabilities, clamp by min/max ratio, and use cumulative
-        attention mass when the Otsu split is not separable enough.
-        """
-        token_count = int(image_scores.numel())
-        if token_count == 0:
-            return torch.empty(0, dtype=torch.long, device=image_scores.device)
-        if token_count <= min_keep_tokens or max_keep_ratio <= 0.0:
-            return torch.arange(token_count, dtype=torch.long, device=image_scores.device)
-
-        min_keep_ratio = max(0.0, min(1.0, float(min_keep_ratio)))
-        max_keep_ratio = max(0.0, min(1.0, float(max_keep_ratio)))
-        min_keep_count = max(min_keep_tokens, int(math.ceil(token_count * min_keep_ratio)))
-        min_keep_count = min(token_count, min_keep_count)
-        max_keep_count = max(min_keep_count, int(math.floor(token_count * max_keep_ratio)))
-        max_keep_count = min(token_count, max_keep_count)
-
-        scores = image_scores.detach().float()
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-        score_sum = scores.sum()
-        if float(score_sum.item()) <= eps:
-            probabilities = torch.full_like(scores, 1.0 / token_count)
-            keep_count = self._fallback_keep_count_from_attention_mass(probabilities, fallback_mass)
-        else:
-            probabilities = scores / score_sum.clamp_min(eps)
-            log_probabilities = torch.log(probabilities.clamp_min(eps))
-            keep_count, separability = self._otsu_keep_count_from_log_probs(log_probabilities, eps=eps)
-            if separability < otsu_min_separability:
-                keep_count = self._fallback_keep_count_from_attention_mass(probabilities, fallback_mass)
-
-        keep_count = max(min_keep_count, min(max_keep_count, keep_count))
-        # Stable sorting keeps tie cases deterministic instead of letting topk pick
-        # arbitrary equal-score image tokens.
-        return torch.argsort(scores, descending=True, stable=True)[:keep_count]
-
-    def _select_vision_feature_subset_from_attention(
-        self,
-        attentions,
-        vision_feature_mask: torch.BoolTensor,
-        attention_mask: Optional[torch.Tensor],
-        select_layer: Optional[int],
-        min_keep_ratio: float,
-        max_keep_ratio: float,
-        fallback_mass: float,
-        otsu_min_separability: float,
-        min_keep_tokens: int = 16,
-    ) -> Optional[torch.BoolTensor]:
-        """
-        Select a subset of image tokens using text-to-image attention at one LLM layer.
-
-        Per sample, attention mass over image tokens is detached, normalized into
-        probabilities, split with Otsu on log-probabilities, then converted into a
-        top-k image-token mask. Min/max ratio caps bound the selected count; low
-        separability falls back to cumulative attention mass.
-
-        Note: `select_layer` only chooses the attention layer used for subset selection.
-        The LLM-hidden CKA term below still compares final hidden states against
-        pre-projector vision features.
-        """
-        if attentions is None or vision_feature_mask is None or select_layer is None:
-            return None
-
-        if not isinstance(attentions, (list, tuple)) or len(attentions) == 0:
-            return None
-
-        if select_layer < 1:
-            return None
-
-        attn_index = select_layer - 1
-        if attn_index < 0 or attn_index >= len(attentions):
-            return None
-
-        layer_attn = attentions[attn_index]
-        if layer_attn is None:
-            return None
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(vision_feature_mask, dtype=torch.bool)
-        else:
-            attention_mask = attention_mask.bool()
-
-        if max_keep_ratio <= 0.0:
-            return vision_feature_mask.clone()
-
-        layer_attn = layer_attn.float()
-        selected_masks = []
-
-        for batch_idx in range(layer_attn.shape[0]):
-            valid_mask = attention_mask[batch_idx]
-            image_mask = vision_feature_mask[batch_idx] & valid_mask
-            text_mask = (~vision_feature_mask[batch_idx]) & valid_mask
-
-            image_token_count = int(image_mask.sum().item())
-            text_token_count = int(text_mask.sum().item())
-            if image_token_count < min_keep_tokens or text_token_count == 0:
-                selected_masks.append(image_mask.clone())
-                continue
-
-            # attn_i: [heads, seq, seq]
-            attn_i = layer_attn[batch_idx]
-            text_to_image = attn_i[:, text_mask][:, :, image_mask]
-            if text_to_image.numel() == 0:
-                selected_masks.append(image_mask.clone())
-                continue
-
-            # Score each image token by average attention received from text queries.
-            image_scores = text_to_image.mean(dim=(0, 1))
-            topk_indices = self._select_topk_indices_from_attention_scores(
-                image_scores=image_scores,
-                min_keep_tokens=min_keep_tokens,
-                min_keep_ratio=min_keep_ratio,
-                max_keep_ratio=max_keep_ratio,
-                fallback_mass=fallback_mass,
-                otsu_min_separability=otsu_min_separability,
-            )
-
-            selected_mask = torch.zeros_like(image_mask)
-            image_positions = torch.where(image_mask)[0]
-            selected_mask[image_positions[topk_indices]] = True
-            selected_masks.append(selected_mask)
-
-        return torch.stack(selected_masks, dim=0)
 
     @torch.no_grad()
     def _select_vision_feature_subset_from_attention_inputs(
@@ -336,13 +85,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         otsu_min_separability: float,
         min_keep_tokens: int = 2,
     ) -> Optional[torch.BoolTensor]:
-        """
-        Select image tokens from one layer's QK attention without asking the whole model
-        to materialize attentions. This keeps flash-attn for the real forward pass.
-
-        This is the fast path for `cka_loss_subset_select_layer`; the fallback path uses
-        `output.attentions` when attentions were already requested.
-        """
         if hidden_states is None or vision_feature_mask is None:
             return None
 
@@ -362,7 +104,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             except AttributeError:
                 return None
             if cached_len:
-                # Training should not use KV cache here. Avoid silently mishandling cached positions.
                 return None
 
         if attention_mask is None:
@@ -393,7 +134,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             bsz, q_len, attention_module.num_key_value_heads, attention_module.head_dim
         ).transpose(1, 2)
 
-        cos, sin = attention_module.rotary_emb(key_states, seq_len=q_len)
+        rotary_seq_len = q_len
+        if position_ids is not None:
+            rotary_seq_len = max(q_len, int(position_ids.max().item()) + 1)
+        cos, sin = attention_module.rotary_emb(key_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         key_states = repeat_kv(key_states, attention_module.num_key_value_groups)
 
@@ -462,8 +206,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        cka_enabled = self.get_model().training and self.get_model().config.cka_loss
+        cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
         vision_feature_mask = None
         subset_vision_feature_mask = None
         pre_post_cka_loss = None
@@ -478,8 +223,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         if inputs_embeds is None:
             if cka_enabled:
-                # CKA-enabled multimodal prep also returns the image-token mask and
-                # pre-projector vision features aligned to the final input sequence.
                 (
                     input_ids,
                     position_ids,
@@ -516,7 +259,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     images,
                     image_sizes
                 )
-        llm_cka_enabled = cka_enabled and self.get_model().config.cka_loss_layers != [-1]
+
+        llm_cka_enabled = cka_enabled and getattr(self.get_model().config, 'cka_loss_layers', "final") != [-1]
         should_output_hidden_states = output_hidden_states
         should_output_attentions = output_attentions
         subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
@@ -525,7 +269,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         final_layer_pre_norm_hidden = None
         norm_pre_hook_handle = None
         if llm_cka_enabled and hasattr(self.get_model(), "norm"):
-            # HF LlamaModel stores hidden_states[-1] after final RMSNorm; CKA needs the pre-norm value.
             def capture_final_layer_pre_norm_hidden(module, module_inputs):
                 nonlocal final_layer_pre_norm_hidden
                 if module_inputs:
@@ -544,7 +287,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             and pre_projector_features is not None
         ):
             layers = getattr(self.get_model(), "layers", None)
-            # Config is 1-based for readability; HF module lists are 0-based.
             layer_idx = int(subset_select_layer) - 1
             if layers is not None and 0 <= layer_idx < len(layers):
                 selected_self_attn = layers[layer_idx].self_attn
@@ -572,19 +314,23 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     with_kwargs=True,
                 )
 
+        forward_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=should_output_attentions,
+            output_hidden_states=should_output_hidden_states,
+            return_dict=return_dict,
+        )
+        if _QWEN2_FORWARD_SUPPORTS_CACHE_POSITION:
+            forward_kwargs["cache_position"] = cache_position
+
         try:
-            output = super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=should_output_attentions,
-                output_hidden_states=should_output_hidden_states,
-                return_dict=return_dict
-            )
+            output = super().forward(**forward_kwargs)
         finally:
             if norm_pre_hook_handle is not None:
                 norm_pre_hook_handle.remove()
@@ -599,7 +345,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         ):
             subset_vision_feature_mask = captured_subset_vision_feature_mask
             if subset_vision_feature_mask is None and output.attentions is not None:
-                # Fallback for runs that materialize attentions instead of using the hook.
                 subset_vision_feature_mask = self._select_vision_feature_subset_from_attention(
                     attentions=output.attentions,
                     vision_feature_mask=vision_feature_mask,
@@ -625,8 +370,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 and final_hidden is not None
                 and pre_projector_features is not None
             ):
-                # LLM CKA term: compare final LLM states at image-token positions
-                # against the corresponding raw vision-tower features.
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
                 cka_layers_loss = self._compute_masked_linear_cka_loss(
                     projected_features=final_hidden,
@@ -642,10 +385,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
                 )
 
-            # Keep projector CKA and LLM CKA as separate terms.
             cka_loss = projector_cka_loss + cka_layers_loss
 
-            # Store losses for logging
             self.last_cka_loss = cka_loss.detach()
             self.last_cka_projector_loss = projector_cka_loss.detach()
             self.last_text_loss = output.loss.detach()
@@ -660,7 +401,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             final_hidden_cka_weight = getattr(self.get_model().config, 'cka_loss_final_hidden_weight', None)
             if final_hidden_cka_weight is None:
                 final_hidden_cka_weight = default_cka_weight
-            
+
             return CausalLMOutputWithPastAux(
                 loss=output.loss,
                 logits=output.logits,
@@ -726,5 +467,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs['image_sizes'] = image_sizes
         return inputs
 
-AutoConfig.register("llava_llama", LlavaConfig)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+
+AutoConfig.register("llava_qwen", LlavaQwenConfig)
+AutoModelForCausalLM.register(LlavaQwenConfig, LlavaQwenForCausalLM)

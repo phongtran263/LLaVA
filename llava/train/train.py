@@ -29,7 +29,7 @@ import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
+from llava.train.llava_trainer import LLaVATrainer, sanitize_generation_config_for_save
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -44,6 +44,24 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def get_parameter_numel(param):
+    ds_numel = getattr(param, "ds_numel", None)
+    if ds_numel is not None:
+        if hasattr(ds_numel, "item"):
+            ds_numel = ds_numel.item()
+        return int(ds_numel)
+    return param.numel()
+
+
+def format_parameter_shape(param):
+    ds_shape = getattr(param, "ds_shape", None)
+    if ds_shape is not None:
+        return list(ds_shape)
+    if param.numel() == 0 and getattr(param, "ds_numel", None) is not None:
+        return f"partitioned(numel={get_parameter_numel(param)})"
+    return list(param.shape)
 
 
 from packaging import version
@@ -72,13 +90,21 @@ class ModelArguments:
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
     cka_loss: bool = field(default=False)
-    use_pcgrad: bool = field(default=False)
     cka_loss_weight: float = field(default=1.0)
-    cka_loss_layers: Optional[str] = field(default="0", metadata={"help": "Comma-separated list of LLM layers to compare CKA loss with image features (e.g., '1,6,12' or 'all'). Layer 0=input embeddings, layer 1+=transformer output. Defaults to layer 1."})
-    cka_loss_exclude_last_layers: int = field(default=0, metadata={"help": "Number of last LLM layers to exclude from CKA loss. For example, 1 skips the final transformer layer."})
-    cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Exponential decay for consecutive LLM-layer CKA weights. 1.0 means equal weights; lower values down-weight deeper consecutive terms."})
+    cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
+    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the final LLM hidden-state CKA loss. Defaults to cka_loss_weight for backward compatibility."})
+    # CKA has two terms: projector CKA always follows `cka_loss`, while this
+    # option controls the final-LLM-hidden-vs-pre-projector term.
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Use 'final' to compare pre-projector image features with the final LLM hidden state; use '-1' to disable this LLM-hidden CKA term."})
+    cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
+    # 1-based layer used only to rank/select important image tokens by
+    # text-to-image attention; it is not the hidden layer used for CKA.
     cka_loss_subset_select_layer: Optional[int] = field(default=None, metadata={"help": "LLM transformer layer index (1-based) whose text-to-image attention is used to select important image tokens for later CKA layers."})
-    cka_loss_subset_ratio: float = field(default=0.5, metadata={"help": "Fraction of image tokens kept when selecting the CKA subset from attention at cka_loss_subset_select_layer."})
+    cka_loss_subset_ratio: float = field(default=0.5, metadata={"help": "Legacy max-ratio cap for attention-selected CKA image tokens when cka_loss_subset_max_ratio is not set."})
+    cka_loss_subset_min_ratio: float = field(default=0.10, metadata={"help": "Minimum fraction of image tokens kept by dynamic attention/Otsu CKA subset selection."})
+    cka_loss_subset_max_ratio: Optional[float] = field(default=0.90, metadata={"help": "Maximum fraction of image tokens kept by dynamic attention/Otsu CKA subset selection. Defaults to cka_loss_subset_ratio for compatibility."})
+    cka_loss_subset_fallback_mass: float = field(default=0.90, metadata={"help": "Cumulative attention mass to keep when Otsu separability is too low."})
+    cka_loss_subset_otsu_min_separability: float = field(default=0.30, metadata={"help": "Minimum Otsu between-class separability before falling back to cumulative attention mass."})
 
 
 @dataclass
@@ -605,6 +631,78 @@ def preprocess_mpt(
     )
 
 
+def preprocess_qwen(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+
+    def encode_prompt(prompt: str) -> List[int]:
+        if has_image:
+            return tokenizer_image_token(prompt, tokenizer)
+        return tokenizer(prompt).input_ids
+
+    input_ids = []
+    targets = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            source = source[1:]
+
+        prompt = conv.system + conv.sep
+        assistant_spans = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            value = sentence["value"]
+            if type(value) is tuple:
+                value, _, _ = value
+
+            if role == conv.roles[1]:
+                answer_start = len(prompt) + len(role)
+                prompt += role + value + conv.sep
+                assistant_spans.append((answer_start, len(prompt)))
+            else:
+                prompt += role + value + conv.sep
+
+        cur_input_ids = torch.tensor(
+            encode_prompt(prompt)[:tokenizer.model_max_length],
+            dtype=torch.long,
+        )
+        cur_target = torch.full_like(cur_input_ids, IGNORE_INDEX)
+
+        for start, end in assistant_spans:
+            start_token = len(encode_prompt(prompt[:start]))
+            end_token = len(encode_prompt(prompt[:end]))
+            start_token = min(start_token, cur_input_ids.shape[0])
+            end_token = min(end_token, cur_input_ids.shape[0])
+            if end_token > start_token:
+                cur_target[start_token:end_token] = cur_input_ids[start_token:end_token]
+
+        input_ids.append(cur_input_ids)
+        targets.append(cur_target)
+
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids,
+        batch_first=True,
+        padding_value=pad_token_id,
+    )
+    targets = torch.nn.utils.rnn.pad_sequence(
+        targets,
+        batch_first=True,
+        padding_value=IGNORE_INDEX,
+    )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
@@ -645,6 +743,8 @@ def preprocess(
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.version == "qwen2":
+        return preprocess_qwen(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
@@ -834,6 +934,7 @@ def train(attn_implementation=None):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    model_name_lower = model_args.model_name_or_path.lower()
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -855,7 +956,7 @@ def train(attn_implementation=None):
         ))
 
     if model_args.vision_tower is not None:
-        if 'mpt' in model_args.model_name_or_path:
+        if 'mpt' in model_name_lower:
             config = transformers.AutoConfig.from_pretrained(
                 model_args.model_name_or_path,
                 trust_remote_code=True,
@@ -869,6 +970,15 @@ def train(attn_implementation=None):
                 force_download=model_args.force_download,
                 **bnb_model_from_pretrained_args
             )
+        elif 'qwen' in model_name_lower:
+            model = LlavaQwenForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                force_download=model_args.force_download,
+                **bnb_model_from_pretrained_args
+            )
         else:
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -879,14 +989,24 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
     else:
-        model = transformers.LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            force_download=model_args.force_download,
-            **bnb_model_from_pretrained_args
-        )
+        if 'qwen' in model_name_lower:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                force_download=model_args.force_download,
+                **bnb_model_from_pretrained_args
+            )
+        else:
+            model = transformers.LlamaForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                force_download=model_args.force_download,
+                **bnb_model_from_pretrained_args
+            )
 
     if attn_implementation == "flash_attention_2" and training_args.bits not in [4, 8]:
         if not torch.cuda.is_available():
@@ -897,24 +1017,48 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
-    model.config.use_pcgrad = model_args.use_pcgrad
     model.config.cka_loss_weight = model_args.cka_loss_weight
-    model.config.cka_loss_exclude_last_layers = max(0, int(model_args.cka_loss_exclude_last_layers))
+    model.config.cka_loss_projector_weight = (
+        float(model_args.cka_loss_projector_weight)
+        if model_args.cka_loss_projector_weight is not None
+        else float(model_args.cka_loss_weight)
+    )
+    model.config.cka_loss_final_hidden_weight = (
+        float(model_args.cka_loss_final_hidden_weight)
+        if model_args.cka_loss_final_hidden_weight is not None
+        else float(model_args.cka_loss_weight)
+    )
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
     model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
     model.config.cka_loss_subset_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_ratio)))
-    # Parse cka_loss_layers: can be "all", "1", or "1,6,12"
+    model.config.cka_loss_subset_min_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_min_ratio)))
+    if model_args.cka_loss_subset_max_ratio is None:
+        model.config.cka_loss_subset_max_ratio = model.config.cka_loss_subset_ratio
+    else:
+        model.config.cka_loss_subset_max_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_max_ratio)))
+    if model.config.cka_loss_subset_max_ratio > 0.0:
+        model.config.cka_loss_subset_max_ratio = max(
+            model.config.cka_loss_subset_min_ratio,
+            model.config.cka_loss_subset_max_ratio,
+        )
+    model.config.cka_loss_subset_fallback_mass = max(0.0, min(1.0, float(model_args.cka_loss_subset_fallback_mass)))
+    model.config.cka_loss_subset_otsu_min_separability = max(0.0, min(1.0, float(model_args.cka_loss_subset_otsu_min_separability)))
+    # cka_loss_layers is kept for CLI compatibility. Any non-disabled value uses
+    # pre-projector image features vs the final LLM hidden state.
     if model_args.cka_loss_layers:
-        if model_args.cka_loss_layers.lower() == "all":
-            model.config.cka_loss_layers = "all"
+        cka_loss_layers_arg = model_args.cka_loss_layers.lower()
+        if cka_loss_layers_arg in ("-1", "none", "off", "false"):
+            model.config.cka_loss_layers = [-1]
+        elif cka_loss_layers_arg in ("final", "last", "all"):
+            model.config.cka_loss_layers = "final"
         else:
             try:
                 model.config.cka_loss_layers = [int(x.strip()) for x in model_args.cka_loss_layers.split(",")]
             except ValueError:
-                rank0_print(f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', defaulting to [1]")
-                model.config.cka_loss_layers = [1]
+                rank0_print(f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', defaulting to final")
+                model.config.cka_loss_layers = "final"
     else:
-        model.config.cka_loss_layers = [1]
+        model.config.cka_loss_layers = "final"
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -950,7 +1094,15 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if 'mpt' in model_args.model_name_or_path:
+    if 'mpt' in model_name_lower:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            force_download=model_args.force_download,
+        )
+    elif 'qwen' in model_name_lower:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -978,7 +1130,13 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        tokenizer.pad_token = tokenizer.unk_token
+        if 'qwen' in model_name_lower:
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+            if tokenizer.pad_token_id is not None:
+                model.config.pad_token_id = tokenizer.pad_token_id
+        else:
+            tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
@@ -1034,10 +1192,11 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print(f"✅ TRAINABLE: {name} | Shape: {list(param.shape)}")
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_params/total_params:.2%}")
+            print(f"✅ TRAINABLE: {name} | Shape: {format_parameter_shape(param)}")
+    trainable_params = sum(get_parameter_numel(p) for p in model.parameters() if p.requires_grad)
+    total_params = sum(get_parameter_numel(p) for p in model.parameters())
+    trainable_pct = trainable_params / total_params if total_params > 0 else 0.0
+    print(f"Trainable params: {trainable_params:,} | Total params: {total_params:,} | Trainable%: {trainable_pct:.2%}")
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,
@@ -1079,6 +1238,7 @@ def train(attn_implementation=None):
             model.named_parameters()
         )
         if training_args.local_rank == 0 or training_args.local_rank == -1:
+            sanitize_generation_config_for_save(model)
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))

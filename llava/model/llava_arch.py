@@ -218,9 +218,11 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().get_vision_tower()(images)
         projected_image_features = self.get_model().mm_projector(image_features)
 
-        if self.get_model().training and self.get_model().config.cka_loss:
+        if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+            # Projector CKA term: keep the projected image embeddings structurally
+            # close to the raw vision-tower patch features.
             cka_loss = compute_linear_cka_loss(image_features, projected_image_features)
-            return projected_image_features, cka_loss
+            return projected_image_features, cka_loss, image_features
 
         return projected_image_features
 
@@ -262,29 +264,37 @@ class LlavaMetaForCausalLM(ABC):
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            if self.get_model().training and self.get_model().config.cka_loss:
-                return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None
+            if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+                return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         pre_post_cka_loss = None
+        pre_projector_image_features = None
 
         if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            if self.get_model().training and self.get_model().config.cka_loss:
-                image_features, pre_post_cka_loss = self.encode_images(concat_images)
+            if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(concat_images)
             else:
                 image_features = self.encode_images(concat_images)
                 if isinstance(image_features, tuple):
                     image_features = image_features[0]
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+            if pre_projector_image_features is not None:
+                pre_projector_image_features = torch.split(pre_projector_image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
+                if pre_projector_image_features is not None:
+                    pre_projector_image_features = [x.flatten(0, 1) for x in pre_projector_image_features]
             elif mm_patch_merge_type.startswith('spatial'):
+                # Spatial/unpad can add learned newline tokens after the projector; skip
+                # pre-projector-vs-LLM CKA there unless an aligned raw newline exists.
+                pre_projector_image_features = None
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
@@ -322,8 +332,8 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            if self.get_model().training and self.get_model().config.cka_loss:
-                image_features, pre_post_cka_loss = self.encode_images(images)
+            if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(images)
             else:
                 image_features = self.encode_images(images)
                 if isinstance(image_features, tuple):
@@ -356,12 +366,20 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
-        new_vision_feature_masks = [] if (self.get_model().training and self.get_model().config.cka_loss) else None
+        new_vision_feature_masks = [] if (self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)) else None
+        # These raw vision features follow the same insertion, truncation, and padding
+        # path as projected image embeddings so later CKA can align token positions.
+        new_pre_projector_features = [] if pre_projector_image_features is not None else None
+        if pre_projector_image_features is not None:
+            sample_pre_projector_feature = pre_projector_image_features[0]
+            pre_projector_feature_size = sample_pre_projector_feature.shape[-1]
+            pre_projector_feature_dtype = sample_pre_projector_feature.dtype
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
+                cur_pre_projector_image_features = pre_projector_image_features[cur_image_idx] if new_pre_projector_features is not None else None
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
@@ -369,6 +387,14 @@ class LlavaMetaForCausalLM(ABC):
                 if new_vision_feature_masks is not None:
                     new_vision_feature_masks.append(
                         torch.zeros(cur_input_embeds.shape[0], dtype=torch.bool, device=cur_input_embeds.device)
+                    )
+                if new_pre_projector_features is not None:
+                    new_pre_projector_features.append(
+                        torch.zeros(
+                            (cur_input_embeds.shape[0], cur_pre_projector_image_features.shape[-1]),
+                            dtype=cur_pre_projector_image_features.dtype,
+                            device=cur_input_embeds.device,
+                        )
                     )
                 cur_image_idx += 1
                 continue
@@ -386,6 +412,7 @@ class LlavaMetaForCausalLM(ABC):
             cur_new_input_embeds = []
             cur_new_labels = []
             cur_new_vision_feature_mask = [] if new_vision_feature_masks is not None else None
+            cur_new_pre_projector_features = [] if new_pre_projector_features is not None else None
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
@@ -394,8 +421,17 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_vision_feature_mask.append(
                         torch.zeros(cur_input_embeds_no_im[i].shape[0], dtype=torch.bool, device=cur_labels.device)
                     )
+                if cur_new_pre_projector_features is not None:
+                    cur_new_pre_projector_features.append(
+                        torch.zeros(
+                            (cur_input_embeds_no_im[i].shape[0], pre_projector_feature_size),
+                            dtype=pre_projector_feature_dtype,
+                            device=cur_labels.device,
+                        )
+                    )
                 if i < num_images:
                     cur_image_features = image_features[cur_image_idx]
+                    cur_pre_projector_image_features = pre_projector_image_features[cur_image_idx] if cur_new_pre_projector_features is not None else None
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
@@ -403,8 +439,18 @@ class LlavaMetaForCausalLM(ABC):
                         cur_new_vision_feature_mask.append(
                             torch.ones(cur_image_features.shape[0], dtype=torch.bool, device=cur_labels.device)
                         )
+                    if cur_new_pre_projector_features is not None:
+                        # Image-token CKA needs one raw vision feature per projected image token.
+                        if cur_pre_projector_image_features.shape[0] != cur_image_features.shape[0]:
+                            raise ValueError(
+                                "Pre-projector image features must align with projected image features for CKA: "
+                                f"{cur_pre_projector_image_features.shape[0]} vs {cur_image_features.shape[0]}"
+                            )
+                        cur_new_pre_projector_features.append(cur_pre_projector_image_features)
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            if cur_new_pre_projector_features is not None:
+                cur_new_pre_projector_features = [x.to(self.device) for x in cur_new_pre_projector_features]
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
@@ -413,6 +459,8 @@ class LlavaMetaForCausalLM(ABC):
             new_labels.append(cur_new_labels)
             if new_vision_feature_masks is not None:
                 new_vision_feature_masks.append(torch.cat(cur_new_vision_feature_mask))
+            if new_pre_projector_features is not None:
+                new_pre_projector_features.append(torch.cat(cur_new_pre_projector_features))
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
@@ -421,6 +469,8 @@ class LlavaMetaForCausalLM(ABC):
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
             if new_vision_feature_masks is not None:
                 new_vision_feature_masks = [x[:tokenizer_model_max_length] for x in new_vision_feature_masks]
+            if new_pre_projector_features is not None:
+                new_pre_projector_features = [x[:tokenizer_model_max_length] for x in new_pre_projector_features]
 
         # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
@@ -433,6 +483,13 @@ class LlavaMetaForCausalLM(ABC):
         vision_feature_mask_padded = None
         if new_vision_feature_masks is not None:
             vision_feature_mask_padded = torch.zeros((batch_size, max_len), dtype=torch.bool, device=attention_mask.device)
+        pre_projector_features_padded = None
+        if new_pre_projector_features is not None:
+            pre_projector_features_padded = torch.zeros(
+                (batch_size, max_len, pre_projector_feature_size),
+                dtype=new_pre_projector_features[0].dtype,
+                device=new_pre_projector_features[0].device,
+            )
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
@@ -447,6 +504,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
                     if vision_feature_mask_padded is not None:
                         vision_feature_mask_padded[i, -cur_len:] = new_vision_feature_masks[i]
+                    if pre_projector_features_padded is not None:
+                        pre_projector_features_padded[i, -cur_len:] = new_pre_projector_features[i]
             else:
                 new_input_embeds_padded.append(torch.cat((
                     cur_new_embed,
@@ -458,6 +517,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
                     if vision_feature_mask_padded is not None:
                         vision_feature_mask_padded[i, :cur_len] = new_vision_feature_masks[i]
+                    if pre_projector_features_padded is not None:
+                        pre_projector_features_padded[i, :cur_len] = new_pre_projector_features[i]
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
 
@@ -466,7 +527,9 @@ class LlavaMetaForCausalLM(ABC):
         else:
             new_labels = new_labels_padded
 
-        keep_attention_mask_for_cka = self.get_model().training and self.get_model().config.cka_loss and getattr(self.get_model().config, 'cka_loss_subset_select_layer', None) is not None
+        # The attention-based CKA subset selector needs this padded mask even when
+        # the original caller did not pass one.
+        keep_attention_mask_for_cka = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False) and getattr(self.get_model().config, 'cka_loss_subset_select_layer', None) is not None
         if _attention_mask is None:
             attention_mask = attention_mask if keep_attention_mask_for_cka else None
         else:
@@ -475,8 +538,8 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        if self.get_model().training and self.get_model().config.cka_loss:
-            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, vision_feature_mask_padded, pre_post_cka_loss
+        if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, vision_feature_mask_padded, pre_post_cka_loss, pre_projector_features_padded
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

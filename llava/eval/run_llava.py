@@ -14,7 +14,7 @@ from llava.utils import disable_torch_init
 from llava.mm_utils import (
     process_images,
     tokenizer_image_token,
-    get_model_name_from_path,
+    get_model_name_from_path, get_generation_config_kwargs,
 )
 
 from PIL import Image
@@ -69,7 +69,9 @@ def eval_model(args):
         else:
             qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
 
-    if "llama-2" in model_name.lower():
+    if "qwen" in model_name.lower():
+        conv_mode = "qwen2"
+    elif "llama-2" in model_name.lower():
         conv_mode = "llava_llama_2"
     elif "mistral" in model_name.lower():
         conv_mode = "mistral_instruct"
@@ -121,7 +123,7 @@ def eval_model(args):
             top_p=args.top_p,
             num_beams=args.num_beams,
             max_new_tokens=args.max_new_tokens,
-            use_cache=True,
+            **get_generation_config_kwargs(model),
         )
 
     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()

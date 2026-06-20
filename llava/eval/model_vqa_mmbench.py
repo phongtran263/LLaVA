@@ -10,7 +10,7 @@ from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_S
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
+from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path, get_generation_config_kwargs, maybe_override_qwen_conv_mode
 
 from PIL import Image
 import math
@@ -57,6 +57,7 @@ def eval_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    maybe_override_qwen_conv_mode(args, model_name)
 
     questions = pd.read_table(os.path.expanduser(args.question_file))
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
@@ -118,7 +119,7 @@ def eval_model(args):
                     num_beams=args.num_beams,
                     # no_repeat_ngram_size=3,
                     max_new_tokens=1024,
-                    use_cache=True)
+                    **get_generation_config_kwargs(model))
 
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 

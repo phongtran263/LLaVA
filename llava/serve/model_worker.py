@@ -19,7 +19,7 @@ from llava.constants import WORKER_HEART_BEAT_INTERVAL
 from llava.utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from llava.model.builder import load_pretrained_model
-from llava.mm_utils import process_images, load_image_from_base64, tokenizer_image_token
+from llava.mm_utils import get_generation_config_kwargs, process_images, load_image_from_base64, tokenizer_image_token
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from transformers import TextIteratorStreamer
 from threading import Thread
@@ -180,7 +180,7 @@ class ModelWorker:
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             streamer=streamer,
-            use_cache=True,
+            **get_generation_config_kwargs(model),
             **image_args
         ))
         thread.start()
