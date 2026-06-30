@@ -27,6 +27,7 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repea
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
+from llava.constants import IGNORE_INDEX
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 
@@ -71,9 +72,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         """
         CKA term between aligned image-token features.
 
-        The current caller passes final LLM hidden states as `projected_features`
-        and detached pre-projector vision features as `layer_hidden_states`.
-        Only positions marked by `vision_feature_mask` participate.
+        The caller passes two aligned feature tensors and only positions marked
+        by `vision_feature_mask` participate. Feature dimensions may differ; CKA
+        compares token-token Gram structure.
         """
         projected_features = projected_features.float()
         layer_hidden_states = layer_hidden_states.float()
@@ -106,6 +107,146 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return projected_features.new_zeros(())
 
         return torch.stack(cka_losses).mean()
+
+    def _get_cka_layer_specs(self):
+        raw_layers = getattr(self.get_model().config, 'cka_loss_layers', "final")
+        if raw_layers == [-1] or raw_layers in (None, "", False):
+            return []
+
+        if isinstance(raw_layers, str):
+            tokens = [token.strip().lower() for token in raw_layers.split(",") if token.strip()]
+        elif isinstance(raw_layers, (list, tuple)):
+            tokens = list(raw_layers)
+        else:
+            tokens = [raw_layers]
+
+        if not tokens:
+            return []
+
+        layers = getattr(self.get_model(), "layers", None)
+        num_layers = len(layers) if layers is not None else 0
+        specs = []
+        seen = set()
+
+        def add_final():
+            key = ("final", None)
+            if key not in seen:
+                specs.append({"kind": "final", "name": "final", "layer_idx": None})
+                seen.add(key)
+
+        def add_layer(layer_idx):
+            if num_layers <= 0 or layer_idx < 1 or layer_idx > num_layers:
+                return
+            key = ("layer", layer_idx)
+            if key not in seen:
+                specs.append({"kind": "layer", "name": f"layer_{layer_idx}", "layer_idx": layer_idx})
+                seen.add(key)
+
+        for token in tokens:
+            token_lower = token.lower() if isinstance(token, str) else token
+            if token_lower in ("-1", "none", "off", "false"):
+                if len(tokens) == 1:
+                    return []
+                continue
+            if token_lower in ("final", "last"):
+                add_final()
+                continue
+            if token_lower == "all":
+                for layer_idx in range(1, num_layers + 1):
+                    add_layer(layer_idx)
+                continue
+
+            try:
+                layer_idx = int(token)
+            except (TypeError, ValueError):
+                continue
+            if layer_idx == -1 and len(tokens) == 1:
+                return []
+            add_layer(layer_idx)
+
+        if not specs:
+            add_final()
+
+        return specs
+
+    def _register_cka_layer_hooks(self, cka_layer_specs, captured_layer_hiddens):
+        layers = getattr(self.get_model(), "layers", None)
+        if layers is None:
+            return []
+
+        handles = []
+        for spec in cka_layer_specs:
+            if spec["kind"] != "layer":
+                continue
+            layer_idx = spec["layer_idx"]
+            if layer_idx is None or layer_idx < 1 or layer_idx > len(layers):
+                continue
+            layer_name = spec["name"]
+
+            def capture_layer_hidden(module, module_inputs, module_outputs, layer_name=layer_name):
+                hidden_states = module_outputs[0] if isinstance(module_outputs, (tuple, list)) else module_outputs
+                if torch.is_tensor(hidden_states):
+                    captured_layer_hiddens[layer_name] = hidden_states
+
+            handles.append(layers[layer_idx - 1].register_forward_hook(capture_layer_hidden))
+
+        return handles
+
+    def _iter_cka_layer_hiddens(
+        self,
+        cka_layer_specs,
+        captured_layer_hiddens,
+        final_hidden,
+        output_hidden_states=None,
+    ):
+        for spec in cka_layer_specs:
+            if spec["kind"] == "final":
+                hidden_states = final_hidden
+            else:
+                hidden_states = captured_layer_hiddens.get(spec["name"])
+                if hidden_states is None and output_hidden_states is not None:
+                    layer_idx = spec["layer_idx"]
+                    if layer_idx is not None and 0 <= layer_idx < len(output_hidden_states):
+                        hidden_states = output_hidden_states[layer_idx]
+
+            if torch.is_tensor(hidden_states):
+                yield spec["name"], hidden_states
+
+    def _compute_cka_chain_losses(
+        self,
+        cka_layer_specs,
+        captured_layer_hiddens,
+        final_hidden,
+        output_hidden_states,
+        pre_projector_features,
+        vision_feature_mask,
+        output_device,
+    ):
+        ordered_hiddens = list(self._iter_cka_layer_hiddens(
+            cka_layer_specs,
+            captured_layer_hiddens,
+            final_hidden,
+            output_hidden_states,
+        ))
+        layer_losses = []
+        per_layer_losses = {}
+        if not ordered_hiddens:
+            return layer_losses, per_layer_losses
+
+        previous_name = "pre_projector"
+        previous_hidden = pre_projector_features.detach()
+        for layer_name, layer_hidden in ordered_hiddens:
+            layer_loss = self._compute_masked_linear_cka_loss(
+                projected_features=layer_hidden,
+                layer_hidden_states=previous_hidden.detach(),
+                vision_feature_mask=vision_feature_mask,
+            ).to(output_device)
+            layer_losses.append(layer_loss)
+            per_layer_losses[f"{previous_name}_to_{layer_name}"] = layer_loss.detach()
+            previous_name = layer_name
+            previous_hidden = layer_hidden
+
+        return layer_losses, per_layer_losses
 
     def _get_cka_attention_subset_kwargs(self):
         config = self.get_model().config
@@ -233,6 +374,25 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # arbitrary equal-score image tokens.
         return torch.argsort(scores, descending=True, stable=True)[:keep_count]
 
+    def _get_cka_attention_query_mask(
+        self,
+        vision_feature_mask: torch.BoolTensor,
+        valid_mask: torch.BoolTensor,
+        labels: Optional[torch.LongTensor] = None,
+    ) -> torch.BoolTensor:
+        text_mask = (~vision_feature_mask) & valid_mask
+        query_tokens = str(
+            getattr(self.get_model().config, 'cka_loss_subset_query_tokens', 'text') or 'text'
+        ).lower().replace('_', '-')
+
+        if query_tokens in ('instruction', 'instructions', 'prompt', 'non-answer', 'nonanswer'):
+            if labels is None or labels.shape != vision_feature_mask.shape:
+                return text_mask
+            labels = labels.to(device=vision_feature_mask.device)
+            return text_mask & labels.eq(IGNORE_INDEX)
+
+        return text_mask
+
     def _select_vision_feature_subset_from_attention(
         self,
         attentions,
@@ -243,6 +403,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         max_keep_ratio: float,
         fallback_mass: float,
         otsu_min_separability: float,
+        labels: Optional[torch.LongTensor] = None,
         min_keep_tokens: int = 16,
     ) -> Optional[torch.BoolTensor]:
         """
@@ -288,7 +449,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         for batch_idx in range(layer_attn.shape[0]):
             valid_mask = attention_mask[batch_idx]
             image_mask = vision_feature_mask[batch_idx] & valid_mask
-            text_mask = (~vision_feature_mask[batch_idx]) & valid_mask
+            cur_labels = labels[batch_idx] if labels is not None else None
+            text_mask = self._get_cka_attention_query_mask(
+                vision_feature_mask[batch_idx],
+                valid_mask,
+                cur_labels,
+            )
 
             image_token_count = int(image_mask.sum().item())
             text_token_count = int(text_mask.sum().item())
@@ -334,6 +500,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         max_keep_ratio: float,
         fallback_mass: float,
         otsu_min_separability: float,
+        labels: Optional[torch.LongTensor] = None,
         min_keep_tokens: int = 2,
     ) -> Optional[torch.BoolTensor]:
         """
@@ -403,7 +570,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         for batch_idx in range(bsz):
             valid_mask = valid_attention_mask[batch_idx]
             image_mask = vision_feature_mask[batch_idx] & valid_mask
-            text_mask = (~vision_feature_mask[batch_idx]) & valid_mask
+            cur_labels = labels[batch_idx] if labels is not None else None
+            text_mask = self._get_cka_attention_query_mask(
+                vision_feature_mask[batch_idx],
+                valid_mask,
+                cur_labels,
+            )
 
             image_token_count = int(image_mask.sum().item())
             text_token_count = int(text_mask.sum().item())
@@ -463,7 +635,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        cka_enabled = self.get_model().training and self.get_model().config.cka_loss
+        cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
         vision_feature_mask = None
         subset_vision_feature_mask = None
         pre_post_cka_loss = None
@@ -475,6 +647,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.last_cka_layers_loss = None
         self.last_cka_per_layer_losses = {}
         self.last_cka_subset_vision_feature_mask = None
+        self.last_cka_final_hidden = None
+        self.last_cka_projector_output = None
 
         if inputs_embeds is None:
             if cka_enabled:
@@ -516,15 +690,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     images,
                     image_sizes
                 )
-        llm_cka_enabled = cka_enabled and self.get_model().config.cka_loss_layers != [-1]
+        cka_layer_specs = self._get_cka_layer_specs() if cka_enabled else []
+        llm_cka_enabled = cka_enabled and len(cka_layer_specs) > 0
         should_output_hidden_states = output_hidden_states
         should_output_attentions = output_attentions
         subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
         subset_selection_kwargs = self._get_cka_attention_subset_kwargs()
+        uses_final_cka_layer = any(spec["kind"] == "final" for spec in cka_layer_specs)
 
         final_layer_pre_norm_hidden = None
         norm_pre_hook_handle = None
-        if llm_cka_enabled and hasattr(self.get_model(), "norm"):
+        if llm_cka_enabled and uses_final_cka_layer and hasattr(self.get_model(), "norm"):
             # HF LlamaModel stores hidden_states[-1] after final RMSNorm; CKA needs the pre-norm value.
             def capture_final_layer_pre_norm_hidden(module, module_inputs):
                 nonlocal final_layer_pre_norm_hidden
@@ -533,6 +709,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             norm_pre_hook_handle = self.get_model().norm.register_forward_pre_hook(
                 capture_final_layer_pre_norm_hidden
+            )
+
+        captured_cka_layer_hiddens = {}
+        cka_layer_hook_handles = []
+        if llm_cka_enabled:
+            cka_layer_hook_handles = self._register_cka_layer_hooks(
+                cka_layer_specs,
+                captured_cka_layer_hiddens,
             )
 
         attention_subset_hook_handle = None
@@ -562,6 +746,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                         attention_mask=attention_mask,
                         position_ids=module_kwargs.get("position_ids", position_ids),
                         past_key_value=module_kwargs.get("past_key_value", None),
+                        labels=labels,
                         **subset_selection_kwargs,
                     )
                     if captured_mask is not None:
@@ -590,6 +775,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 norm_pre_hook_handle.remove()
             if attention_subset_hook_handle is not None:
                 attention_subset_hook_handle.remove()
+            for hook_handle in cka_layer_hook_handles:
+                hook_handle.remove()
 
         if (
             llm_cka_enabled
@@ -605,6 +792,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     vision_feature_mask=vision_feature_mask,
                     attention_mask=attention_mask,
                     select_layer=subset_select_layer,
+                    labels=labels,
                     **subset_selection_kwargs,
                 )
             if subset_vision_feature_mask is None:
@@ -617,23 +805,30 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             cka_layers_loss = output.loss.new_zeros(())
             final_hidden = final_layer_pre_norm_hidden
-            if final_hidden is None and output.hidden_states is not None:
+            if uses_final_cka_layer and final_hidden is None and output.hidden_states is not None:
                 final_hidden = output.hidden_states[-1]
+            if getattr(self.get_model().config, 'log_gradient_norms', False):
+                self.last_cka_final_hidden = final_hidden
 
-            if (
-                vision_feature_mask is not None
-                and final_hidden is not None
-                and pre_projector_features is not None
-            ):
-                # LLM CKA term: compare final LLM states at image-token positions
-                # against the corresponding raw vision-tower features.
+            if vision_feature_mask is not None and pre_projector_features is not None:
+                # LLM CKA terms form a chain over image tokens:
+                # pre_projector -> first requested layer -> ... .
+                # The previous endpoint is detached for each edge, so each term
+                # updates only the later hidden state in that pair.
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                cka_layers_loss = self._compute_masked_linear_cka_loss(
-                    projected_features=final_hidden,
-                    layer_hidden_states=pre_projector_features.detach(),
+                layer_losses, per_layer_losses = self._compute_cka_chain_losses(
+                    cka_layer_specs=cka_layer_specs,
+                    captured_layer_hiddens=captured_cka_layer_hiddens,
+                    final_hidden=final_hidden,
+                    output_hidden_states=output.hidden_states,
+                    pre_projector_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
-                ).to(output.loss.device)
-                self.last_cka_per_layer_losses = {"pre_projector_final": cka_layers_loss.detach()}
+                    output_device=output.loss.device,
+                )
+
+                if layer_losses:
+                    cka_layers_loss = torch.stack(layer_losses).sum()
+                self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
                 )

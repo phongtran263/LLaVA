@@ -210,6 +210,209 @@ class LLaVATrainer(Trainer):
         aux_losses = outputs["aux_losses"]
         return (loss, projector_cka_loss, aux_losses, outputs) if return_outputs else (loss, projector_cka_loss, aux_losses)
 
+    def _should_log_gradient_norms(self):
+        if not getattr(self.args, 'log_gradient_norms', False):
+            return False
+
+        interval = max(1, int(getattr(self.args, 'gradient_log_steps', 1) or 1))
+        global_step = int(getattr(self.state, 'global_step', 0) or 0)
+        if global_step % interval != 0:
+            return False
+        if getattr(self, '_last_gradient_log_step', None) == global_step:
+            return False
+
+        self._last_gradient_log_step = global_step
+        return True
+
+    def _find_model_attr(self, model, attr_name):
+        queue = [model]
+        visited = set()
+
+        while queue:
+            current = queue.pop(0)
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+
+            try:
+                if hasattr(current, attr_name):
+                    return getattr(current, attr_name)
+            except Exception:
+                pass
+
+            for child_attr in ('module', 'base_model', 'model', 'get_model'):
+                try:
+                    child = getattr(current, child_attr)
+                except Exception:
+                    continue
+                if child_attr == 'get_model' and callable(child):
+                    try:
+                        child = child()
+                    except Exception:
+                        continue
+                if isinstance(child, (list, tuple)):
+                    queue.extend(child)
+                else:
+                    queue.append(child)
+
+        return None
+
+    def _set_model_attr(self, model, attr_name, value):
+        queue = [model]
+        try:
+            queue.append(unwrap_model(model))
+        except Exception:
+            pass
+        visited = set()
+
+        while queue:
+            current = queue.pop(0)
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+
+            try:
+                if hasattr(current, attr_name):
+                    setattr(current, attr_name, value)
+            except Exception:
+                pass
+
+            for child_attr in ('module', 'base_model', 'model', 'get_model'):
+                try:
+                    child = getattr(current, child_attr)
+                except Exception:
+                    continue
+                if child_attr == 'get_model' and callable(child):
+                    try:
+                        child = child()
+                    except Exception:
+                        continue
+                if isinstance(child, (list, tuple)):
+                    queue.extend(child)
+                else:
+                    queue.append(child)
+
+    def _clear_gradient_log_tensors(self, model):
+        if not getattr(self.args, 'log_gradient_norms', False):
+            return
+        self._set_model_attr(model, 'last_cka_final_hidden', None)
+        self._set_model_attr(model, 'last_cka_projector_output', None)
+
+    def _gradient_norm(self, loss, tensors, loss_name, target_name):
+        if loss is None or not torch.is_tensor(loss) or not loss.requires_grad:
+            return None
+
+        tensors = [tensor for tensor in tensors if torch.is_tensor(tensor) and tensor.requires_grad]
+        if len(tensors) == 0:
+            return None
+
+        try:
+            grads = torch.autograd.grad(
+                loss,
+                tensors,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+        except RuntimeError as exc:
+            warning_key = f'{loss_name}->{target_name}'
+            warned = getattr(self, '_gradient_log_warnings', set())
+            if warning_key not in warned:
+                logger.warning(
+                    "Skipping gradient norm log for %s because autograd.grad failed: %s",
+                    warning_key,
+                    str(exc).split('\n')[0],
+                )
+                warned.add(warning_key)
+                self._gradient_log_warnings = warned
+            return None
+
+        grad_norms = []
+        for grad in grads:
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+            grad_norms.append(grad.detach().float().norm(2))
+
+        if len(grad_norms) == 0:
+            # A disconnected loss-target pair has a mathematically zero gradient.
+            # Logging 0.0 keeps the W&B series visible on language-only batches.
+            return 0.0
+
+        return torch.stack(grad_norms).norm(2).item()
+
+    def _sum_losses(self, losses):
+        if not losses:
+            return None
+
+        total = losses[0]
+        for loss in losses[1:]:
+            total = total + loss
+        return total
+
+    def _collect_gradient_norm_logs(self, model, text_loss, projector_cka_loss=None, aux_losses=None):
+        if not self._should_log_gradient_norms():
+            return
+
+        self._last_gradient_norm_logs = None
+        try:
+            unwrapped_model = unwrap_model(model)
+        except Exception:
+            unwrapped_model = model
+
+        try:
+            projector_params = [
+                param for name, param in unwrapped_model.named_parameters()
+                if 'mm_projector' in name and param.requires_grad
+            ]
+        except Exception as exc:
+            logger.warning("Could not collect mm_projector parameters for gradient logging: %s", exc)
+            projector_params = []
+
+        projector_output = self._find_model_attr(unwrapped_model, 'last_cka_projector_output')
+        projector_output_tensors = [
+            projector_output
+        ] if torch.is_tensor(projector_output) and projector_output.requires_grad else []
+        final_hidden = self._find_model_attr(unwrapped_model, 'last_cka_final_hidden')
+        final_hidden_tensors = [final_hidden] if torch.is_tensor(final_hidden) and final_hidden.requires_grad else []
+        final_hidden_cka_loss = self._sum_losses(aux_losses or [])
+
+        cka_loss = None
+        if projector_cka_loss is not None and final_hidden_cka_loss is not None:
+            cka_loss = projector_cka_loss + final_hidden_cka_loss
+        elif projector_cka_loss is not None:
+            cka_loss = projector_cka_loss
+        elif final_hidden_cka_loss is not None:
+            cka_loss = final_hidden_cka_loss
+
+        logs = {'grad_norm/measured_global_step': float(getattr(self.state, 'global_step', 0) or 0)}
+
+        projector_losses = (
+            ('text_loss', text_loss),
+            ('cka_loss', cka_loss),
+            ('projector_cka_loss', projector_cka_loss),
+            ('final_hidden_cka_loss', final_hidden_cka_loss),
+        )
+        final_hidden_losses = (
+            ('text_loss', text_loss),
+            ('cka_loss', cka_loss),
+            ('final_hidden_cka_loss', final_hidden_cka_loss),
+        )
+        target_specs = (
+            ('projector_output', projector_output_tensors, projector_losses),
+            ('projector_params', projector_params, projector_losses),
+            ('final_hidden', final_hidden_tensors, final_hidden_losses),
+        )
+        for target_name, target_tensors, loss_specs in target_specs:
+            for loss_name, loss_value in loss_specs:
+                norm = self._gradient_norm(loss_value, target_tensors, loss_name, target_name)
+                if norm is not None:
+                    logs[f'grad_norm/{loss_name}/{target_name}'] = norm
+
+        if len(logs) > 1:
+            self._last_gradient_norm_logs = logs
+
     def training_step(self, model, inputs):
         model.train()
         inputs = self._prepare_inputs(inputs)
@@ -233,6 +436,8 @@ class LLaVATrainer(Trainer):
         if self.model.config.cka_loss and self.args.n_gpu > 1:
             aux_losses = [aux_loss.mean() for aux_loss in aux_losses]
 
+        self._collect_gradient_norm_logs(model, text_loss, projector_cka_loss, aux_losses)
+
         loss = text_loss
         if self.model.config.cka_loss:
             if projector_cka_loss is not None:
@@ -240,11 +445,14 @@ class LLaVATrainer(Trainer):
             # Auxiliary CKA currently contains the final LLM hidden vs pre-projector term.
             loss = loss + sum(aux_losses)
 
-        if self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            self.accelerator.backward(loss)
+        try:
+            if self.use_apex:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                self.accelerator.backward(loss)
+        finally:
+            self._clear_gradient_log_tensors(model)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
@@ -285,6 +493,7 @@ class LLaVATrainer(Trainer):
         cka_projector_loss = getattr(model, 'last_cka_projector_loss', getattr(model, 'last_cka_pre_post_loss', None))
         cka_pre_final_loss = getattr(model, 'last_cka_pre_final_loss', None)
         cka_layers_loss = getattr(model, 'last_cka_layers_loss', None)
+        cka_per_layer_losses = getattr(model, 'last_cka_per_layer_losses', None)
 
         if cka_loss is not None:
             logs['loss/cka_loss'] = cka_loss.item() if torch.is_tensor(cka_loss) else float(cka_loss)
@@ -296,6 +505,14 @@ class LLaVATrainer(Trainer):
             logs['loss/cka_pre_final_loss'] = cka_pre_final_loss.item() if torch.is_tensor(cka_pre_final_loss) else float(cka_pre_final_loss)
         if cka_layers_loss is not None:
             logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
+        if isinstance(cka_per_layer_losses, dict):
+            for layer_name, layer_loss in sorted(cka_per_layer_losses.items()):
+                logs[f'loss/cka_layers/{layer_name}'] = layer_loss.item() if torch.is_tensor(layer_loss) else float(layer_loss)
+
+        gradient_norm_logs = getattr(self, '_last_gradient_norm_logs', None)
+        if gradient_norm_logs:
+            logs.update(gradient_norm_logs)
+            self._last_gradient_norm_logs = None
 
         return super().log(logs)
 

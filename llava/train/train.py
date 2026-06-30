@@ -92,14 +92,15 @@ class ModelArguments:
     cka_loss: bool = field(default=False)
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
-    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the final LLM hidden-state CKA loss. Defaults to cka_loss_weight for backward compatibility."})
+    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the chained LLM hidden-state CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     # CKA has two terms: projector CKA always follows `cka_loss`, while this
-    # option controls the final-LLM-hidden-vs-pre-projector term.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Use 'final' to compare pre-projector image features with the final LLM hidden state; use '-1' to disable this LLM-hidden CKA term."})
+    # option controls the chained LLM-hidden CKA term.
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for chained LLM-hidden CKA: pre_projector->first->next->...->final, e.g. '8,16,24,final'. Use 'all' for pre_projector->layer1->layer2->...->last_block over image tokens. Use '-1' to disable this term."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
     cka_loss_subset_select_layer: Optional[int] = field(default=None, metadata={"help": "LLM transformer layer index (1-based) whose text-to-image attention is used to select important image tokens for later CKA layers."})
+    cka_loss_subset_query_tokens: str = field(default="text", metadata={"help": "Query tokens for attention-based CKA subset selection: 'text' for all non-image text tokens, or 'instruction' for non-answer prompt tokens (labels == IGNORE_INDEX)."})
     cka_loss_subset_ratio: float = field(default=0.5, metadata={"help": "Legacy max-ratio cap for attention-selected CKA image tokens when cka_loss_subset_max_ratio is not set."})
     cka_loss_subset_min_ratio: float = field(default=0.10, metadata={"help": "Minimum fraction of image tokens kept by dynamic attention/Otsu CKA subset selection."})
     cka_loss_subset_max_ratio: Optional[float] = field(default=0.90, metadata={"help": "Maximum fraction of image tokens kept by dynamic attention/Otsu CKA subset selection. Defaults to cka_loss_subset_ratio for compatibility."})
@@ -115,6 +116,8 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    train_data_fraction: float = field(default=1.0, metadata={"help": "Fraction of the training JSON to use. Set below 1.0 for quick debug runs."})
+    train_data_seed: int = field(default=42, metadata={"help": "Seed used when sampling train_data_fraction."})
 
 
 @dataclass
@@ -156,6 +159,8 @@ class TrainingArguments(transformers.TrainingArguments):
     debug_compare_batch_start: int = field(default=0, metadata={"help": "Starting dataset index for the CKA debug comparison batch."})
     debug_compare_seed: int = field(default=1234, metadata={"help": "Random seed reused for both CKA-off and CKA-on debug passes."})
     debug_compare_grad_param: Optional[str] = field(default=None, metadata={"help": "Optional substring used to choose a reference parameter when comparing gradients."})
+    log_gradient_norms: bool = field(default=False, metadata={"help": "Log per-loss gradient norms for projector parameters and final hidden states."})
+    gradient_log_steps: int = field(default=50, metadata={"help": "How often, in optimizer steps, to compute gradient norm debug logs."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -703,6 +708,16 @@ def preprocess_qwen(
     )
 
 
+def preprocess_llama3(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    # Llama 3 chat headers and <|eot_id|> are easier to mask by assistant spans
+    # than by separator token counts, especially with image-token placeholders.
+    return preprocess_qwen(sources, tokenizer, has_image=has_image)
+
+
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
@@ -745,6 +760,8 @@ def preprocess(
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "qwen2":
         return preprocess_qwen(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.version == "llama3":
+        return preprocess_llama3(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
@@ -783,6 +800,22 @@ class LazySupervisedDataset(Dataset):
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
+        original_size = len(list_data_dict)
+        train_data_fraction = float(getattr(data_args, 'train_data_fraction', 1.0) or 1.0)
+        if train_data_fraction <= 0.0 or train_data_fraction > 1.0:
+            raise ValueError(f"train_data_fraction must be in (0, 1], got {train_data_fraction}")
+        if original_size > 0 and train_data_fraction < 1.0:
+            subset_size = max(1, int(original_size * train_data_fraction))
+            train_data_seed = int(getattr(data_args, 'train_data_seed', 42))
+            generator = torch.Generator()
+            generator.manual_seed(train_data_seed)
+            selected_indices = torch.randperm(original_size, generator=generator)[:subset_size].tolist()
+            selected_indices.sort()
+            list_data_dict = [list_data_dict[idx] for idx in selected_indices]
+            rank0_print(
+                f"Using {len(list_data_dict):,}/{original_size:,} training samples "
+                f"({train_data_fraction:.2%}) with train_data_seed={train_data_seed}"
+            )
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -935,6 +968,7 @@ def train(attn_implementation=None):
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     model_name_lower = model_args.model_name_or_path.lower()
+    is_llama3_model = "llama-3" in model_name_lower or "llama3" in model_name_lower
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -1017,6 +1051,7 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    model.config.log_gradient_norms = training_args.log_gradient_norms
     model.config.cka_loss_weight = model_args.cka_loss_weight
     model.config.cka_loss_projector_weight = (
         float(model_args.cka_loss_projector_weight)
@@ -1030,6 +1065,17 @@ def train(attn_implementation=None):
     )
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
     model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
+    cka_subset_query_tokens = str(model_args.cka_loss_subset_query_tokens or "text").lower().replace("_", "-")
+    if cka_subset_query_tokens in ("all", "all-text", "text"):
+        cka_subset_query_tokens = "text"
+    elif cka_subset_query_tokens in ("instruction", "instructions", "prompt", "non-answer", "nonanswer"):
+        cka_subset_query_tokens = "instruction"
+    else:
+        rank0_print(
+            f"Warning: Invalid cka_loss_subset_query_tokens '{model_args.cka_loss_subset_query_tokens}', defaulting to text"
+        )
+        cka_subset_query_tokens = "text"
+    model.config.cka_loss_subset_query_tokens = cka_subset_query_tokens
     model.config.cka_loss_subset_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_ratio)))
     model.config.cka_loss_subset_min_ratio = max(0.0, min(1.0, float(model_args.cka_loss_subset_min_ratio)))
     if model_args.cka_loss_subset_max_ratio is None:
@@ -1043,20 +1089,46 @@ def train(attn_implementation=None):
         )
     model.config.cka_loss_subset_fallback_mass = max(0.0, min(1.0, float(model_args.cka_loss_subset_fallback_mass)))
     model.config.cka_loss_subset_otsu_min_separability = max(0.0, min(1.0, float(model_args.cka_loss_subset_otsu_min_separability)))
-    # cka_loss_layers is kept for CLI compatibility. Any non-disabled value uses
-    # pre-projector image features vs the final LLM hidden state.
+    # cka_loss_layers accepts comma-separated 1-based decoder layer indices plus
+    # the special final/pre-norm hidden state. It also accepts "all", which
+    # expands to every transformer block output. The requested hidden states are
+    # regularized as a chain over image tokens: pre_projector->first->next->... .
     if model_args.cka_loss_layers:
-        cka_loss_layers_arg = model_args.cka_loss_layers.lower()
-        if cka_loss_layers_arg in ("-1", "none", "off", "false"):
+        cka_loss_layers_arg = model_args.cka_loss_layers.strip()
+        cka_loss_layers_lower = cka_loss_layers_arg.lower()
+        if cka_loss_layers_lower in ("-1", "none", "off", "false"):
             model.config.cka_loss_layers = [-1]
-        elif cka_loss_layers_arg in ("final", "last", "all"):
-            model.config.cka_loss_layers = "final"
+        elif cka_loss_layers_lower == "all":
+            model.config.cka_loss_layers = "all"
         else:
-            try:
-                model.config.cka_loss_layers = [int(x.strip()) for x in model_args.cka_loss_layers.split(",")]
-            except ValueError:
-                rank0_print(f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', defaulting to final")
+            parsed_cka_layers = []
+            invalid_cka_layer = None
+            for raw_token in cka_loss_layers_arg.split(","):
+                token = raw_token.strip()
+                if not token:
+                    continue
+                token_lower = token.lower()
+                if token_lower in ("final", "last"):
+                    parsed_cka_layers.append("final")
+                    continue
+                try:
+                    layer_idx = int(token)
+                except ValueError:
+                    invalid_cka_layer = token
+                    break
+                if layer_idx <= 0:
+                    invalid_cka_layer = token
+                    break
+                parsed_cka_layers.append(layer_idx)
+
+            if invalid_cka_layer is not None or not parsed_cka_layers:
+                rank0_print(
+                    f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', "
+                    "defaulting to final"
+                )
                 model.config.cka_loss_layers = "final"
+            else:
+                model.config.cka_loss_layers = parsed_cka_layers
     else:
         model.config.cka_loss_layers = "final"
 
@@ -1116,7 +1188,7 @@ def train(attn_implementation=None):
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
-            use_fast=False,
+            use_fast=is_llama3_model,
             force_download=model_args.force_download,
         )
 
@@ -1133,6 +1205,11 @@ def train(attn_implementation=None):
         if 'qwen' in model_name_lower:
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+            if tokenizer.pad_token_id is not None:
+                model.config.pad_token_id = tokenizer.pad_token_id
+        elif is_llama3_model:
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token
             if tokenizer.pad_token_id is not None:
                 model.config.pad_token_id = tokenizer.pad_token_id
         else:

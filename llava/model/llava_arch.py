@@ -217,6 +217,8 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         projected_image_features = self.get_model().mm_projector(image_features)
+        if self.get_model().training and getattr(self.get_model().config, 'log_gradient_norms', False):
+            self.last_cka_projector_output = projected_image_features
 
         if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
             # Projector CKA term: keep the projected image embeddings structurally

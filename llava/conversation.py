@@ -380,6 +380,20 @@ You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
     sep="<|im_end|>\n",
 )
 
+conv_llama_3_1 = Conversation(
+    # Do not include literal <|begin_of_text|>; Llama tokenizers add BOS when
+    # LLaVA calls tokenizer(...), and tokenizer_image_token preserves it.
+    system="""<|start_header_id|>system<|end_header_id|>
+
+You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.""",
+    roles=("<|start_header_id|>user<|end_header_id|>\n\n", "<|start_header_id|>assistant<|end_header_id|>\n\n"),
+    version="llama3",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|eot_id|>",
+)
+
 default_conversation = conv_vicuna_v1
 conv_templates = {
     "default": conv_vicuna_v0,
@@ -392,6 +406,10 @@ conv_templates = {
     "mistral_direct": conv_chatml_direct,
     "qwen2": conv_qwen2,
     "qwen2_5": conv_qwen2,
+    "llama3": conv_llama_3_1,
+    "llama_3": conv_llama_3_1,
+    "llama3_1": conv_llama_3_1,
+    "llama_3_1": conv_llama_3_1,
 
     "plain": conv_llava_plain,
     "v0_plain": conv_llava_plain,

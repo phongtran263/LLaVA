@@ -35,7 +35,6 @@ _QWEN2_FORWARD_SUPPORTS_CACHE_POSITION = (
     "cache_position" in inspect.signature(Qwen2ForCausalLM.forward).parameters
 )
 
-
 class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
@@ -49,13 +48,17 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
 class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaQwenConfig
-
     _compute_masked_linear_cka_loss = LlavaLlamaForCausalLM._compute_masked_linear_cka_loss
     _get_cka_attention_subset_kwargs = LlavaLlamaForCausalLM._get_cka_attention_subset_kwargs
     _fallback_keep_count_from_attention_mass = LlavaLlamaForCausalLM._fallback_keep_count_from_attention_mass
     _otsu_keep_count_from_log_probs = LlavaLlamaForCausalLM._otsu_keep_count_from_log_probs
     _select_topk_indices_from_attention_scores = LlavaLlamaForCausalLM._select_topk_indices_from_attention_scores
     _select_vision_feature_subset_from_attention = LlavaLlamaForCausalLM._select_vision_feature_subset_from_attention
+    _get_cka_attention_query_mask = LlavaLlamaForCausalLM._get_cka_attention_query_mask
+    _get_cka_layer_specs = LlavaLlamaForCausalLM._get_cka_layer_specs
+    _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
+    _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
+    _compute_cka_chain_losses = LlavaLlamaForCausalLM._compute_cka_chain_losses
 
     def __init__(self, config):
         config.model_type = "llava_qwen"
@@ -83,6 +86,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         max_keep_ratio: float,
         fallback_mass: float,
         otsu_min_separability: float,
+        labels: Optional[torch.LongTensor] = None,
         min_keep_tokens: int = 2,
     ) -> Optional[torch.BoolTensor]:
         if hidden_states is None or vision_feature_mask is None:
@@ -147,7 +151,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         for batch_idx in range(bsz):
             valid_mask = valid_attention_mask[batch_idx]
             image_mask = vision_feature_mask[batch_idx] & valid_mask
-            text_mask = (~vision_feature_mask[batch_idx]) & valid_mask
+            cur_labels = labels[batch_idx] if labels is not None else None
+            text_mask = self._get_cka_attention_query_mask(
+                vision_feature_mask[batch_idx],
+                valid_mask,
+                cur_labels,
+            )
 
             image_token_count = int(image_mask.sum().item())
             text_token_count = int(text_mask.sum().item())
@@ -220,6 +229,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.last_cka_layers_loss = None
         self.last_cka_per_layer_losses = {}
         self.last_cka_subset_vision_feature_mask = None
+        self.last_cka_final_hidden = None
+        self.last_cka_projector_output = None
 
         if inputs_embeds is None:
             if cka_enabled:
@@ -260,15 +271,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     image_sizes
                 )
 
-        llm_cka_enabled = cka_enabled and getattr(self.get_model().config, 'cka_loss_layers', "final") != [-1]
+        cka_layer_specs = self._get_cka_layer_specs() if cka_enabled else []
+        llm_cka_enabled = cka_enabled and len(cka_layer_specs) > 0
         should_output_hidden_states = output_hidden_states
         should_output_attentions = output_attentions
         subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
         subset_selection_kwargs = self._get_cka_attention_subset_kwargs()
+        uses_final_cka_layer = any(spec["kind"] == "final" for spec in cka_layer_specs)
 
         final_layer_pre_norm_hidden = None
         norm_pre_hook_handle = None
-        if llm_cka_enabled and hasattr(self.get_model(), "norm"):
+        if llm_cka_enabled and uses_final_cka_layer and hasattr(self.get_model(), "norm"):
             def capture_final_layer_pre_norm_hidden(module, module_inputs):
                 nonlocal final_layer_pre_norm_hidden
                 if module_inputs:
@@ -276,6 +289,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
             norm_pre_hook_handle = self.get_model().norm.register_forward_pre_hook(
                 capture_final_layer_pre_norm_hidden
+            )
+
+        captured_cka_layer_hiddens = {}
+        cka_layer_hook_handles = []
+        if llm_cka_enabled:
+            cka_layer_hook_handles = self._register_cka_layer_hooks(
+                cka_layer_specs,
+                captured_cka_layer_hiddens,
             )
 
         attention_subset_hook_handle = None
@@ -304,6 +325,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         attention_mask=attention_mask,
                         position_ids=module_kwargs.get("position_ids", position_ids),
                         past_key_value=module_kwargs.get("past_key_value", None),
+                        labels=labels,
                         **subset_selection_kwargs,
                     )
                     if captured_mask is not None:
@@ -336,6 +358,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 norm_pre_hook_handle.remove()
             if attention_subset_hook_handle is not None:
                 attention_subset_hook_handle.remove()
+            for hook_handle in cka_layer_hook_handles:
+                hook_handle.remove()
 
         if (
             llm_cka_enabled
@@ -350,6 +374,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     vision_feature_mask=vision_feature_mask,
                     attention_mask=attention_mask,
                     select_layer=subset_select_layer,
+                    labels=labels,
                     **subset_selection_kwargs,
                 )
             if subset_vision_feature_mask is None:
@@ -362,21 +387,26 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
             cka_layers_loss = output.loss.new_zeros(())
             final_hidden = final_layer_pre_norm_hidden
-            if final_hidden is None and output.hidden_states is not None:
+            if uses_final_cka_layer and final_hidden is None and output.hidden_states is not None:
                 final_hidden = output.hidden_states[-1]
+            if getattr(self.get_model().config, 'log_gradient_norms', False):
+                self.last_cka_final_hidden = final_hidden
 
-            if (
-                vision_feature_mask is not None
-                and final_hidden is not None
-                and pre_projector_features is not None
-            ):
+            if vision_feature_mask is not None and pre_projector_features is not None:
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                cka_layers_loss = self._compute_masked_linear_cka_loss(
-                    projected_features=final_hidden,
-                    layer_hidden_states=pre_projector_features.detach(),
+                layer_losses, per_layer_losses = self._compute_cka_chain_losses(
+                    cka_layer_specs=cka_layer_specs,
+                    captured_layer_hiddens=captured_cka_layer_hiddens,
+                    final_hidden=final_hidden,
+                    output_hidden_states=output.hidden_states,
+                    pre_projector_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
-                ).to(output.loss.device)
-                self.last_cka_per_layer_losses = {"pre_projector_final": cka_layers_loss.detach()}
+                    output_device=output.loss.device,
+                )
+
+                if layer_losses:
+                    cka_layers_loss = torch.stack(layer_losses).sum()
+                self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None
                 )
