@@ -1,188 +1,40 @@
-name: p
+name: llava
 channels:
   - conda-forge
-  - nvidia
 dependencies:
-  - _openmp_mutex=4.5
-  - alsa-lib=1.2.15.3
-  - binutils=2.45.1
-  - binutils_impl_linux-64=2.45.1
-  - binutils_linux-64=2.45.1
-  - bzip2=1.0.8
-  - c-compiler=1.11.0
-  - ca-certificates=2026.2.25
-  - conda-gcc-specs=14.3.0
-  - cuda-cccl_linux-64=13.2.27
-  - cuda-command-line-tools=13.2.0
-  - cuda-compiler=13.2.0
-  - cuda-crt-dev_linux-64=13.2.51
-  - cuda-crt-tools=13.2.51
-  - cuda-ctadvisor=13.2.51
-  - cuda-cudart=13.2.51
-  - cuda-cudart-dev=13.2.51
-  - cuda-cudart-dev_linux-64=13.2.51
-  - cuda-cudart-static=13.2.51
-  - cuda-cudart-static_linux-64=13.2.51
-  - cuda-cudart_linux-64=13.2.51
-  - cuda-culibos-static=13.2.51
-  - cuda-cuobjdump=13.2.51
-  - cuda-cupti=13.2.23
-  - cuda-cupti-dev=13.2.23
-  - cuda-cuxxfilt=13.2.51
-  - cuda-documentation=12.4.127
-  - cuda-driver-dev=13.2.51
-  - cuda-driver-dev_linux-64=13.2.51
-  - cuda-gdb=13.2.20
-  - cuda-libraries=13.2.0
-  - cuda-libraries-dev=13.2.0
-  - cuda-libraries-static=13.2.0
-  - cuda-nsight=13.2.20
-  - cuda-nvcc=13.2.51
-  - cuda-nvcc-dev_linux-64=13.2.51
-  - cuda-nvcc-impl=13.2.51
-  - cuda-nvcc-tools=13.2.51
-  - cuda-nvcc_linux-64=13.2.51
-  - cuda-nvdisasm=13.2.51
-  - cuda-nvml-dev=13.2.51
-  - cuda-nvprune=13.2.51
-  - cuda-nvrtc=13.2.51
-  - cuda-nvrtc-dev=13.2.51
-  - cuda-nvrtc-static=13.2.51
-  - cuda-nvtx=13.2.20
-  - cuda-nvvm-dev_linux-64=13.2.51
-  - cuda-nvvm-impl=13.2.51
-  - cuda-nvvm-tools=13.2.51
-  - cuda-opencl=13.2.51
-  - cuda-opencl-dev=13.2.51
-  - cuda-profiler-api=13.2.20
-  - cuda-sanitizer-api=13.2.23
-  - cuda-tileiras=13.2.51
-  - cuda-toolkit=12.1.1
-  - cuda-tools=13.2.0
-  - cuda-version=13.2
-  - cuda-visual-tools=13.2.0
-  - cxx-compiler=1.11.0
-  - dbus=1.16.2
-  - fontconfig=2.17.1
-  - freetype=2.14.3
-  - gcc=14.3.0
-  - gcc_impl_linux-64=14.3.0
-  - gcc_linux-64=14.3.0
-  - gds-tools=1.17.0.44
-  - gmp=6.3.0
-  - gxx=14.3.0
-  - gxx_impl_linux-64=14.3.0
-  - gxx_linux-64=14.3.0
-  - icu=78.3
-  - kernel-headers_linux-64=5.14.0
-  - ld_impl_linux-64=2.45.1
-  - libcap=2.77
-  - libcublas=13.3.0.5
-  - libcublas-dev=13.3.0.5
-  - libcublas-static=13.3.0.5
-  - libcufft=12.2.0.37
-  - libcufft-dev=12.2.0.37
-  - libcufft-static=12.2.0.37
-  - libcufile=1.17.0.44
-  - libcufile-dev=1.17.0.44
-  - libcufile-static=1.17.0.44
-  - libcuobjclient=1.1.0.44
-  - libcuobjclient-dev=1.1.0.44
-  - libcurand=10.4.2.51
-  - libcurand-dev=10.4.2.51
-  - libcurand-static=10.4.2.51
-  - libcusolver=12.1.0.51
-  - libcusolver-dev=12.1.0.51
-  - libcusolver-static=12.1.0.51
-  - libcusparse=12.7.9.17
-  - libcusparse-dev=12.7.9.17
-  - libcusparse-static=12.7.9.17
-  - libexpat=2.7.5
-  - libffi=3.5.2
-  - libfreetype=2.14.3
-  - libfreetype6=2.14.3
-  - libgcc=15.2.0
-  - libgcc-devel_linux-64=14.3.0
-  - libgcc-ng=15.2.0
-  - libglib=2.86.4
-  - libglvnd=1.7.0
-  - libgomp=15.2.0
-  - libiconv=1.18
-  - liblzma=5.8.2
-  - libnl=3.11.0
-  - libnpp=13.1.0.44
-  - libnpp-dev=13.1.0.44
-  - libnpp-static=13.1.0.44
-  - libnsl=2.0.1
-  - libnuma=2.0.18
-  - libnvfatbin=13.2.51
-  - libnvfatbin-dev=13.2.51
-  - libnvfatbin-static=13.2.51
-  - libnvjitlink=13.2.51
-  - libnvjitlink-dev=13.2.51
-  - libnvjitlink-static=13.2.51
-  - libnvjpeg=13.0.4.44
-  - libnvjpeg-dev=13.0.4.44
-  - libnvjpeg-static=13.0.4.44
-  - libnvptxcompiler-dev=13.2.51
-  - libnvptxcompiler-dev_linux-64=13.2.51
-  - libnvvm-samples=12.1.105
-  - libopengl=1.7.0
-  - libpng=1.6.57
-  - libsanitizer=14.3.0
-  - libsqlite=3.52.0
-  - libstdcxx=15.2.0
-  - libstdcxx-devel_linux-64=14.3.0
-  - libstdcxx-ng=15.2.0
-  - libsystemd0=260.1
-  - libudev1=260.1
-  - libuuid=2.42
-  - libxcb=1.17.0
-  - libxcrypt=4.4.36
-  - libxkbcommon=1.13.1
-  - libxkbfile=1.1.0
-  - libxml2=2.15.2
-  - libxml2-16=2.15.2
-  - libzlib=1.3.2
-  - ncurses=6.5
-  - nsight-compute=2026.1.0.9
-  - nspr=4.38
-  - nss=3.118
-  - ocl-icd=2.3.3
-  - opencl-headers=2025.06.13
-  - openssl=3.6.2
-  - packaging=26.0
-  - pcre2=10.47
-  - pip=26.0.1
-  - pthread-stubs=0.4
-  - python=3.10.20
-  - rdma-core=61.0
-  - readline=8.3
-  - sysroot_linux-64=2.34
-  - tk=8.6.13
-  - wayland=1.25.0
-  - wheel=0.46.3
-  - xcb-util=0.4.1
-  - xcb-util-cursor=0.1.6
-  - xcb-util-image=0.4.0
-  - xcb-util-keysyms=0.4.1
-  - xcb-util-renderutil=0.3.10
-  - xcb-util-wm=0.4.2
-  - xkeyboard-config=2.47
-  - xorg-libice=1.1.2
-  - xorg-libsm=1.2.6
-  - xorg-libx11=1.8.13
-  - xorg-libxau=1.0.12
-  - xorg-libxcomposite=0.4.7
-  - xorg-libxdamage=1.1.6
-  - xorg-libxdmcp=1.1.5
-  - xorg-libxext=1.3.7
-  - xorg-libxfixes=6.0.2
-  - xorg-libxi=1.8.2
-  - xorg-libxrandr=1.5.5
-  - xorg-libxrender=0.9.12
-  - xorg-libxtst=1.2.5
-  - zstd=1.5.7
+  - _openmp_mutex=4.5=20_gnu
+  - bzip2=1.0.8=hda65f42_9
+  - ca-certificates=2026.5.20=hbd8a1cb_0
+  - htop=3.5.1=h18c060e_0
+  - ld_impl_linux-64=2.45.1=default_hbd61a6d_102
+  - libexpat=2.8.1=hecca717_0
+  - libffi=3.5.2=h3435931_0
+  - libgcc=15.2.0=he0feb66_19
+  - libgcc-ng=15.2.0=h69a702a_19
+  - libgomp=15.2.0=he0feb66_19
+  - libiconv=1.18=h3b78370_2
+  - liblzma=5.8.3=hb03c661_0
+  - libnl=3.11.0=hb9d3cd8_0
+  - libnsl=2.0.1=hb9d3cd8_1
+  - libsqlite=3.53.2=h0c1763c_0
+  - libstdcxx=15.2.0=h934c35e_19
+  - libuuid=2.42.1=h5347b49_0
+  - libxcrypt=4.4.36=hd590300_1
+  - libzlib=1.3.2=h25fd6f3_2
+  - lz4-c=1.10.0=h5888daf_1
+  - ncurses=6.6=hdb14827_0
+  - openssl=3.6.3=h35e630c_0
+  - packaging=26.2=pyhc364b38_0
+  - pip=26.1.2=pyh8b19718_0
+  - popt=1.19=h3b78370_0
+  - python=3.10.20=h3c07f61_0_cpython
+  - readline=8.3=h853b02a_0
+  - rsync=3.4.4=h5440a77_0
+  - setuptools=82.0.1=pyh332efcf_0
+  - tk=8.6.13=noxft_h366c992_103
+  - wheel=0.47.0=pyhd8ed1ab_0
+  - xxhash=0.8.3=hb47aa4a_0
+  - zstd=1.5.7=hb78ec9c_6
   - pip:
       - accelerate==0.21.0
       - aiofiles==23.2.1
@@ -192,49 +44,48 @@ dependencies:
       - anyio==4.13.0
       - attrs==26.1.0
       - bitsandbytes==0.45.5
-      - certifi==2026.2.25
+      - certifi==2026.5.20
       - charset-normalizer==3.4.7
-      - click==8.3.2
+      - click==8.4.1
       - contourpy==1.3.2
       - cycler==0.12.1
-      - deepspeed==0.18.9
+      - deepspeed==0.15.4
       - einops==0.6.1
       - einops-exts==0.0.4
-      - et-xmlfile==2.0.0
       - exceptiongroup==1.3.1
       - fastapi==0.135.3
       - ffmpy==1.0.0
-      - filelock==3.25.2
+      - filelock==3.29.1
       - flash-attn==2.8.3
-      - fonttools==4.62.1
-      - fsspec==2026.3.0
+      - fonttools==4.63.0
+      - fsspec==2026.4.0
       - gitdb==4.0.12
-      - gitpython==3.1.46
+      - gitpython==3.1.50
       - gradio==4.16.0
       - gradio-client==0.8.1
       - h11==0.14.0
-      - hf-xet==1.4.3
+      - hf-xet==1.5.1
       - hjson==3.1.0
       - httpcore==0.17.3
       - httpx==0.24.0
       - huggingface-hub==0.36.2
-      - idna==3.11
+      - idna==3.18
       - importlib-resources==6.5.2
       - jinja2==3.1.6
       - joblib==1.5.3
       - jsonschema==4.26.0
       - jsonschema-specifications==2025.9.1
       - kiwisolver==1.5.0
-      - latex2mathml==3.79.0
+      - latex2mathml==3.81.0
       - llava==1.2.2.post1
-      - markdown-it-py==4.0.0
+      - markdown-it-py==4.2.0
       - markdown2==2.5.5
       - markupsafe==2.1.5
-      - matplotlib==3.10.8
+      - matplotlib==3.10.9
       - mdurl==0.1.2
       - mpmath==1.3.0
       - msgpack==1.1.2
-      - narwhals==2.19.0
+      - narwhals==2.22.1
       - networkx==3.4.2
       - ninja==1.13.0
       - numpy==1.26.4
@@ -249,16 +100,14 @@ dependencies:
       - nvidia-cusolver-cu12==11.7.2.55
       - nvidia-cusparse-cu12==12.5.7.53
       - nvidia-cusparselt-cu12==0.6.3
-      - nvidia-ml-py==13.595.45
       - nvidia-nccl-cu12==2.26.2
       - nvidia-nvjitlink-cu12==12.8.61
       - nvidia-nvtx-cu12==12.8.55
-      - openpyxl==3.1.2
-      - orjson==3.11.8
+      - orjson==3.11.9
       - pandas==2.3.3
       - peft==0.4.0
       - pillow==10.4.0
-      - platformdirs==4.9.6
+      - platformdirs==4.10.0
       - protobuf==6.33.6
       - psutil==7.2.2
       - py-cpuinfo==9.0.0
@@ -266,52 +115,48 @@ dependencies:
       - pydantic-core==2.41.5
       - pydub==0.25.1
       - pygments==2.20.0
-      - pynvml==13.0.1
       - pyparsing==3.3.2
       - python-dateutil==2.9.0.post0
-      - python-multipart==0.0.24
-      - pytz==2026.1.post1
+      - python-multipart==0.0.32
+      - pytz==2026.2
       - pyyaml==6.0.3
       - referencing==0.37.0
-      - regex==2026.4.4
+      - regex==2026.5.9
       - requests==2.33.1
-      - rich==14.3.3
+      - rich==15.0.0
       - rpds-py==0.30.0
-      - ruff==0.15.10
-      - safetensors==0.7.0
+      - ruff==0.15.16
+      - safetensors==0.8.0
       - scikit-learn==1.2.2
       - scipy==1.15.3
       - semantic-version==2.10.0
       - sentencepiece==0.1.99
-      - sentry-sdk==2.57.0
-      - setuptools==80.10.2
+      - sentry-sdk==2.62.0
       - shellingham==1.5.4
       - shortuuid==1.0.13
       - six==1.17.0
       - smmap==5.0.3
       - sniffio==1.3.1
-      - starlette==1.0.0
+      - starlette==1.2.1
       - svgwrite==1.4.3
       - sympy==1.14.0
-      - tensorboardx==2.6.2.2
       - threadpoolctl==3.6.0
-      - tiktoken==0.5.2
       - timm==0.6.13
       - tokenizers==0.15.1
       - tomlkit==0.12.0
       - torch==2.7.1+cu128
       - torchaudio==2.7.1+cu128
       - torchvision==0.22.1+cu128
-      - tqdm==4.67.3
+      - tqdm==4.68.2
       - transformers==4.37.2
       - triton==3.3.1
-      - typer==0.24.1
+      - typer==0.26.7
       - typing-extensions==4.15.0
       - typing-inspection==0.4.2
-      - tzdata==2026.1
-      - urllib3==2.6.3
+      - tzdata==2026.2
+      - urllib3==2.7.0
       - uvicorn==0.44.0
       - wandb==0.25.1
       - wavedrom==2.0.3.post3
       - websockets==11.0.3
-prefix: /home/duc/.conda/envs/cka
+prefix: /home/jovyan/dowser-lora-datavol-1/phong/conda/envs/llava
