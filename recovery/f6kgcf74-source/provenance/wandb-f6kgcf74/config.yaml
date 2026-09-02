@@ -1,0 +1,725 @@
+_name_or_path:
+    value: Qwen/Qwen2.5-7B-Instruct
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            7ler1vgptc2si0mp9lj8omk84pkl2a4p:
+                args:
+                    - --local_rank=0
+                    - --deepspeed
+                    - ./scripts/zero2.json
+                    - --model_name_or_path
+                    - Qwen/Qwen2.5-7B-Instruct
+                    - --force_download
+                    - "False"
+                    - --version
+                    - plain
+                    - --data_path
+                    - ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json
+                    - --image_folder
+                    - ./playground/LLaVA-Pretrain/images
+                    - --vision_tower
+                    - openai/clip-vit-large-patch14-336
+                    - --mm_projector_type
+                    - mlp2x_gelu
+                    - --tune_mm_mlp_adapter
+                    - "True"
+                    - --mm_vision_select_layer
+                    - "-2"
+                    - --mm_use_im_start_end
+                    - "False"
+                    - --mm_use_im_patch_token
+                    - "False"
+                    - --bf16
+                    - "True"
+                    - --output_dir
+                    - ./checkpoints/qwen-7b-cka-grad/llava-pretrain
+                    - --num_train_epochs
+                    - "1"
+                    - --per_device_train_batch_size
+                    - "16"
+                    - --per_device_eval_batch_size
+                    - "4"
+                    - --gradient_accumulation_steps
+                    - "8"
+                    - --evaluation_strategy
+                    - "no"
+                    - --save_strategy
+                    - steps
+                    - --save_steps
+                    - "24000"
+                    - --save_total_limit
+                    - "1"
+                    - --learning_rate
+                    - "1e-3"
+                    - --weight_decay
+                    - "0."
+                    - --warmup_ratio
+                    - "0.03"
+                    - --lr_scheduler_type
+                    - cosine
+                    - --logging_steps
+                    - "1"
+                    - --tf32
+                    - "True"
+                    - --model_max_length
+                    - "2048"
+                    - --gradient_checkpointing
+                    - "False"
+                    - --dataloader_num_workers
+                    - "16"
+                    - --lazy_preprocess
+                    - "True"
+                    - --report_to
+                    - wandb
+                    - --run_name
+                    - qwen-7b-cka-grad-pretrain
+                    - --cka_loss
+                    - "True"
+                    - --cka_loss_tau
+                    - "0.0"
+                    - --cka_loss_weight
+                    - "1.0"
+                    - --vsp_gradient_diagnostics
+                    - "True"
+                    - --vsp_asymmetric_pcgrad
+                    - "True"
+                    - --vsp_norm_cap
+                    - "True"
+                    - --vsp_pcgrad_threshold
+                    - "0.05"
+                    - --vsp_proj_max_grad_ratio
+                    - "0.5"
+                    - --vsp_llm_max_grad_ratio
+                    - "0.5"
+                    - --vsp_grad_log_interval
+                    - "10"
+                    - --cka_loss_layers
+                    - "-1"
+                codePath: llava/train/train_mem.py
+                codePathLocal: llava/train/train_mem.py
+                cpu_count: 144
+                cpu_count_logical: 288
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "46086829899776"
+                        used: "2968447442944"
+                email: pppppppp1202@gmail.com
+                executable: /home/jovyan/dowser-lora-datavol-1/phong/conda/envs/llava-qwen/bin/python3.10
+                git:
+                    commit: 0d7b4e664f3be6de466a3a80b08cba0909ecd675
+                    remote: https://github.com/phongtran263/LLaVA.git
+                gpu: NVIDIA B200
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 18944
+                      memoryTotal: "192265846784"
+                      name: NVIDIA B200
+                      uuid: GPU-95eb7884-63bd-ff68-da40-84df1737a4e5
+                    - architecture: Blackwell
+                      cudaCores: 18944
+                      memoryTotal: "192265846784"
+                      name: NVIDIA B200
+                      uuid: GPU-af277aeb-4439-72d8-b0aa-22b9d97a489b
+                    - architecture: Blackwell
+                      cudaCores: 18944
+                      memoryTotal: "192265846784"
+                      name: NVIDIA B200
+                      uuid: GPU-7cdac825-006e-5fa9-ff65-3820b156f8d2
+                    - architecture: Blackwell
+                      cudaCores: 18944
+                      memoryTotal: "192265846784"
+                      name: NVIDIA B200
+                      uuid: GPU-fe896a3f-0c2c-71e8-9c9d-a0bf6d82cf46
+                host: dowser-5-0
+                memory:
+                    total: "2434587181056"
+                os: Linux-6.8.0-87-generic-x86_64-with-glibc2.35
+                program: /home/jovyan/dowser-lora-datavol-1/phong/LLaVA/llava/train/train_mem.py
+                python: CPython 3.10.20
+                root: /home/jovyan/dowser-lora-datavol-1/phong/LLaVA
+                startedAt: "2026-07-20T06:38:28.801311Z"
+                writerId: 7ler1vgptc2si0mp9lj8omk84pkl2a4p
+        m:
+            - "1": train/global_step
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 98
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 98
+                - 105
+            "3":
+                - 7
+                - 13
+                - 19
+                - 62
+                - 66
+            "4": 3.10.20
+            "5": 0.25.1
+            "6": 4.43.1
+            "9":
+                "1": transformers_trainer
+            "10":
+                - 21
+            "12": 0.25.1
+            "13": linux-x86_64
+accelerator_config:
+    value:
+        dispatch_batches: null
+        even_batches: true
+        gradient_accumulation_kwargs: null
+        non_blocking: false
+        split_batches: false
+        use_seedable_sampler: true
+adafactor:
+    value: false
+adam_beta1:
+    value: 0.9
+adam_beta2:
+    value: 0.999
+adam_epsilon:
+    value: 1e-08
+add_cross_attention:
+    value: false
+architectures:
+    value:
+        - Qwen2ForCausalLM
+attention_dropout:
+    value: 0
+auto_find_batch_size:
+    value: false
+bad_words_ids:
+    value: null
+batch_eval_metrics:
+    value: false
+begin_suppress_tokens:
+    value: null
+bf16:
+    value: true
+bf16_full_eval:
+    value: false
+bits:
+    value: 16
+bos_token_id:
+    value: 151643
+cache_dir:
+    value: null
+chunk_size_feed_forward:
+    value: 0
+cka_loss:
+    value: true
+cka_loss_final_hidden_weight:
+    value: 1
+cka_loss_layer_decay:
+    value: 1
+cka_loss_layers:
+    value:
+        - -1
+cka_loss_projector_weight:
+    value: 1
+cka_loss_subset_fallback_mass:
+    value: 0.9
+cka_loss_subset_max_ratio:
+    value: 0.9
+cka_loss_subset_min_ratio:
+    value: 0.1
+cka_loss_subset_otsu_min_separability:
+    value: 0.3
+cka_loss_subset_query_tokens:
+    value: text
+cka_loss_subset_ratio:
+    value: 0.5
+cka_loss_subset_select_layer:
+    value: null
+cka_loss_tau:
+    value: 0
+cka_loss_weight:
+    value: 1
+cross_attention_hidden_size:
+    value: null
+data_seed:
+    value: null
+dataloader_drop_last:
+    value: false
+dataloader_num_workers:
+    value: 16
+dataloader_persistent_workers:
+    value: false
+dataloader_pin_memory:
+    value: true
+dataloader_prefetch_factor:
+    value: null
+ddp_backend:
+    value: null
+ddp_broadcast_buffers:
+    value: null
+ddp_bucket_cap_mb:
+    value: null
+ddp_find_unused_parameters:
+    value: null
+ddp_timeout:
+    value: 1800
+debug:
+    value: []
+debug_compare_batch_size:
+    value: 1
+debug_compare_batch_start:
+    value: 0
+debug_compare_cka:
+    value: false
+debug_compare_grad_param:
+    value: null
+debug_compare_seed:
+    value: 1234
+decoder_start_token_id:
+    value: null
+deepspeed:
+    value: ./scripts/zero2.json
+disable_tqdm:
+    value: false
+dispatch_batches:
+    value: null
+diversity_penalty:
+    value: 0
+do_eval:
+    value: false
+do_predict:
+    value: false
+do_sample:
+    value: false
+do_train:
+    value: false
+double_quant:
+    value: true
+early_stopping:
+    value: false
+encoder_no_repeat_ngram_size:
+    value: 0
+eos_token_id:
+    value: 151645
+eval_accumulation_steps:
+    value: null
+eval_delay:
+    value: 0
+eval_do_concat_batches:
+    value: true
+eval_on_start:
+    value: false
+eval_steps:
+    value: null
+eval_strategy:
+    value: "no"
+eval_use_gather_object:
+    value: false
+evaluation_strategy:
+    value: "no"
+exponential_decay_length_penalty:
+    value: null
+finetuning_task:
+    value: null
+forced_bos_token_id:
+    value: null
+forced_eos_token_id:
+    value: null
+fp16:
+    value: false
+fp16_backend:
+    value: auto
+fp16_full_eval:
+    value: false
+fp16_opt_level:
+    value: O1
+freeze_mm_mlp_adapter:
+    value: false
+fsdp:
+    value: []
+fsdp_config:
+    value:
+        min_num_params: 0
+        xla: false
+        xla_fsdp_grad_ckpt: false
+        xla_fsdp_v2: false
+fsdp_min_num_params:
+    value: 0
+fsdp_transformer_layer_cls_to_wrap:
+    value: null
+full_determinism:
+    value: false
+gradient_accumulation_steps:
+    value: 8
+gradient_checkpointing:
+    value: false
+gradient_checkpointing_kwargs:
+    value: null
+gradient_log_steps:
+    value: 50
+greater_is_better:
+    value: null
+group_by_length:
+    value: false
+group_by_modality_length:
+    value: false
+guided_text_select_layer:
+    value: null
+half_precision_backend:
+    value: auto
+hidden_act:
+    value: silu
+hidden_size:
+    value: 3584
+hub_always_push:
+    value: false
+hub_model_id:
+    value: null
+hub_private_repo:
+    value: false
+hub_strategy:
+    value: every_save
+hub_token:
+    value: <HUB_TOKEN>
+id2label:
+    value:
+        "0": LABEL_0
+        "1": LABEL_1
+ignore_data_skip:
+    value: false
+image_aspect_ratio:
+    value: square
+include_inputs_for_metrics:
+    value: false
+include_num_input_tokens_seen:
+    value: false
+include_tokens_per_second:
+    value: false
+initializer_range:
+    value: 0.02
+intermediate_size:
+    value: 18944
+is_decoder:
+    value: false
+is_encoder_decoder:
+    value: false
+jit_mode_eval:
+    value: false
+label_names:
+    value: null
+label_smoothing_factor:
+    value: 0
+label2id:
+    value:
+        LABEL_0: 0
+        LABEL_1: 1
+learning_rate:
+    value: 0.001
+length_column_name:
+    value: length
+length_penalty:
+    value: 1
+load_best_model_at_end:
+    value: false
+local_rank:
+    value: 0
+log_gradient_norms:
+    value: false
+log_level:
+    value: passive
+log_level_replica:
+    value: warning
+log_on_each_node:
+    value: true
+logging_dir:
+    value: ./checkpoints/qwen-7b-cka-grad/llava-pretrain/runs/Jul20_06-37-00_dowser-5-0
+logging_first_step:
+    value: false
+logging_nan_inf_filter:
+    value: true
+logging_steps:
+    value: 1
+logging_strategy:
+    value: steps
+lora_alpha:
+    value: 16
+lora_bias:
+    value: none
+lora_dropout:
+    value: 0.05
+lora_enable:
+    value: false
+lora_r:
+    value: 64
+lora_weight_path:
+    value: ""
+lr_scheduler_type:
+    value: cosine
+max_grad_norm:
+    value: 1
+max_length:
+    value: 20
+max_position_embeddings:
+    value: 32768
+max_steps:
+    value: -1
+max_window_layers:
+    value: 28
+metric_for_best_model:
+    value: null
+min_length:
+    value: 0
+mm_hidden_size:
+    value: 1024
+mm_patch_merge_type:
+    value: flat
+mm_projector_lr:
+    value: null
+mm_projector_type:
+    value: mlp2x_gelu
+mm_use_im_patch_token:
+    value: false
+mm_use_im_start_end:
+    value: false
+mm_vision_select_feature:
+    value: patch
+mm_vision_select_layer:
+    value: -2
+mm_vision_tower:
+    value: openai/clip-vit-large-patch14-336
+model/num_parameters:
+    value: 7935646208
+model_max_length:
+    value: 2048
+model_type:
+    value: llava_qwen
+mp_parameters:
+    value: ""
+mpt_attn_impl:
+    value: triton
+neftune_noise_alpha:
+    value: null
+no_cuda:
+    value: false
+no_repeat_ngram_size:
+    value: 0
+num_attention_heads:
+    value: 28
+num_beam_groups:
+    value: 1
+num_beams:
+    value: 1
+num_hidden_layers:
+    value: 28
+num_key_value_heads:
+    value: 4
+num_return_sequences:
+    value: 1
+num_train_epochs:
+    value: 1
+optim:
+    value: adamw_torch
+optim_args:
+    value: null
+optim_target_modules:
+    value: null
+output_attentions:
+    value: false
+output_dir:
+    value: ./checkpoints/qwen-7b-cka-grad/llava-pretrain
+output_hidden_states:
+    value: false
+output_scores:
+    value: false
+overwrite_output_dir:
+    value: false
+pad_token_id:
+    value: 151643
+past_index:
+    value: -1
+per_device_eval_batch_size:
+    value: 4
+per_device_train_batch_size:
+    value: 16
+per_gpu_eval_batch_size:
+    value: null
+per_gpu_train_batch_size:
+    value: null
+prediction_loss_only:
+    value: false
+prefix:
+    value: null
+problem_type:
+    value: null
+push_to_hub:
+    value: false
+push_to_hub_model_id:
+    value: null
+push_to_hub_organization:
+    value: null
+push_to_hub_token:
+    value: <PUSH_TO_HUB_TOKEN>
+quant_type:
+    value: nf4
+ray_scope:
+    value: last
+remove_invalid_values:
+    value: false
+remove_unused_columns:
+    value: false
+repetition_penalty:
+    value: 1
+report_to:
+    value:
+        - wandb
+restore_callback_states_from_checkpoint:
+    value: false
+resume_from_checkpoint:
+    value: null
+return_dict:
+    value: true
+return_dict_in_generate:
+    value: false
+rms_norm_eps:
+    value: 1e-06
+rope_theta:
+    value: 1e+06
+run_name:
+    value: qwen-7b-cka-grad-pretrain
+save_on_each_node:
+    value: false
+save_only_model:
+    value: false
+save_safetensors:
+    value: true
+save_steps:
+    value: 24000
+save_strategy:
+    value: steps
+save_total_limit:
+    value: 1
+seed:
+    value: 42
+sep_token_id:
+    value: null
+skip_memory_metrics:
+    value: true
+sliding_window:
+    value: null
+split_batches:
+    value: null
+suppress_tokens:
+    value: null
+task_specific_params:
+    value: null
+temperature:
+    value: 1
+tf_legacy_loss:
+    value: false
+tf32:
+    value: true
+tie_encoder_decoder:
+    value: false
+tie_word_embeddings:
+    value: false
+tokenizer_class:
+    value: null
+tokenizer_model_max_length:
+    value: 2048
+tokenizer_padding_side:
+    value: right
+top_k:
+    value: 50
+top_p:
+    value: 1
+torch_compile:
+    value: false
+torch_compile_backend:
+    value: null
+torch_compile_mode:
+    value: null
+torch_dtype:
+    value: bfloat16
+torch_empty_cache_steps:
+    value: null
+torchdynamo:
+    value: null
+torchscript:
+    value: false
+tpu_metrics_debug:
+    value: false
+tpu_num_cores:
+    value: null
+transformers_version:
+    value: 4.43.1
+tune_mm_mlp_adapter:
+    value: true
+typical_p:
+    value: 1
+use_bfloat16:
+    value: false
+use_cache:
+    value: false
+use_cpu:
+    value: false
+use_ipex:
+    value: false
+use_legacy_prediction_loop:
+    value: false
+use_mm_proj:
+    value: true
+use_mps_device:
+    value: false
+use_pcgrad:
+    value: false
+use_sliding_window:
+    value: false
+vocab_size:
+    value: 152064
+vsp_asymmetric_pcgrad:
+    value: true
+vsp_grad_ema_beta:
+    value: 0.95
+vsp_grad_eps:
+    value: 1e-12
+vsp_grad_log_interval:
+    value: 10
+vsp_gradient_diagnostics:
+    value: true
+vsp_llm_max_grad_ratio:
+    value: 0.5
+vsp_norm_cap:
+    value: true
+vsp_pcgrad_threshold:
+    value: 0.05
+vsp_proj_max_grad_ratio:
+    value: 0.5
+warmup_ratio:
+    value: 0.03
+warmup_steps:
+    value: 0
+weight_decay:
+    value: 0
