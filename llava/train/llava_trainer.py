@@ -1,3 +1,4 @@
+import math
 import os
 import torch
 import torch.nn as nn
@@ -13,7 +14,277 @@ from transformers.trainer import (
     logger,
 )
 from transformers.modeling_utils import unwrap_model
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from llava.train.vsp_gradient_controller import (
+    VSPGradientController,
+    combine_partitioned_vsp_gradients,
+    is_projector_parameter,
+    validate_vsp_gradient_config,
+    vsp_controller_requested,
+    vsp_rewrites_gradients,
+)
+
+
+PCGRAD_EPS = 1e-12
+PCGRAD_STAT_CHUNK_SIZE = 1_048_576
+
+
+def _empty_pcgrad_stats(reference_tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    zero = torch.zeros((), device=reference_tensor.device, dtype=torch.float32)
+    return {
+        "dot_product": zero,
+        "main_grad_norm": zero,
+        "auxiliary_grad_norm": zero,
+        "cosine_similarity": zero,
+        "conflict": zero,
+        "projection_magnitude": zero,
+    }
+
+
+def _pcgrad_coefficient_and_stats(
+    dot_product: torch.Tensor,
+    main_norm_sq: torch.Tensor,
+    auxiliary_norm_sq: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    usable_main_gradient = main_norm_sq > float(eps)
+    finite_statistics = (
+        torch.isfinite(dot_product)
+        & torch.isfinite(main_norm_sq)
+        & torch.isfinite(auxiliary_norm_sq)
+    )
+    conflict = (dot_product < 0.0) & usable_main_gradient & finite_statistics
+    safe_main_norm_sq = torch.where(
+        usable_main_gradient,
+        main_norm_sq,
+        torch.ones_like(main_norm_sq),
+    )
+    coefficient = torch.where(
+        conflict,
+        dot_product / safe_main_norm_sq,
+        torch.zeros_like(dot_product),
+    )
+
+    norm_product = (main_norm_sq * auxiliary_norm_sq).clamp_min(0.0).sqrt()
+    cosine_similarity = torch.where(
+        norm_product > float(eps),
+        dot_product / norm_product,
+        torch.zeros_like(dot_product),
+    )
+    stats = {
+        "dot_product": dot_product.detach(),
+        "main_grad_norm": main_norm_sq.clamp_min(0.0).sqrt().detach(),
+        "auxiliary_grad_norm": auxiliary_norm_sq.clamp_min(0.0).sqrt().detach(),
+        "cosine_similarity": cosine_similarity.detach(),
+        "conflict": conflict.float().detach(),
+        "projection_magnitude": (-coefficient).clamp_min(0.0).detach(),
+    }
+    return coefficient.detach(), stats
+
+
+def _dense_float_gradient(gradient: torch.Tensor) -> torch.Tensor:
+    gradient = gradient.detach()
+    if gradient.is_sparse:
+        gradient = gradient.coalesce().to_dense()
+    return gradient.float()
+
+
+def compute_pcgrad_projection_coefficient(
+    main_gradients: Sequence[Optional[torch.Tensor]],
+    auxiliary_gradients: Sequence[Optional[torch.Tensor]],
+    reference_tensor: torch.Tensor,
+    eps: float = PCGRAD_EPS,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Return the coefficient for projecting only the conflicting auxiliary part."""
+    if len(main_gradients) != len(auxiliary_gradients):
+        raise ValueError("PCGrad main and auxiliary gradient lists must have the same length.")
+    if not math.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError(f"PCGrad eps must be finite and positive, got {eps}.")
+
+    dot_product = torch.zeros((), device=reference_tensor.device, dtype=torch.float32)
+    main_norm_sq = torch.zeros_like(dot_product)
+    auxiliary_norm_sq = torch.zeros_like(dot_product)
+
+    with torch.no_grad():
+        for main_gradient, auxiliary_gradient in zip(main_gradients, auxiliary_gradients):
+            main_float = None
+            if main_gradient is not None:
+                main_float = _dense_float_gradient(main_gradient)
+                main_norm_sq.add_(main_float.square().sum())
+            if auxiliary_gradient is not None:
+                auxiliary_float = _dense_float_gradient(auxiliary_gradient)
+                auxiliary_norm_sq.add_(auxiliary_float.square().sum())
+                if main_float is not None:
+                    dot_product.add_((main_float * auxiliary_float).sum())
+
+        return _pcgrad_coefficient_and_stats(
+            dot_product,
+            main_norm_sq,
+            auxiliary_norm_sq,
+            eps,
+        )
+
+
+def build_pcgrad_surrogate_loss(
+    main_loss: torch.Tensor,
+    auxiliary_loss: torch.Tensor,
+    parameters: Iterable[torch.nn.Parameter],
+    eps: float = PCGRAD_EPS,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Build a scalar whose gradient is main + projected auxiliary gradient.
+
+    This fallback is used by unsharded backends. The scalar is only a backward
+    surrogate; callers must continue reporting ``main_loss + auxiliary_loss``.
+    """
+    parameters = tuple(parameter for parameter in parameters if parameter.requires_grad)
+    if not parameters or not auxiliary_loss.requires_grad:
+        return main_loss + auxiliary_loss, _empty_pcgrad_stats(main_loss)
+
+    try:
+        main_gradients = torch.autograd.grad(
+            main_loss,
+            parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        if not any(gradient is not None for gradient in main_gradients):
+            raise RuntimeError(
+                "PCGrad could not observe any main-loss gradients. Reentrant gradient "
+                "checkpointing is a common cause; use use_reentrant=False."
+            )
+        auxiliary_gradients = torch.autograd.grad(
+            auxiliary_loss,
+            parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "PCGrad gradient probing failed. Use non-reentrant gradient checkpointing "
+            "(gradient_checkpointing_kwargs={'use_reentrant': False})."
+        ) from exc
+
+    coefficient, stats = compute_pcgrad_projection_coefficient(
+        main_gradients,
+        auxiliary_gradients,
+        reference_tensor=main_loss,
+        eps=eps,
+    )
+    del main_gradients, auxiliary_gradients
+
+    coefficient = coefficient.to(device=main_loss.device, dtype=main_loss.dtype)
+    return (1.0 - coefficient) * main_loss + auxiliary_loss, stats
+
+
+def project_pcgrad_gradient_parts(
+    main_parts: Dict[int, List[torch.Tensor]],
+    auxiliary_parts: Dict[int, List[torch.Tensor]],
+    reference_tensor: torch.Tensor,
+    process_group=None,
+    eps: float = PCGRAD_EPS,
+    chunk_size: int = PCGRAD_STAT_CHUNK_SIZE,
+) -> Tuple[Dict[int, List[torch.Tensor]], Dict[str, torch.Tensor]]:
+    """Project accumulated ZeRO-2 gradient shards and return the final shards."""
+    if not math.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError(f"PCGrad eps must be finite and positive, got {eps}.")
+    if int(chunk_size) <= 0:
+        raise ValueError(f"PCGrad chunk_size must be positive, got {chunk_size}.")
+
+    group_keys = sorted(set(main_parts) | set(auxiliary_parts))
+    statistics = torch.zeros(3, device=reference_tensor.device, dtype=torch.float64)
+
+    with torch.no_grad():
+        for group_key in group_keys:
+            group_main = main_parts.get(group_key)
+            group_auxiliary = auxiliary_parts.get(group_key)
+            if group_main is not None and not isinstance(group_main, (list, tuple)):
+                raise TypeError(f"PCGrad main gradient group {group_key} must be a list or tuple.")
+            if group_auxiliary is not None and not isinstance(group_auxiliary, (list, tuple)):
+                raise TypeError(f"PCGrad auxiliary gradient group {group_key} must be a list or tuple.")
+            if group_main is not None and group_auxiliary is not None and len(group_main) != len(group_auxiliary):
+                raise ValueError(f"PCGrad gradient group {group_key} has mismatched shard counts.")
+
+            shard_count = len(group_main) if group_main is not None else len(group_auxiliary or [])
+            for shard_index in range(shard_count):
+                main_gradient = group_main[shard_index] if group_main is not None else None
+                auxiliary_gradient = group_auxiliary[shard_index] if group_auxiliary is not None else None
+                if main_gradient is not None and auxiliary_gradient is not None:
+                    if main_gradient.shape != auxiliary_gradient.shape:
+                        raise ValueError(
+                            f"PCGrad gradient group {group_key} shard {shard_index} has "
+                            "mismatched shapes."
+                        )
+                if main_gradient is None and auxiliary_gradient is None:
+                    continue
+
+                main_flat = main_gradient.detach().reshape(-1) if main_gradient is not None else None
+                auxiliary_flat = (
+                    auxiliary_gradient.detach().reshape(-1)
+                    if auxiliary_gradient is not None
+                    else None
+                )
+                numel = main_flat.numel() if main_flat is not None else auxiliary_flat.numel()
+                for start in range(0, numel, int(chunk_size)):
+                    stop = min(start + int(chunk_size), numel)
+                    main_chunk = main_flat[start:stop].float() if main_flat is not None else None
+                    auxiliary_chunk = (
+                        auxiliary_flat[start:stop].float()
+                        if auxiliary_flat is not None
+                        else None
+                    )
+                    if main_chunk is not None:
+                        statistics[1].add_(torch.dot(main_chunk, main_chunk).double())
+                    if auxiliary_chunk is not None:
+                        statistics[2].add_(torch.dot(auxiliary_chunk, auxiliary_chunk).double())
+                        if main_chunk is not None:
+                            statistics[0].add_(torch.dot(main_chunk, auxiliary_chunk).double())
+
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+        ):
+            torch.distributed.all_reduce(
+                statistics,
+                op=torch.distributed.ReduceOp.SUM,
+                group=process_group,
+            )
+
+        coefficient, stats = _pcgrad_coefficient_and_stats(
+            statistics[0],
+            statistics[1],
+            statistics[2],
+            eps,
+        )
+        main_scale = float((1.0 - coefficient).item())
+
+        final_parts = {}
+        for group_key in group_keys:
+            group_main = main_parts.get(group_key)
+            group_auxiliary = auxiliary_parts.get(group_key)
+            if group_main is None:
+                final_parts[group_key] = list(group_auxiliary)
+                continue
+            if group_auxiliary is None:
+                final_parts[group_key] = list(group_main)
+                continue
+
+            final_group = []
+            for main_gradient, auxiliary_gradient in zip(group_main, group_auxiliary):
+                if auxiliary_gradient is None:
+                    final_group.append(main_gradient)
+                    continue
+                if main_gradient is None:
+                    final_group.append(auxiliary_gradient)
+                    continue
+                auxiliary_gradient.add_(main_gradient, alpha=main_scale)
+                final_group.append(auxiliary_gradient)
+            final_parts[group_key] = final_group
+
+    return final_parts, stats
 
 
 def sanitize_generation_config_for_save(model):
@@ -293,10 +564,15 @@ class LLaVATrainer(Trainer):
                     queue.append(child)
 
     def _clear_gradient_log_tensors(self, model):
-        if not getattr(self.args, 'log_gradient_norms', False):
+        if not (
+            getattr(self.args, 'log_gradient_norms', False)
+            or getattr(self.model.config, 'cka_loss', False)
+            or self._vsp_controller_requested()
+        ):
             return
         self._set_model_attr(model, 'last_cka_final_hidden', None)
         self._set_model_attr(model, 'last_cka_projector_output', None)
+        self._set_model_attr(model, '_aux_losses', [])
 
     def _gradient_norm(self, loss, tensors, loss_name, target_name):
         if loss is None or not torch.is_tensor(loss) or not loss.requires_grad:
@@ -350,6 +626,595 @@ class LLaVATrainer(Trainer):
         for loss in losses[1:]:
             total = total + loss
         return total
+
+    def _drop_zero_weighted_cka_losses(self, projector_cka_loss, aux_losses):
+        config = self.model.config
+        if abs(float(getattr(config, 'cka_loss_projector_weight', 1.0) or 0.0)) <= 0.0:
+            projector_cka_loss = None
+        if abs(float(getattr(config, 'cka_loss_final_hidden_weight', 1.0) or 0.0)) <= 0.0:
+            aux_losses = []
+        return projector_cka_loss, aux_losses
+
+    def _get_cka_auxiliary_loss(self, text_loss, projector_cka_loss=None, aux_losses=None):
+        cka_terms = []
+        if projector_cka_loss is not None:
+            cka_terms.append(projector_cka_loss)
+        cka_terms.extend(aux_losses or [])
+        if not cka_terms:
+            return text_loss.new_zeros(())
+        return self._sum_losses(cka_terms)
+
+    def _get_deepspeed_engine(self, model):
+        for candidate in (model, getattr(self, 'deepspeed', None)):
+            if (
+                candidate is not None
+                and callable(getattr(candidate, 'backward', None))
+                and callable(getattr(candidate, 'step', None))
+                and callable(getattr(candidate, 'zero_optimization_stage', None))
+            ):
+                return candidate
+        return None
+
+    def _get_deepspeed_zero_stage(self, model):
+        engine = self._get_deepspeed_engine(model)
+        if engine is not None:
+            try:
+                return int(engine.zero_optimization_stage())
+            except (TypeError, ValueError):
+                pass
+
+        accelerator = getattr(self, 'accelerator', None)
+        state = getattr(accelerator, 'state', None)
+        plugin = getattr(state, 'deepspeed_plugin', None)
+        stage = getattr(plugin, 'zero_stage', None)
+        if stage is not None:
+            try:
+                return int(stage)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _validate_pcgrad_backend(self, model):
+        zero_stage = self._get_deepspeed_zero_stage(model)
+        if zero_stage is not None and zero_stage >= 3:
+            raise RuntimeError(
+                "CKA PCGrad currently supports DeepSpeed ZeRO-2 or lower, but "
+                f"ZeRO-{zero_stage} is configured. Use scripts/zero2.json or disable PCGrad."
+            )
+        if getattr(self, 'is_fsdp_enabled', False):
+            raise RuntimeError(
+                "CKA PCGrad does not currently support FSDP parameter sharding. "
+                "Use DeepSpeed ZeRO-2 or disable PCGrad."
+            )
+        if zero_stage != 2:
+            world_size = int(getattr(self.args, 'world_size', 1) or 1)
+            distributed_is_initialized = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+            if world_size > 1 or distributed_is_initialized:
+                raise RuntimeError(
+                    "CKA PCGrad on non-ZeRO-2 distributed backends is not supported. "
+                    "Use DeepSpeed ZeRO-2 for exact global PCGrad, or run PCGrad on a "
+                    "single process."
+                )
+        return zero_stage
+
+    def _vsp_controller_requested(self):
+        return vsp_controller_requested(self.model.config)
+
+    def _vsp_rewrites_gradients(self):
+        return vsp_rewrites_gradients(self.model.config)
+
+    def _get_vsp_gradient_controller(self, model, process_group=None):
+        controller = getattr(self, '_vsp_gradient_controller', None)
+        if controller is None or controller.model is not unwrap_model(model):
+            controller = VSPGradientController(
+                unwrap_model(model),
+                self.model.config,
+                process_group=process_group,
+            )
+            self._vsp_gradient_controller = controller
+        else:
+            controller.config = self.model.config
+            controller.process_group = process_group
+            validate_vsp_gradient_config(controller.config)
+        return controller
+
+    def _should_log_vsp_gradient_stats(self):
+        interval = max(1, int(getattr(self.model.config, 'vsp_grad_log_interval', 10) or 10))
+        global_step = int(getattr(self.state, 'global_step', 0) or 0)
+        if global_step % interval != 0:
+            return False
+        if getattr(self, '_last_vsp_gradient_log_step', None) == global_step:
+            return False
+        self._last_vsp_gradient_log_step = global_step
+        return True
+
+    def _store_vsp_gradient_logs(self, logs):
+        if logs and self._should_log_vsp_gradient_stats():
+            self._last_vsp_gradient_logs = dict(logs)
+
+    def _validate_vsp_gradient_backend(self, model):
+        zero_stage = self._get_deepspeed_zero_stage(model)
+        if zero_stage is not None and zero_stage >= 3:
+            raise RuntimeError(
+                "VSP gradient diagnostics/controller supports DeepSpeed ZeRO-2 or lower, "
+                f"but ZeRO-{zero_stage} is configured. ZeRO-3 shards parameters in a way "
+                "that this controller does not gather."
+            )
+        if getattr(self, 'is_fsdp_enabled', False):
+            raise RuntimeError(
+                "VSP gradient diagnostics/controller does not support FSDP parameter sharding. "
+                "Use DeepSpeed ZeRO-2 or a single process."
+            )
+        if zero_stage != 2:
+            world_size = int(getattr(self.args, 'world_size', 1) or 1)
+            distributed_is_initialized = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+            if world_size > 1 or distributed_is_initialized:
+                raise RuntimeError(
+                    "VSP gradient statistics on non-ZeRO-2 distributed backends would use "
+                    "incomplete local gradients. Use DeepSpeed ZeRO-2 or a single process."
+                )
+            if self._vsp_rewrites_gradients():
+                gas = int(getattr(self.args, 'gradient_accumulation_steps', 1) or 1)
+                if gas != 1:
+                    raise RuntimeError(
+                        "VSP PCGrad/norm-cap on an unsharded backend currently requires "
+                        "gradient_accumulation_steps=1. Use DeepSpeed ZeRO-2 for exact "
+                        "accumulated-gradient surgery."
+                    )
+                if getattr(self.args, 'fp16', False):
+                    raise RuntimeError(
+                        "VSP PCGrad/norm-cap on an unsharded fp16 backend would bypass the "
+                        "AMP scaler. Use bf16/fp32, disable the controller, or use ZeRO-2."
+                    )
+                if getattr(self, 'use_apex', False):
+                    raise RuntimeError(
+                        "VSP PCGrad/norm-cap on Apex AMP is not supported. Use bf16/fp32 "
+                        "or DeepSpeed ZeRO-2."
+                    )
+            else:
+                gas = int(getattr(self.args, 'gradient_accumulation_steps', 1) or 1)
+                if gas != 1 and not getattr(self, '_vsp_diag_accum_warning_emitted', False):
+                    logger.warning(
+                        "VSP diagnostics on an unsharded backend with gradient accumulation "
+                        "reports per-microbatch gradient statistics; the original accumulated "
+                        "weighted-loss update is preserved."
+                    )
+                    self._vsp_diag_accum_warning_emitted = True
+        return zero_stage
+
+    def _get_zero2_vsp_group_names(self, zero_optimizer):
+        param_groups = getattr(zero_optimizer, 'param_groups', None)
+        if param_groups is None:
+            wrapped_optimizer = getattr(zero_optimizer, 'optimizer', None)
+            param_groups = getattr(wrapped_optimizer, 'param_groups', None)
+        if not isinstance(param_groups, (list, tuple)):
+            raise RuntimeError("Could not inspect DeepSpeed optimizer parameter groups for VSP control.")
+
+        try:
+            named_parameters = dict(unwrap_model(self.model).named_parameters())
+        except Exception:
+            named_parameters = dict(self.model.named_parameters())
+        name_by_param_id = {id(param): name for name, param in named_parameters.items()}
+
+        group_names = {}
+        for group_index, group in enumerate(param_groups):
+            configured_name = group.get('vsp_group') if isinstance(group, dict) else None
+            if configured_name in ('projector', 'llm'):
+                group_names[group_index] = configured_name
+                continue
+
+            has_projector = False
+            has_llm = False
+            for param in group.get('params', []):
+                param_name = name_by_param_id.get(id(param), '')
+                if is_projector_parameter(param_name):
+                    has_projector = True
+                else:
+                    has_llm = True
+            if has_projector and has_llm:
+                raise RuntimeError(
+                    "DeepSpeed optimizer group mixes projector and LLM parameters, so VSP "
+                    "group-wise ratios would be wrong. Let LLaVATrainer create the optimizer "
+                    "or split projector parameters into separate optimizer groups."
+                )
+            group_names[group_index] = 'projector' if has_projector else 'llm'
+
+        return group_names
+
+    def _validate_zero2_pcgrad_engine(self, engine):
+        zero_optimizer = getattr(engine, 'optimizer', None)
+        if zero_optimizer is None:
+            raise RuntimeError("DeepSpeed ZeRO-2 PCGrad could not access the engine optimizer.")
+        if not getattr(zero_optimizer, 'partition_gradients', False):
+            raise RuntimeError("DeepSpeed PCGrad expected a ZeRO-2 gradient-partition optimizer.")
+        if getattr(zero_optimizer, 'cpu_offload', False):
+            raise RuntimeError(
+                "DeepSpeed ZeRO-2 optimizer offload is not supported by CKA PCGrad. "
+                "Use the non-offloaded scripts/zero2.json configuration."
+            )
+        averaged_gradients = getattr(zero_optimizer, 'averaged_gradients', None)
+        if not isinstance(averaged_gradients, dict):
+            raise RuntimeError(
+                "This DeepSpeed version does not expose the ZeRO-2 averaged-gradient "
+                "dictionary required by CKA PCGrad."
+            )
+        all_grad_tensors = getattr(zero_optimizer, 'all_grad_tensors', None)
+        if all_grad_tensors is not None and not isinstance(all_grad_tensors, dict):
+            raise RuntimeError("Unsupported DeepSpeed ZeRO-2 all_grad_tensors layout.")
+        if (
+            getattr(engine, 'has_moe_layers', False)
+            or getattr(zero_optimizer, 'has_moe_layers', False)
+            or getattr(engine, 'pipeline_parallelism', False)
+        ):
+            raise RuntimeError(
+                "DeepSpeed MoE and pipeline parallelism are not supported by CKA PCGrad."
+            )
+        return zero_optimizer
+
+    @staticmethod
+    def _load_zero2_gradient_parts(live_parts, owned_parts):
+        """Transfer gradient-part ownership into a DeepSpeed-owned dict."""
+        if not isinstance(live_parts, dict) or not isinstance(owned_parts, dict):
+            raise TypeError("ZeRO-2 PCGrad gradient-part state must be dictionary-backed.")
+        if live_parts is owned_parts:
+            raise RuntimeError("ZeRO-2 PCGrad cannot load a gradient dictionary into itself.")
+        live_parts.clear()
+        live_parts.update(owned_parts)
+        owned_parts.clear()
+
+    @staticmethod
+    def _take_zero2_gradient_parts(live_parts):
+        """Transfer non-empty gradient parts out without replacing DeepSpeed's dict."""
+        if not isinstance(live_parts, dict):
+            raise TypeError("ZeRO-2 PCGrad gradient-part state must be dictionary-backed.")
+        owned_parts = {
+            group_id: group_parts
+            for group_id, group_parts in live_parts.items()
+            if group_parts is not None
+        }
+        live_parts.clear()
+        return owned_parts
+
+    def _project_zero2_pcgrad_parts(
+        self,
+        zero_optimizer,
+        main_parts,
+        auxiliary_parts,
+        reference_tensor,
+    ):
+        if not auxiliary_parts:
+            self._last_pcgrad_stats = _empty_pcgrad_stats(reference_tensor)
+            return main_parts
+
+        final_parts, stats = project_pcgrad_gradient_parts(
+            main_parts,
+            auxiliary_parts,
+            reference_tensor=reference_tensor,
+            process_group=getattr(zero_optimizer, 'dp_process_group', None),
+        )
+        self._last_pcgrad_stats = stats
+
+        # final_parts has its own lists and points at the now-projected auxiliary
+        # tensors, so the unneeded main partition can be released before step().
+        main_parts.clear()
+        auxiliary_parts.clear()
+        return final_parts
+
+    def _deepspeed_zero2_pcgrad_backward(
+        self,
+        model,
+        text_loss,
+        cka_auxiliary_loss,
+    ):
+        engine = self._get_deepspeed_engine(model)
+        if engine is None:
+            raise RuntimeError("DeepSpeed ZeRO-2 PCGrad could not locate the DeepSpeed engine.")
+        zero_optimizer = self._validate_zero2_pcgrad_engine(engine)
+
+        accelerator = getattr(self, 'accelerator', None)
+        if accelerator is None or not hasattr(accelerator, 'sync_gradients'):
+            raise RuntimeError("DeepSpeed ZeRO-2 PCGrad requires Accelerate accumulation state.")
+        sync_gradients = bool(accelerator.sync_gradients)
+        engine.set_gradient_accumulation_boundary(sync_gradients)
+
+        main_parts = getattr(self, '_pcgrad_zero2_main_parts', {})
+        auxiliary_parts = getattr(self, '_pcgrad_zero2_auxiliary_parts', {})
+        if not isinstance(main_parts, dict) or not isinstance(auxiliary_parts, dict):
+            raise RuntimeError("Corrupt ZeRO-2 PCGrad accumulation state.")
+
+        auxiliary_requires_grad = (
+            torch.is_tensor(cka_auxiliary_loss)
+            and bool(cka_auxiliary_loss.requires_grad)
+        )
+        uses_all_grad_layout = isinstance(
+            getattr(zero_optimizer, 'all_grad_tensors', None),
+            dict,
+        )
+
+        if uses_all_grad_layout:
+            # DeepSpeed 0.18.x: all_grad_tensors accumulates across non-boundary
+            # micro-batches; averaged_gradients is materialized only at boundary.
+            live_accumulated = zero_optimizer.all_grad_tensors
+            live_averaged = zero_optimizer.averaged_gradients
+
+            # If older micro-batches produced auxiliary gradients but this boundary
+            # batch has a disconnected/constant auxiliary, a zero backward is needed
+            # solely to materialize the stored auxiliary accumulator.
+            flush_stored_auxiliary = sync_gradients and bool(auxiliary_parts)
+            run_auxiliary_backward = auxiliary_requires_grad or flush_stored_auxiliary
+
+            self._load_zero2_gradient_parts(live_accumulated, main_parts)
+            live_averaged.clear()
+            engine.backward(text_loss, retain_graph=run_auxiliary_backward)
+            if sync_gradients:
+                main_parts = self._take_zero2_gradient_parts(live_averaged)
+                live_accumulated.clear()
+            else:
+                main_parts = self._take_zero2_gradient_parts(live_accumulated)
+                live_averaged.clear()
+
+            if run_auxiliary_backward:
+                self._load_zero2_gradient_parts(live_accumulated, auxiliary_parts)
+                live_averaged.clear()
+                auxiliary_backward_loss = (
+                    cka_auxiliary_loss
+                    if auxiliary_requires_grad
+                    else text_loss * 0.0
+                )
+                engine.backward(auxiliary_backward_loss)
+                if sync_gradients:
+                    auxiliary_parts = self._take_zero2_gradient_parts(live_averaged)
+                    live_accumulated.clear()
+                else:
+                    auxiliary_parts = self._take_zero2_gradient_parts(live_accumulated)
+                    live_averaged.clear()
+
+            if not sync_gradients:
+                self._pcgrad_zero2_main_parts = main_parts
+                self._pcgrad_zero2_auxiliary_parts = auxiliary_parts
+                return
+
+            final_parts = self._project_zero2_pcgrad_parts(
+                zero_optimizer,
+                main_parts,
+                auxiliary_parts,
+                text_loss,
+            )
+            live_averaged.clear()
+            self._load_zero2_gradient_parts(live_averaged, final_parts)
+            live_accumulated.clear()
+
+        else:
+            # DeepSpeed 0.15.x: averaged_gradients itself accumulates a reduced
+            # partition on every micro-batch.
+            live_averaged = zero_optimizer.averaged_gradients
+
+            self._load_zero2_gradient_parts(live_averaged, main_parts)
+            engine.backward(text_loss, retain_graph=auxiliary_requires_grad)
+            main_parts = self._take_zero2_gradient_parts(live_averaged)
+
+            if auxiliary_requires_grad:
+                self._load_zero2_gradient_parts(live_averaged, auxiliary_parts)
+                engine.backward(cka_auxiliary_loss)
+                auxiliary_parts = self._take_zero2_gradient_parts(live_averaged)
+
+            if not sync_gradients:
+                self._pcgrad_zero2_main_parts = main_parts
+                self._pcgrad_zero2_auxiliary_parts = auxiliary_parts
+                return
+
+            final_parts = self._project_zero2_pcgrad_parts(
+                zero_optimizer,
+                main_parts,
+                auxiliary_parts,
+                text_loss,
+            )
+            live_averaged.clear()
+            self._load_zero2_gradient_parts(live_averaged, final_parts)
+
+        # Accelerate's DeepSpeed optimizer/scheduler wrappers are no-ops. Calling
+        # the engine directly avoids a step between the two backward passes.
+        self._pcgrad_zero2_main_parts = {}
+        self._pcgrad_zero2_auxiliary_parts = {}
+        engine.step()
+
+        # Successful step leaves group -> None; fp16 overflow may replace the dict.
+        current_averaged = getattr(zero_optimizer, 'averaged_gradients', None)
+        if isinstance(current_averaged, dict):
+            current_averaged.clear()
+        current_all_grad = getattr(zero_optimizer, 'all_grad_tensors', None)
+        if isinstance(current_all_grad, dict):
+            current_all_grad.clear()
+
+    def _combine_zero2_vsp_parts(
+        self,
+        model,
+        zero_optimizer,
+        main_parts,
+        proj_parts,
+        final_parts,
+        reference_tensor,
+    ):
+        controller = self._get_vsp_gradient_controller(
+            model,
+            process_group=getattr(zero_optimizer, 'dp_process_group', None),
+        )
+        final_zero2_parts, logs = combine_partitioned_vsp_gradients(
+            controller,
+            main_parts,
+            proj_parts,
+            final_parts,
+            self._get_zero2_vsp_group_names(zero_optimizer),
+            reference_tensor=reference_tensor,
+        )
+        self._store_vsp_gradient_logs(logs)
+        main_parts.clear()
+        proj_parts.clear()
+        final_parts.clear()
+        return final_zero2_parts
+
+    def _deepspeed_zero2_vsp_backward(
+        self,
+        model,
+        text_loss,
+        projector_cka_loss,
+        final_hidden_cka_loss,
+    ):
+        engine = self._get_deepspeed_engine(model)
+        if engine is None:
+            raise RuntimeError("DeepSpeed ZeRO-2 VSP controller could not locate the DeepSpeed engine.")
+        zero_optimizer = self._validate_zero2_pcgrad_engine(engine)
+
+        accelerator = getattr(self, 'accelerator', None)
+        if accelerator is None or not hasattr(accelerator, 'sync_gradients'):
+            raise RuntimeError("DeepSpeed ZeRO-2 VSP controller requires Accelerate accumulation state.")
+        sync_gradients = bool(accelerator.sync_gradients)
+        engine.set_gradient_accumulation_boundary(sync_gradients)
+
+        main_parts = getattr(self, '_vsp_zero2_main_parts', {})
+        proj_parts = getattr(self, '_vsp_zero2_proj_parts', {})
+        final_parts = getattr(self, '_vsp_zero2_final_parts', {})
+        if not all(isinstance(parts, dict) for parts in (main_parts, proj_parts, final_parts)):
+            raise RuntimeError("Corrupt ZeRO-2 VSP accumulation state.")
+
+        proj_requires_grad = torch.is_tensor(projector_cka_loss) and bool(projector_cka_loss.requires_grad)
+        final_requires_grad = torch.is_tensor(final_hidden_cka_loss) and bool(final_hidden_cka_loss.requires_grad)
+        uses_all_grad_layout = isinstance(getattr(zero_optimizer, 'all_grad_tensors', None), dict)
+
+        if uses_all_grad_layout:
+            live_accumulated = zero_optimizer.all_grad_tensors
+            live_averaged = zero_optimizer.averaged_gradients
+
+            flush_stored_proj = sync_gradients and bool(proj_parts)
+            flush_stored_final = sync_gradients and bool(final_parts)
+            run_proj_backward = proj_requires_grad or flush_stored_proj
+            run_final_backward = final_requires_grad or flush_stored_final
+            retain_for_auxiliary = run_proj_backward or run_final_backward
+
+            self._load_zero2_gradient_parts(live_accumulated, main_parts)
+            live_averaged.clear()
+            engine.backward(text_loss, retain_graph=retain_for_auxiliary)
+            if sync_gradients:
+                main_parts = self._take_zero2_gradient_parts(live_averaged)
+                live_accumulated.clear()
+            else:
+                main_parts = self._take_zero2_gradient_parts(live_accumulated)
+                live_averaged.clear()
+
+            if run_proj_backward:
+                self._load_zero2_gradient_parts(live_accumulated, proj_parts)
+                live_averaged.clear()
+                proj_backward_loss = projector_cka_loss if proj_requires_grad else text_loss * 0.0
+                engine.backward(proj_backward_loss, retain_graph=run_final_backward)
+                if sync_gradients:
+                    proj_parts = self._take_zero2_gradient_parts(live_averaged)
+                    live_accumulated.clear()
+                else:
+                    proj_parts = self._take_zero2_gradient_parts(live_accumulated)
+                    live_averaged.clear()
+
+            if run_final_backward:
+                self._load_zero2_gradient_parts(live_accumulated, final_parts)
+                live_averaged.clear()
+                final_backward_loss = final_hidden_cka_loss if final_requires_grad else text_loss * 0.0
+                engine.backward(final_backward_loss)
+                if sync_gradients:
+                    final_parts = self._take_zero2_gradient_parts(live_averaged)
+                    live_accumulated.clear()
+                else:
+                    final_parts = self._take_zero2_gradient_parts(live_accumulated)
+                    live_averaged.clear()
+
+            if not sync_gradients:
+                self._vsp_zero2_main_parts = main_parts
+                self._vsp_zero2_proj_parts = proj_parts
+                self._vsp_zero2_final_parts = final_parts
+                return
+
+            final_zero2_parts = self._combine_zero2_vsp_parts(
+                model,
+                zero_optimizer,
+                main_parts,
+                proj_parts,
+                final_parts,
+                text_loss,
+            )
+            live_averaged.clear()
+            self._load_zero2_gradient_parts(live_averaged, final_zero2_parts)
+            live_accumulated.clear()
+
+        else:
+            live_averaged = zero_optimizer.averaged_gradients
+
+            self._load_zero2_gradient_parts(live_averaged, main_parts)
+            engine.backward(text_loss, retain_graph=proj_requires_grad or final_requires_grad)
+            main_parts = self._take_zero2_gradient_parts(live_averaged)
+
+            if proj_requires_grad:
+                self._load_zero2_gradient_parts(live_averaged, proj_parts)
+                engine.backward(projector_cka_loss, retain_graph=final_requires_grad)
+                proj_parts = self._take_zero2_gradient_parts(live_averaged)
+
+            if final_requires_grad:
+                self._load_zero2_gradient_parts(live_averaged, final_parts)
+                engine.backward(final_hidden_cka_loss)
+                final_parts = self._take_zero2_gradient_parts(live_averaged)
+
+            if not sync_gradients:
+                self._vsp_zero2_main_parts = main_parts
+                self._vsp_zero2_proj_parts = proj_parts
+                self._vsp_zero2_final_parts = final_parts
+                return
+
+            final_zero2_parts = self._combine_zero2_vsp_parts(
+                model,
+                zero_optimizer,
+                main_parts,
+                proj_parts,
+                final_parts,
+                text_loss,
+            )
+            live_averaged.clear()
+            self._load_zero2_gradient_parts(live_averaged, final_zero2_parts)
+
+        # Accelerate's DeepSpeed optimizer/scheduler wrappers are no-ops; the
+        # direct engine step keeps the three backward passes in one optimizer update.
+        self._vsp_zero2_main_parts = {}
+        self._vsp_zero2_proj_parts = {}
+        self._vsp_zero2_final_parts = {}
+        engine.step()
+
+        current_averaged = getattr(zero_optimizer, 'averaged_gradients', None)
+        if isinstance(current_averaged, dict):
+            current_averaged.clear()
+        current_all_grad = getattr(zero_optimizer, 'all_grad_tensors', None)
+        if isinstance(current_all_grad, dict):
+            current_all_grad.clear()
+
+    def _build_pcgrad_backward_loss(self, model, text_loss, cka_auxiliary_loss):
+        if not getattr(self, '_pcgrad_memory_warning_emitted', False):
+            logger.warning(
+                "CKA PCGrad on an unsharded backend performs two retained full-parameter "
+                "gradient probes per micro-batch; full-model fine-tuning can use "
+                "substantially more memory."
+            )
+            self._pcgrad_memory_warning_emitted = True
+
+        backward_loss, stats = build_pcgrad_surrogate_loss(
+            text_loss,
+            cka_auxiliary_loss,
+            model.parameters(),
+        )
+        self._last_pcgrad_stats = stats
+        return backward_loss
 
     def _collect_gradient_norm_logs(self, model, text_loss, projector_cka_loss=None, aux_losses=None):
         if not self._should_log_gradient_norms():
@@ -428,6 +1293,7 @@ class LLaVATrainer(Trainer):
                 aux_losses = None
             else:
                 text_loss, projector_cka_loss, aux_losses = self.compute_loss(model, inputs)
+                projector_cka_loss, aux_losses = self._drop_zero_weighted_cka_losses(projector_cka_loss, aux_losses)
 
         if self.args.n_gpu > 1:
             text_loss = text_loss.mean()
@@ -439,21 +1305,58 @@ class LLaVATrainer(Trainer):
         self._collect_gradient_norm_logs(model, text_loss, projector_cka_loss, aux_losses)
 
         loss = text_loss
+        backward_loss = text_loss
+        use_vsp_controller = False
+        zero_stage = None
+        final_hidden_cka_loss = None
         if self.model.config.cka_loss:
-            if projector_cka_loss is not None:
-                loss = loss + projector_cka_loss
-            # Auxiliary CKA currently contains the final LLM hidden vs pre-projector term.
-            loss = loss + sum(aux_losses)
+            # The model has already applied the projector/final CKA weights.
+            final_hidden_cka_loss = self._sum_losses(aux_losses or [])
+            cka_auxiliary_loss = self._get_cka_auxiliary_loss(
+                text_loss,
+                projector_cka_loss,
+                aux_losses,
+            )
+            loss = text_loss + cka_auxiliary_loss
+            backward_loss = loss
+            use_vsp_controller = self._vsp_controller_requested()
+            if use_vsp_controller:
+                zero_stage = self._validate_vsp_gradient_backend(model)
 
         try:
-            if self.use_apex:
-                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
+            if use_vsp_controller and zero_stage == 2:
+                self._deepspeed_zero2_vsp_backward(
+                    model,
+                    text_loss,
+                    projector_cka_loss,
+                    final_hidden_cka_loss,
+                )
+            elif use_vsp_controller and self._vsp_rewrites_gradients():
+                controller = self._get_vsp_gradient_controller(model)
+                vsp_logs = controller.compute_and_assign_gradients(
+                    text_loss,
+                    projector_cka_loss,
+                    final_hidden_cka_loss,
+                )
+                self._store_vsp_gradient_logs(vsp_logs)
             else:
-                self.accelerator.backward(loss)
+                if use_vsp_controller:
+                    controller = self._get_vsp_gradient_controller(model)
+                    vsp_logs = controller.compute_diagnostics(
+                        text_loss,
+                        projector_cka_loss,
+                        final_hidden_cka_loss,
+                    )
+                    self._store_vsp_gradient_logs(vsp_logs)
+                if self.use_apex:
+                    with amp.scale_loss(backward_loss, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    self.accelerator.backward(backward_loss)
         finally:
             self._clear_gradient_log_tensors(model)
 
+        # Report the real objective, never the gradient-controller internals.
         return loss.detach() / self.args.gradient_accumulation_steps
 
     def _collect_router_stats(self):
@@ -514,6 +1417,19 @@ class LLaVATrainer(Trainer):
             logs.update(gradient_norm_logs)
             self._last_gradient_norm_logs = None
 
+        pcgrad_stats = getattr(self, '_last_pcgrad_stats', None)
+        if pcgrad_stats:
+            for stat_name, stat_value in pcgrad_stats.items():
+                logs[f'pcgrad/{stat_name}'] = (
+                    stat_value.item() if torch.is_tensor(stat_value) else float(stat_value)
+                )
+            self._last_pcgrad_stats = None
+
+        vsp_gradient_logs = getattr(self, '_last_vsp_gradient_logs', None)
+        if vsp_gradient_logs:
+            logs.update(vsp_gradient_logs)
+            self._last_vsp_gradient_logs = None
+
         return super().log(logs)
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
@@ -546,34 +1462,40 @@ class LLaVATrainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
-            if self.args.mm_projector_lr is not None:
-                projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
+            split_projector_groups = self.args.mm_projector_lr is not None or vsp_controller_requested(getattr(opt_model, 'config', self.model.config))
+            if split_projector_groups:
+                projector_parameters = [name for name, _ in opt_model.named_parameters() if is_projector_parameter(name)]
+                projector_lr_kwargs = {"lr": self.args.mm_projector_lr} if self.args.mm_projector_lr is not None else {}
                 optimizer_grouped_parameters = [
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
+                        "vsp_group": "llm",
                     },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in projector_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
+                        "vsp_group": "llm",
                     },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in projector_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
+                        "vsp_group": "projector",
+                        **projector_lr_kwargs,
                     },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in projector_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
+                        "vsp_group": "projector",
+                        **projector_lr_kwargs,
                     },
                 ]
             else:
@@ -583,12 +1505,14 @@ class LLaVATrainer(Trainer):
                             p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
+                        "vsp_group": "llm",
                     },
                     {
                         "params": [
                             p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
+                        "vsp_group": "llm",
                     },
                 ]
 

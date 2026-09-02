@@ -14,6 +14,8 @@
 
 
 from abc import ABC, abstractmethod
+import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -25,83 +27,125 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
-def compute_linear_cka_loss(x, y, eps=1e-8):
+
+def validate_cka_loss_tau(tau):
+    """Return a finite CKA-loss tolerance in the closed interval [0, 1]."""
+    try:
+        tau = float(tau)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cka_loss_tau must be a number in [0, 1], got {tau!r}") from exc
+
+    if not math.isfinite(tau) or not 0.0 <= tau <= 1.0:
+        raise ValueError(f"cka_loss_tau must be finite and in [0, 1], got {tau!r}")
+    return tau
+
+
+def validate_cka_eps(eps):
+    """Return a finite, strictly positive numerical-stability constant."""
+    try:
+        eps = float(eps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"CKA eps must be a positive finite number, got {eps!r}") from exc
+
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"CKA eps must be a positive finite number, got {eps!r}")
+    return eps
+
+
+def normalize_centered_cka_features(features):
+    """Normalize each centered sample without introducing an absolute scale floor."""
+    reduce_dims = tuple(range(1, features.ndim))
+    norms = torch.linalg.vector_norm(features, dim=reduce_dims, keepdim=True)
+    return features / norms.clamp_min(torch.finfo(features.dtype).tiny)
+
+
+def cka_similarity_to_loss(cka, tau=0.0):
+    """Apply a per-sample hinge to CKA dissimilarity.
+
+    ``tau`` is the tolerated raw CKA loss. Consequently, no gradient is applied
+    once ``CKA >= 1 - tau``. ``torch.relu`` is intentional: unlike
+    ``clamp_min``, its gradient is zero exactly at the hinge boundary.
+    """
+    tau = validate_cka_loss_tau(tau)
+    return torch.relu((1.0 - tau) - cka)
+
+
+def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0):
     """
     Compute per-sample Linear CKA loss.
     For each batch element, treats tokens/patches as samples and features as dimensions.
-    
+
     Args:
         x, y: Shape (B, L, D) where B=batch, L=sequence length (tokens/patches), D=features
               If 2D, treats as (B, L*D)
         eps: numerical stability constant
-        
+        tau: tolerated raw CKA loss in [0, 1]. The returned loss is
+             ``mean(max(0, 1 - CKA - tau))``.
+
     Returns:
         Scalar loss (mean of per-sample CKA losses)
     """
+    tau = validate_cka_loss_tau(tau)
+    eps = validate_cka_eps(eps)
+
+    if x.ndim != y.ndim or x.ndim not in (2, 3):
+        raise ValueError(
+            f"CKA inputs must both be rank 2 or both be rank 3, got {x.ndim} and {y.ndim}"
+        )
+    if x.device != y.device:
+        raise ValueError(f"CKA inputs must be on the same device, got {x.device} and {y.device}")
     if x.shape[0] != y.shape[0]:
         raise ValueError(f"Batch size mismatch: {x.shape[0]} vs {y.shape[0]}")
+    if x.shape[0] == 0:
+        return x.float().sum() * 0.0 + y.float().sum() * 0.0
+    if x.ndim == 3 and x.shape[1] != y.shape[1]:
+        raise ValueError(f"Token length mismatch: {x.shape[1]} vs {y.shape[1]}")
+    if x.ndim == 2 and x.shape[1] != y.shape[1]:
+        raise ValueError(f"Feature length mismatch: {x.shape[1]} vs {y.shape[1]}")
 
-    B = x.shape[0]
-    x = x.float()
-    y = y.float()
-    
-    cka_losses = []
-    
-    # Compute per-sample CKA
-    if x.ndim == 3:
-        # Already (B, L, D) - tokens as samples, features as dimensions
-        for i in range(B):
-            x_i = x[i]  # (L, D)
-            y_i = y[i]  # (L, D)
-            
-            # Center features
-            x_i = x_i - x_i.mean(dim=0, keepdim=True)
-            y_i = y_i - y_i.mean(dim=0, keepdim=True)
-            
-            # Gram matrices: (L, D) @ (D, L) = (L, L)
-            xx = x_i @ x_i.T
-            yy = y_i @ y_i.T
-            
-            # CKA computation
-            hsic_xy = (xx * yy).sum()
-            hsic_xx = xx.square().sum()
-            hsic_yy = yy.square().sum()
-            
-            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
-            cka_i = hsic_xy / denom
-            cka_i = cka_i.clamp(0.0, 1.0)
-            
-            cka_losses.append(1.0 - cka_i)
-    else:
-        # 2D input (B, L*D) - flatten approach
-        x = x.flatten(1)
-        y = y.flatten(1)
-        
-        for i in range(B):
-            x_i = x[i].unsqueeze(1)  # (L*D, 1) - treat flattened as single sample
-            y_i = y[i].unsqueeze(1)  # (L*D, 1)
-            
-            # Center
-            x_i = x_i - x_i.mean()
-            y_i = y_i - y_i.mean()
-            
-            # Gram matrices: (L*D, 1) @ (1, L*D) = (L*D, L*D)
-            xx = x_i @ x_i.T
-            yy = y_i @ y_i.T
-            
-            # CKA computation
-            hsic_xy = (xx * yy).sum()
-            hsic_xx = xx.square().sum()
-            hsic_yy = yy.square().sum()
-            
-            denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
-            cka_i = hsic_xy / denom
-            cka_i = cka_i.clamp(0.0, 1.0)
-            
-            cka_losses.append(1.0 - cka_i)
-    
-    # Return mean loss across batch
-    return torch.stack(cka_losses).mean()
+    # Merely casting the inputs to float32 is insufficient under CUDA autocast:
+    # bmm/matmul can still be downcast to fp16. CKA's Gram/HSIC reductions are
+    # especially sensitive to that, so keep the entire calculation in FP32.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        x = x.float()
+        y = y.float()
+
+        # Compute per-sample CKA.
+        if x.ndim == 3:
+            # Already (B, L, D) - tokens as samples, features as dimensions.
+            x = x - x.mean(dim=1, keepdim=True)
+            y = y - y.mean(dim=1, keepdim=True)
+            x = normalize_centered_cka_features(x)
+            y = normalize_centered_cka_features(y)
+
+            # Batched Gram matrices: (B, L, D) @ (B, D, L) = (B, L, L).
+            xx = torch.bmm(x, x.transpose(1, 2))
+            yy = torch.bmm(y, y.transpose(1, 2))
+
+            hsic_xy = (xx * yy).sum(dim=(1, 2))
+            hsic_xx = xx.square().sum(dim=(1, 2))
+            hsic_yy = yy.square().sum(dim=(1, 2))
+        else:
+            # 2D input (B, L*D) - flatten approach. This is algebraically
+            # equivalent to the old per-sample outer-product Gram computation.
+            x = x.flatten(1)
+            y = y.flatten(1)
+            x = x - x.mean(dim=1, keepdim=True)
+            y = y - y.mean(dim=1, keepdim=True)
+            x = normalize_centered_cka_features(x)
+            y = normalize_centered_cka_features(y)
+
+            xy = (x * y).sum(dim=1)
+            xx = x.square().sum(dim=1)
+            yy = y.square().sum(dim=1)
+
+            hsic_xy = xy.square()
+            hsic_xx = xx.square()
+            hsic_yy = yy.square()
+
+        denom = torch.sqrt(torch.clamp(hsic_xx * hsic_yy, min=eps))
+        cka = (hsic_xy / denom).clamp(0.0, 1.0)
+        return cka_similarity_to_loss(cka, tau=tau).mean()
 
 class LlavaMetaModel:
 
@@ -214,6 +258,34 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
+    def warn_if_projector_only_cka(self):
+        """Warn once when a backbone cannot honor hidden-layer CKA settings."""
+        config = self.get_model().config
+        raw_layers = getattr(config, 'cka_loss_layers', 'final')
+        disabled_tokens = {"-1", "none", "off", "false"}
+        hidden_layers_disabled = (
+            raw_layers in (None, "", False)
+            or (
+                isinstance(raw_layers, str)
+                and raw_layers.strip().lower() in disabled_tokens
+            )
+            or (
+                isinstance(raw_layers, (list, tuple))
+                and len(raw_layers) == 1
+                and str(raw_layers[0]).strip().lower() in disabled_tokens
+            )
+        )
+        if hidden_layers_disabled or getattr(self, '_projector_only_cka_warned', False):
+            return
+
+        warnings.warn(
+            f"{type(self).__name__} supports projector CKA only; "
+            "cka_loss_layers is ignored. Use -1 to silence this warning.",
+            UserWarning,
+            stacklevel=2,
+        )
+        self._projector_only_cka_warned = True
+
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         projected_image_features = self.get_model().mm_projector(image_features)
@@ -221,10 +293,25 @@ class LlavaMetaForCausalLM(ABC):
             self.last_cka_projector_output = projected_image_features
 
         if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
-            # Projector CKA term: keep the projected image embeddings structurally
-            # close to the raw vision-tower patch features.
-            cka_loss = compute_linear_cka_loss(image_features, projected_image_features)
-            return projected_image_features, cka_loss, image_features
+            config = self.get_model().config
+            projector_weight = getattr(config, 'cka_loss_projector_weight', None)
+            if projector_weight is None:
+                projector_weight = getattr(config, 'cka_loss_weight', 1.0)
+
+            cka_loss = None
+            if float(projector_weight) != 0.0:
+                # Projector CKA term: keep the projected image embeddings
+                # structurally close to the raw vision-tower patch features.
+                cka_loss = compute_linear_cka_loss(
+                    image_features,
+                    projected_image_features,
+                    tau=getattr(config, 'cka_loss_tau', 0.0),
+                )
+            # The hidden-state chain now starts from post-projector embeddings.
+            # Do not also pad/carry raw vision features through the full language
+            # sequence. A zero projector weight intentionally skips that CKA
+            # calculation while preserving the tuple used by hidden-only CKA.
+            return projected_image_features, cka_loss, None
 
         return projected_image_features
 

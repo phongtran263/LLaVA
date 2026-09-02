@@ -305,7 +305,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             llm_cka_enabled
             and subset_select_layer is not None
             and vision_feature_mask is not None
-            and pre_projector_features is not None
+            and inputs_embeds is not None
         ):
             layers = getattr(self.get_model(), "layers", None)
             layer_idx = int(subset_select_layer) - 1
@@ -365,7 +365,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             llm_cka_enabled
             and subset_select_layer is not None
             and vision_feature_mask is not None
-            and pre_projector_features is not None
+            and inputs_embeds is not None
         ):
             subset_vision_feature_mask = captured_subset_vision_feature_mask
             if subset_vision_feature_mask is None and output.attentions is not None:
@@ -392,14 +392,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None and pre_projector_features is not None:
+            if vision_feature_mask is not None and inputs_embeds is not None:
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
                 layer_losses, per_layer_losses = self._compute_cka_chain_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
-                    pre_projector_features=pre_projector_features,
+                    chain_start_features=inputs_embeds,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )

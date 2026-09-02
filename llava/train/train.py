@@ -30,9 +30,11 @@ import tokenizers
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer, sanitize_generation_config_for_save
+from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
 from llava import conversation as conversation_lib
 from llava.model import *
+from llava.model.llava_arch import validate_cka_loss_tau
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -90,12 +92,24 @@ class ModelArguments:
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
     cka_loss: bool = field(default=False)
+    use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
+    vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
+    vsp_asymmetric_pcgrad: bool = field(default=False, metadata={"help": "Protect the LM gradient and project only conflicting weighted VSP/CKA auxiliary gradients."})
+    vsp_apply_to_projector_only: bool = field(default=False, metadata={"help": "Apply asymmetric PCGrad only to the projector CKA loss; final-hidden CKA gradients remain unprojected. This selects the auxiliary loss, not a parameter group."})
+    vsp_norm_cap: bool = field(default=False, metadata={"help": "Cap weighted VSP/CKA auxiliary gradients relative to the LM gradient by parameter group."})
+    vsp_pcgrad_threshold: float = field(default=0.05)
+    vsp_proj_max_grad_ratio: float = field(default=0.5)
+    vsp_llm_max_grad_ratio: float = field(default=0.1)
+    vsp_grad_ema_beta: float = field(default=0.95)
+    vsp_grad_log_interval: int = field(default=10)
+    vsp_grad_eps: float = field(default=1e-12)
+    cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the chained LLM hidden-state CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     # CKA has two terms: projector CKA always follows `cka_loss`, while this
     # option controls the chained LLM-hidden CKA term.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for chained LLM-hidden CKA: pre_projector->first->next->...->final, e.g. '8,16,24,final'. Use 'all' for pre_projector->layer1->layer2->...->last_block over image tokens. Use '-1' to disable this term."})
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for chained LLM-hidden CKA: post_projector->first->next->...->final, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden-chain CKA is supported by LLaMA/Qwen; Mistral/MPT use projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
@@ -966,6 +980,27 @@ def train(attn_implementation=None):
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
+    if model_args.use_pcgrad:
+        model_args.vsp_asymmetric_pcgrad = True
+    vsp_gradient_requested = bool(
+        model_args.vsp_gradient_diagnostics
+        or model_args.vsp_asymmetric_pcgrad
+        or model_args.vsp_norm_cap
+    )
+    validate_vsp_gradient_config(model_args)
+    if vsp_gradient_requested and not model_args.cka_loss:
+        rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
+    if vsp_gradient_requested and training_args.gradient_checkpointing:
+        if not hasattr(training_args, "gradient_checkpointing_kwargs"):
+            raise ValueError(
+                "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
+                "that supports gradient_checkpointing_kwargs."
+            )
+        checkpointing_kwargs = dict(training_args.gradient_checkpointing_kwargs or {})
+        if checkpointing_kwargs.get("use_reentrant", True):
+            rank0_print("VSP gradient controller: setting gradient checkpointing to use_reentrant=False.")
+        checkpointing_kwargs["use_reentrant"] = False
+        training_args.gradient_checkpointing_kwargs = checkpointing_kwargs
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     model_name_lower = model_args.model_name_or_path.lower()
     is_llama3_model = "llama-3" in model_name_lower or "llama3" in model_name_lower
@@ -1013,6 +1048,15 @@ def train(attn_implementation=None):
                 force_download=model_args.force_download,
                 **bnb_model_from_pretrained_args
             )
+        elif 'mistral' in model_name_lower:
+            model = LlavaMistralForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                force_download=model_args.force_download,
+                **bnb_model_from_pretrained_args
+            )
         else:
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1051,6 +1095,18 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    model.config.use_pcgrad = bool(model_args.use_pcgrad)
+    model.config.vsp_gradient_diagnostics = bool(model_args.vsp_gradient_diagnostics)
+    model.config.vsp_asymmetric_pcgrad = bool(model_args.vsp_asymmetric_pcgrad)
+    model.config.vsp_apply_to_projector_only = bool(model_args.vsp_apply_to_projector_only)
+    model.config.vsp_norm_cap = bool(model_args.vsp_norm_cap)
+    model.config.vsp_pcgrad_threshold = float(model_args.vsp_pcgrad_threshold)
+    model.config.vsp_proj_max_grad_ratio = float(model_args.vsp_proj_max_grad_ratio)
+    model.config.vsp_llm_max_grad_ratio = float(model_args.vsp_llm_max_grad_ratio)
+    model.config.vsp_grad_ema_beta = float(model_args.vsp_grad_ema_beta)
+    model.config.vsp_grad_log_interval = int(model_args.vsp_grad_log_interval)
+    model.config.vsp_grad_eps = float(model_args.vsp_grad_eps)
+    model.config.cka_loss_tau = validate_cka_loss_tau(model_args.cka_loss_tau)
     model.config.log_gradient_norms = training_args.log_gradient_norms
     model.config.cka_loss_weight = model_args.cka_loss_weight
     model.config.cka_loss_projector_weight = (
@@ -1091,8 +1147,9 @@ def train(attn_implementation=None):
     model.config.cka_loss_subset_otsu_min_separability = max(0.0, min(1.0, float(model_args.cka_loss_subset_otsu_min_separability)))
     # cka_loss_layers accepts comma-separated 1-based decoder layer indices plus
     # the special final/pre-norm hidden state. It also accepts "all", which
-    # expands to every transformer block output. The requested hidden states are
-    # regularized as a chain over image tokens: pre_projector->first->next->... .
+    # expands to every transformer block output, and interval shorthands such as
+    # "every4" or "interval:4". The requested hidden states are regularized as a
+    # chain over image tokens: post_projector->first->next->... .
     if model_args.cka_loss_layers:
         cka_loss_layers_arg = model_args.cka_loss_layers.strip()
         cka_loss_layers_lower = cka_loss_layers_arg.lower()
@@ -1103,13 +1160,45 @@ def train(attn_implementation=None):
         else:
             parsed_cka_layers = []
             invalid_cka_layer = None
+            layers = getattr(model.get_model(), "layers", None) if hasattr(model, "get_model") else None
+            num_cka_layers = len(layers) if layers is not None else int(getattr(model.config, "num_hidden_layers", 0) or 0)
+
+            def parse_interval_token(token_lower):
+                for prefix in ("every", "interval:", "interval=", "stride:", "stride=", "step:", "step="):
+                    if token_lower.startswith(prefix):
+                        raw_interval = token_lower[len(prefix):].lstrip("_-")
+                        try:
+                            interval = int(raw_interval)
+                        except ValueError:
+                            return None
+                        return interval if interval > 0 else None
+                return None
+
             for raw_token in cka_loss_layers_arg.split(","):
                 token = raw_token.strip()
                 if not token:
                     continue
                 token_lower = token.lower()
+                if token_lower in ("-1", "none", "off", "false"):
+                    if len([part for part in cka_loss_layers_arg.split(",") if part.strip()]) == 1:
+                        parsed_cka_layers = [-1]
+                        break
+                    continue
                 if token_lower in ("final", "last"):
                     parsed_cka_layers.append("final")
+                    continue
+                if token_lower == "all":
+                    if num_cka_layers <= 0:
+                        invalid_cka_layer = token
+                        break
+                    parsed_cka_layers.extend(range(1, num_cka_layers + 1))
+                    continue
+                interval = parse_interval_token(token_lower)
+                if interval is not None:
+                    if num_cka_layers <= 0:
+                        invalid_cka_layer = token
+                        break
+                    parsed_cka_layers.extend(range(interval, num_cka_layers + 1, interval))
                     continue
                 try:
                     layer_idx = int(token)
@@ -1121,7 +1210,9 @@ def train(attn_implementation=None):
                     break
                 parsed_cka_layers.append(layer_idx)
 
-            if invalid_cka_layer is not None or not parsed_cka_layers:
+            if parsed_cka_layers == [-1]:
+                model.config.cka_loss_layers = [-1]
+            elif invalid_cka_layer is not None or not parsed_cka_layers:
                 rank0_print(
                     f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', "
                     "defaulting to final"
@@ -1246,8 +1337,9 @@ def train(attn_implementation=None):
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-        if training_args.bits in [4, 8]:
-            model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+        mm_projector = getattr(model.get_model(), "mm_projector", None)
+        if mm_projector is not None:
+            mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
