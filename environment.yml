@@ -1,4 +1,4 @@
-name: llava
+name: llava-qwen
 channels:
   - conda-forge
 dependencies:
@@ -36,7 +36,7 @@ dependencies:
   - xxhash=0.8.3=hb47aa4a_0
   - zstd=1.5.7=hb78ec9c_6
   - pip:
-      - accelerate==0.21.0
+      - accelerate==1.14.0
       - aiofiles==23.2.1
       - altair==5.5.0
       - annotated-doc==0.0.4
@@ -105,7 +105,7 @@ dependencies:
       - nvidia-nvtx-cu12==12.8.55
       - orjson==3.11.9
       - pandas==2.3.3
-      - peft==0.4.0
+      - peft==0.19.1
       - pillow==10.4.0
       - platformdirs==4.10.0
       - protobuf==6.33.6
@@ -142,15 +142,15 @@ dependencies:
       - sympy==1.14.0
       - threadpoolctl==3.6.0
       - timm==0.6.13
-      - tokenizers==0.15.1
+      - tokenizers==0.19.1
       - tomlkit==0.12.0
       - torch==2.7.1+cu128
       - torchaudio==2.7.1+cu128
       - torchvision==0.22.1+cu128
       - tqdm==4.68.2
-      - transformers==4.37.2
+      - transformers==4.43.1
       - triton==3.3.1
-      - typer==0.26.7
+      - typer==0.25.1
       - typing-extensions==4.15.0
       - typing-inspection==0.4.2
       - tzdata==2026.2
@@ -159,4 +159,4 @@ dependencies:
       - wandb==0.25.1
       - wavedrom==2.0.3.post3
       - websockets==11.0.3
-prefix: /home/jovyan/dowser-lora-datavol-1/phong/conda/envs/llava
+prefix: /home/jovyan/dowser-lora-datavol-1/phong/conda/envs/llava-qwen

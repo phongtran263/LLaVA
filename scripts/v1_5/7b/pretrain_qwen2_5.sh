@@ -6,7 +6,7 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-3b-cka-grad/llava-pretrain}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-1.5b-cka-grad/llava-pretrain}"
 
 python - <<'PY_CHECK'
 from packaging import version
@@ -27,7 +27,7 @@ PY_CHECK
 
 "${CONDA_PREFIX}/bin/deepspeed" --include localhost:0 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
     --force_download False \
     --version plain \
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
@@ -59,7 +59,7 @@ PY_CHECK
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name qwen-3b-cka-grad-pretrain \
+    --run_name qwen-1.5b-cka-grad-pretrain \
     --cka_loss True \
     --cka_loss_tau 0.0 \
     --cka_loss_weight 1.0 \

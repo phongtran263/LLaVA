@@ -307,11 +307,21 @@ class LlavaMetaForCausalLM(ABC):
                     projected_image_features,
                     tau=getattr(config, 'cka_loss_tau', 0.0),
                 )
-            # The hidden-state chain now starts from post-projector embeddings.
-            # Do not also pad/carry raw vision features through the full language
-            # sequence. A zero projector weight intentionally skips that CKA
-            # calculation while preserving the tuple used by hidden-only CKA.
-            return projected_image_features, cka_loss, None
+            final_hidden_weight = getattr(config, "cka_loss_final_hidden_weight", None)
+            if final_hidden_weight is None:
+                final_hidden_weight = getattr(config, "cka_loss_weight", 1.0)
+            selected_hidden_specs = (
+                self._get_cka_layer_specs()
+                if hasattr(self, "_get_cka_layer_specs")
+                else []
+            )
+            needs_vision_reference = (
+                float(final_hidden_weight) != 0.0 and bool(selected_hidden_specs)
+            )
+            # Carry one detached raw vision feature per image token only when a
+            # selected LLM-hidden CKA term needs the fixed vision reference.
+            vision_reference = image_features.detach() if needs_vision_reference else None
+            return projected_image_features, cka_loss, vision_reference
 
         return projected_image_features
 

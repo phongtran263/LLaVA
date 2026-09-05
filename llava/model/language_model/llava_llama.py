@@ -290,13 +290,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if torch.is_tensor(hidden_states):
                 yield spec["name"], hidden_states
 
-    def _compute_cka_chain_losses(
+    def _compute_cka_vision_reference_losses(
         self,
         cka_layer_specs,
         captured_layer_hiddens,
         final_hidden,
         output_hidden_states,
-        chain_start_features,
+        vision_encoder_features,
         vision_feature_mask,
         output_device,
     ):
@@ -311,18 +311,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if not ordered_hiddens:
             return layer_losses, per_layer_losses
 
-        previous_name = "post_projector"
-        previous_hidden = chain_start_features.detach()
+        vision_reference = vision_encoder_features.detach()
         for layer_name, layer_hidden in ordered_hiddens:
             layer_loss = self._compute_masked_linear_cka_loss(
                 projected_features=layer_hidden,
-                layer_hidden_states=previous_hidden.detach(),
+                layer_hidden_states=vision_reference,
                 vision_feature_mask=vision_feature_mask,
             ).to(output_device)
             layer_losses.append(layer_loss)
-            per_layer_losses[f"{previous_name}_to_{layer_name}"] = layer_loss.detach()
-            previous_name = layer_name
-            previous_hidden = layer_hidden
+            per_layer_losses[f"vision_encoder_to_{layer_name}"] = layer_loss.detach()
 
         return layer_losses, per_layer_losses
 
@@ -493,8 +490,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         separability falls back to cumulative attention mass.
 
         Note: `select_layer` only chooses the attention layer used for subset selection.
-        The LLM-hidden CKA term below still compares the selected hidden-state chain against
-        post-projector image embeddings.
+        Every selected LLM hidden state is still compared against the same raw
+        vision-encoder features after applying the selected image-token mask.
         """
         if attentions is None or vision_feature_mask is None or select_layer is None:
             return None
@@ -893,19 +890,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None and inputs_embeds is not None:
-                # LLM CKA terms form a chain over image tokens:
-                # post_projector -> first requested layer -> ... .
-                # The previous endpoint is detached as the explicit CKA
-                # reference. Gradients still follow the later hidden state's
-                # normal computation graph through earlier modules.
+            if vision_feature_mask is not None and pre_projector_features is not None:
+                # Every selected LLM hidden state uses the same detached, aligned
+                # raw vision-encoder features as its CKA reference. Gradients follow
+                # each hidden target through preceding LLM blocks and the projector.
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                layer_losses, per_layer_losses = self._compute_cka_chain_losses(
+                layer_losses, per_layer_losses = self._compute_cka_vision_reference_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
-                    chain_start_features=inputs_embeds,
+                    vision_encoder_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )

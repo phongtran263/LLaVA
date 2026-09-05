@@ -59,6 +59,8 @@ CKA_LOSS_SUBSET_QUERY_TOKENS="${CKA_LOSS_SUBSET_QUERY_TOKENS:-text}"
     --run_name 7b-cka-grad-finetune \
     --cka_loss True \
     --use_pcgrad False \
+    --vsp_asymmetric_pcgrad True \
+    --vsp_apply_to_projector_only True \
     --cka_loss_projector_weight 0.1 \
     --cka_loss_final_hidden_weight 0.1 \
     --cka_loss_subset_query_tokens "${CKA_LOSS_SUBSET_QUERY_TOKENS}" \

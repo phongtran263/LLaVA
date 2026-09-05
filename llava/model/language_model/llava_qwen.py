@@ -58,7 +58,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     _get_cka_layer_specs = LlavaLlamaForCausalLM._get_cka_layer_specs
     _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
     _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
-    _compute_cka_chain_losses = LlavaLlamaForCausalLM._compute_cka_chain_losses
+    _compute_cka_vision_reference_losses = LlavaLlamaForCausalLM._compute_cka_vision_reference_losses
 
     def __init__(self, config):
         config.model_type = "llava_qwen"
@@ -392,14 +392,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None and inputs_embeds is not None:
+            if vision_feature_mask is not None and pre_projector_features is not None:
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                layer_losses, per_layer_losses = self._compute_cka_chain_losses(
+                layer_losses, per_layer_losses = self._compute_cka_vision_reference_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
-                    chain_start_features=inputs_embeds,
+                    vision_encoder_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )

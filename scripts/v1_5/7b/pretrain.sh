@@ -6,7 +6,7 @@
 # TinyLlama/TinyLlama-1.1B-Chat-v1.0
 # Qwen/Qwen3-4B-Instruct-2507
 
-deepspeed --include localhost:0,1 llava/train/train_mem.py \
+deepspeed --include localhost:3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
     --force_download False \
@@ -24,7 +24,7 @@ deepspeed --include localhost:0,1 llava/train/train_mem.py \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 16 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 24000 \
@@ -43,7 +43,8 @@ deepspeed --include localhost:0,1 llava/train/train_mem.py \
     --run_name 7b-cka-grad-pretrain \
     --cka_loss True \
     --use_pcgrad False \
-    --pretrain_projector_pcgrad True \
+    --vsp_asymmetric_pcgrad True \
+    --vsp_apply_to_projector_only True \
     --cka_loss_weight 0.1 \
     --cka_loss_layers "-1" \
     --log_gradient_norms False \

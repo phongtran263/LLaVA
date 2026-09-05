@@ -6,8 +6,8 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/qwen-3b-cka-grad/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-3b-cka-grad-last/llava-finetune}"
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/qwen-1.5b-cka-grad/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-1.5b-cka-grad-last/llava-finetune}"
 
 python - <<'PY_CHECK'
 from packaging import version
@@ -26,9 +26,9 @@ if version.parse(accelerate.__version__) < version.parse("0.33.0"):
     )
 PY_CHECK
 
-"${CONDA_PREFIX}/bin/deepspeed" --include localhost:2 llava/train/train_mem.py \
+"${CONDA_PREFIX}/bin/deepspeed" --include localhost:3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
     --version qwen2 \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
@@ -43,9 +43,9 @@ PY_CHECK
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 128 \
+    --gradient_accumulation_steps 8 \
     --evaluation_strategy "no" \
     --save_strategy "no" \
     --learning_rate 2e-5 \
@@ -55,11 +55,11 @@ PY_CHECK
     --logging_steps 1 \
     --tf32 True \
     --model_max_length 2048 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name qwen-3b-cka-grad-finetune \
+    --run_name qwen-1.5b-cka-grad-finetune \
     --cka_loss True \
     --cka_loss_tau 0.0 \
     --cka_loss_projector_weight 0.1 \
@@ -72,4 +72,4 @@ PY_CHECK
     --vsp_proj_max_grad_ratio 0.5 \
     --vsp_llm_max_grad_ratio 0.5 \
     --vsp_grad_log_interval 10 \
-    --cka_loss_layers "final"
+    --cka_loss_layers "-1"

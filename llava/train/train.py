@@ -106,10 +106,10 @@ class ModelArguments:
     cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
-    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the chained LLM hidden-state CKA loss. Defaults to cka_loss_weight for backward compatibility."})
+    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for LLM hidden-state CKA against the raw vision-encoder features. Defaults to cka_loss_weight for backward compatibility."})
     # CKA has two terms: projector CKA always follows `cka_loss`, while this
-    # option controls the chained LLM-hidden CKA term.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for chained LLM-hidden CKA: post_projector->first->next->...->final, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden-chain CKA is supported by LLaMA/Qwen; Mistral/MPT use projector CKA only."})
+    # option selects LLM hidden states compared to the raw vision reference.
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA against the same raw vision-encoder features, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden CKA is supported by LLaMA/Qwen; Mistral/MPT use projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
@@ -1149,7 +1149,7 @@ def train(attn_implementation=None):
     # the special final/pre-norm hidden state. It also accepts "all", which
     # expands to every transformer block output, and interval shorthands such as
     # "every4" or "interval:4". The requested hidden states are regularized as a
-    # chain over image tokens: post_projector->first->next->... .
+    # set against the same aligned, detached raw vision-encoder features.
     if model_args.cka_loss_layers:
         cka_loss_layers_arg = model_args.cka_loss_layers.strip()
         cka_loss_layers_lower = cka_loss_layers_arg.lower()
