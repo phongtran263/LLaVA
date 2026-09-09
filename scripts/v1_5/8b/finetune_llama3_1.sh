@@ -11,14 +11,14 @@ from packaging import version
 import accelerate
 import transformers
 
-if version.parse(transformers.__version__) != version.parse("4.43.1"):
+if version.parse(transformers.__version__) != version.parse("4.51.3"):
     raise SystemExit(
-        f"Llama 3.1 training expects transformers==4.43.1, got {transformers.__version__}. "
-        "Activate llava-llama31 or install transformers==4.43.1."
+        f"Llama 3.1 training expects transformers==4.51.3, got {transformers.__version__}. "
+        "Activate llava-llama31 or install transformers==4.51.3."
     )
-if version.parse(accelerate.__version__) < version.parse("0.33.0"):
+if version.parse(accelerate.__version__) < version.parse("1.6.0"):
     raise SystemExit(
-        f"Llama 3.1 training expects accelerate>=0.33.0, got {accelerate.__version__}."
+        f"Llama 3.1 training expects accelerate>=1.6.0, got {accelerate.__version__}."
     )
 PY_CHECK
 

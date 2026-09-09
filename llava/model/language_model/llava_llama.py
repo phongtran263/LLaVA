@@ -577,6 +577,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         otsu_min_separability: float,
         labels: Optional[torch.LongTensor] = None,
         min_keep_tokens: int = 2,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[torch.BoolTensor]:
         """
         Select image tokens from one layer's QK attention without asking the whole model
@@ -629,13 +630,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         key_states = attention_module.k_proj(hidden_states)
 
         query_states = query_states.view(
-            bsz, q_len, attention_module.num_heads, attention_module.head_dim
+            bsz, q_len, -1, attention_module.head_dim
         ).transpose(1, 2)
         key_states = key_states.view(
-            bsz, q_len, attention_module.num_key_value_heads, attention_module.head_dim
+            bsz, q_len, -1, attention_module.head_dim
         ).transpose(1, 2)
 
-        cos, sin = attention_module.rotary_emb(key_states, seq_len=q_len)
+        if position_embeddings is None:
+            cos, sin = attention_module.rotary_emb(key_states, seq_len=q_len)
+        else:
+            # Transformers 4.51 computes RoPE in LlamaModel and passes it to attention.
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         key_states = repeat_kv(key_states, attention_module.num_key_value_groups)
 
@@ -822,6 +827,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                         attention_mask=attention_mask,
                         position_ids=module_kwargs.get("position_ids", position_ids),
                         past_key_value=module_kwargs.get("past_key_value", None),
+                        position_embeddings=module_kwargs.get("position_embeddings", None),
                         labels=labels,
                         **subset_selection_kwargs,
                     )

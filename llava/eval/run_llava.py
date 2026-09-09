@@ -14,7 +14,7 @@ from llava.utils import disable_torch_init
 from llava.mm_utils import (
     process_images,
     tokenizer_image_token,
-    get_model_name_from_path, get_generation_config_kwargs,
+    get_model_name_from_path, get_generation_config_kwargs, infer_conversation_mode,
 )
 
 from PIL import Image
@@ -69,20 +69,14 @@ def eval_model(args):
         else:
             qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
 
-    if "qwen" in model_name.lower():
-        conv_mode = "qwen2"
-    elif "llama-2" in model_name.lower():
-        conv_mode = "llava_llama_2"
-    elif "mistral" in model_name.lower():
-        conv_mode = "mistral_instruct"
-    elif "v1.6-34b" in model_name.lower():
-        conv_mode = "chatml_direct"
-    elif "v1" in model_name.lower():
-        conv_mode = "llava_v1"
-    elif "mpt" in model_name.lower():
-        conv_mode = "mpt"
-    else:
-        conv_mode = "llava_v0"
+    conv_mode = infer_conversation_mode(model_name, model.config)
+    if conv_mode is None:
+        if "v1.6-34b" in model_name.lower():
+            conv_mode = "chatml_direct"
+        elif "v1" in model_name.lower():
+            conv_mode = "llava_v1"
+        else:
+            conv_mode = "llava_v0"
 
     if args.conv_mode is not None and conv_mode != args.conv_mode:
         print(

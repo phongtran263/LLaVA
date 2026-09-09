@@ -442,7 +442,9 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Keep the existing per-microbatch text/CKA means. The new Trainer's
+        # token-count argument must not change their relative weighting.
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
@@ -1278,7 +1280,7 @@ class LLaVATrainer(Trainer):
         if len(logs) > 1:
             self._last_gradient_norm_logs = logs
 
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
@@ -1352,6 +1354,14 @@ class LLaVATrainer(Trainer):
                     with amp.scale_loss(backward_loss, self.optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
+                    if not self.is_deepspeed_enabled:
+                        # Older Trainer versions configure accumulation in
+                        # Accelerate; 4.51 leaves its factor at 1. Compensate so
+                        # backward divides by the configured factor exactly once.
+                        backward_loss = backward_loss * (
+                            self.accelerator.gradient_accumulation_steps
+                            / self.args.gradient_accumulation_steps
+                        )
                     self.accelerator.backward(backward_loss)
         finally:
             self._clear_gradient_log_tensors(model)
@@ -1387,7 +1397,7 @@ class LLaVATrainer(Trainer):
 
         return None, None
 
-    def log(self, logs):
+    def log(self, logs, *args, **kwargs):
         logs = dict(logs)
         model = self.model.module if hasattr(self.model, 'module') else self.model
 
@@ -1430,7 +1440,7 @@ class LLaVATrainer(Trainer):
             logs.update(vsp_gradient_logs)
             self._last_vsp_gradient_logs = None
 
-        return super().log(logs)
+        return super().log(logs, *args, **kwargs)
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
@@ -1535,7 +1545,7 @@ class LLaVATrainer(Trainer):
 
         return self.optimizer
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial, *args, **kwargs):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
@@ -1554,7 +1564,7 @@ class LLaVATrainer(Trainer):
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
-            super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            super(LLaVATrainer, self)._save_checkpoint(model, trial, *args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

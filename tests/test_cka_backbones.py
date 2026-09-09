@@ -27,6 +27,23 @@ if hasattr(transformers, "Qwen2Config"):
 else:
     LlavaQwenConfig = None
     LlavaQwenForCausalLM = None
+if hasattr(transformers, "Qwen3Config"):
+    from llava.model.language_model.llava_modern import (
+        LlavaQwen3Config,
+        LlavaQwen3ForCausalLM,
+        LlavaGemma3Config,
+        LlavaGemma3ForCausalLM,
+        LlavaPhi3Config,
+        LlavaPhi3ForCausalLM,
+    )
+else:
+    LlavaQwen3Config = None
+    LlavaQwen3ForCausalLM = None
+    LlavaGemma3Config = None
+    LlavaGemma3ForCausalLM = None
+    LlavaPhi3Config = None
+    LlavaPhi3ForCausalLM = None
+
 
 
 class _FakeVisionTower(nn.Module):
@@ -111,6 +128,40 @@ def _backbone_factories():
             ),
         ),
     ]
+    if LlavaQwen3ForCausalLM is not None:
+        factories.extend([
+            (
+                "qwen3",
+                LlavaQwen3ForCausalLM,
+                lambda: LlavaQwen3Config(
+                    vocab_size=64, hidden_size=16, intermediate_size=32,
+                    num_hidden_layers=2, num_attention_heads=4,
+                    num_key_value_heads=2, head_dim=4,
+                    max_position_embeddings=64,
+                ),
+            ),
+            (
+                "gemma3",
+                LlavaGemma3ForCausalLM,
+                lambda: LlavaGemma3Config(
+                    vocab_size=64, hidden_size=16, intermediate_size=32,
+                    num_hidden_layers=2, num_attention_heads=4,
+                    num_key_value_heads=2, head_dim=4,
+                    max_position_embeddings=64, sliding_window=32,
+                ),
+            ),
+            (
+                "phi3",
+                LlavaPhi3ForCausalLM,
+                lambda: LlavaPhi3Config(
+                    vocab_size=64, hidden_size=16, intermediate_size=32,
+                    num_hidden_layers=2, num_attention_heads=4,
+                    num_key_value_heads=2, max_position_embeddings=64,
+                    original_max_position_embeddings=64,
+                    pad_token_id=0, bos_token_id=1, eos_token_id=2,
+                ),
+            ),
+        ])
     if LlavaQwenForCausalLM is not None:
         factories.append(
             (
@@ -237,7 +288,7 @@ class CkaBackboneSmokeTests(unittest.TestCase):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2"}
+            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -279,7 +330,7 @@ class CkaBackboneSmokeTests(unittest.TestCase):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2"}
+            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -401,7 +452,7 @@ class CkaBackboneSmokeTests(unittest.TestCase):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2"}
+            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -501,6 +552,26 @@ class CkaBackboneSmokeTests(unittest.TestCase):
             )
         self.assertEqual(output.logits.shape[:2], input_ids.shape)
 
+
+
+    def test_modern_backbone_generate_is_cache_compatible(self):
+        for name, model_cls, config_factory in _backbone_factories():
+            if name not in {"qwen3", "gemma3", "phi3"}:
+                continue
+            with self.subTest(backbone=name):
+                config = config_factory()
+                config.cka_loss = False
+                config.use_cache = True
+                model = model_cls(config).eval()
+                input_ids = torch.tensor([[1, 2, 3]])
+                with torch.no_grad():
+                    output = model.generate(
+                        inputs=input_ids,
+                        max_new_tokens=1,
+                        do_sample=False,
+                    )
+                self.assertEqual(output.shape[0], 1)
+                self.assertEqual(output.shape[1], 1)
 
 
 if __name__ == "__main__":

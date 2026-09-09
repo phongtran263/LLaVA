@@ -91,8 +91,31 @@ pip install -e .
 3. Install additional packages for training cases
 ```
 pip install -e ".[train]"
-pip install flash-attn --no-build-isolation
+pip install flash-attn==2.8.3 --no-build-isolation
 ```
+
+This checkout's `pyproject.toml` targets LLaVA 1.5/Vicuna training with
+`transformers==4.51.3`, `tokenizers==0.21.2`, `accelerate==1.6.0`, and
+`peft==0.15.2`. It retains PyTorch 2.7.1 / CUDA 12.8 support for B200.
+Use a fresh Python 3.10 environment to keep existing experiment environments intact.
+Existing experiment-specific scripts may still target their historical environments.
+For new runs, the config-based loader supports Qwen2.5, Qwen3, Llama 3.2,
+Gemma 3 1B text decoder, Phi-3.5, TinyLlama, Vicuna and Mistral.
+
+```Shell
+export MODEL_NAME_OR_PATH=Qwen/Qwen3-0.6B
+export RUN_NAME=qwen3-0.6b
+export GPU_INCLUDE=localhost:0,1
+bash scripts/v1_5/pretrain_backbone.sh
+bash scripts/v1_5/finetune_backbone.sh
+```
+
+The same scripts accept any supported checkpoint through `MODEL_NAME_OR_PATH`.
+Use `CKA_LOSS=True` and the `CKA_*` / `VSP_*` environment variables to
+enable the optional CKA and gradient-controller settings; they are off by default.
+
+CPU training, accumulation, checkpoint, CKA, and backbone compatibility checks:
+`python -m unittest -v tests.test_training_compatibility tests.test_backbone_registry`.
 
 ### Upgrade to latest code base
 

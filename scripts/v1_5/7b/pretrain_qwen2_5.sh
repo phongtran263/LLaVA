@@ -6,28 +6,11 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-1.5b-cka-grad/llava-pretrain}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}"
 
-python - <<'PY_CHECK'
-from packaging import version
-import accelerate
-import transformers
-
-if version.parse(transformers.__version__) != version.parse("4.43.1"):
-    raise SystemExit(
-        f"Qwen2.5 training expects transformers==4.43.1, got {transformers.__version__}. "
-        "Activate llava-qwen or downgrade this env."
-    )
-if version.parse(accelerate.__version__) < version.parse("0.33.0"):
-    raise SystemExit(
-        f"Qwen2.5 training expects accelerate>=0.33.0 with transformers 4.43.x, got {accelerate.__version__}. "
-        "Run: conda run -n llava-qwen python -m pip install accelerate==0.33.0"
-    )
-PY_CHECK
-
-"${CONDA_PREFIX}/bin/deepspeed" --include localhost:0 llava/train/train_mem.py \
+"${CONDA_PREFIX}/bin/deepspeed" --include localhost:3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
     --force_download False \
     --version plain \
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
@@ -44,7 +27,7 @@ PY_CHECK
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 16 \
-    --evaluation_strategy "no" \
+    --eval_strategy  "no" \
     --save_strategy "steps" \
     --save_steps 24000 \
     --save_total_limit 1 \
@@ -59,14 +42,14 @@ PY_CHECK
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name qwen-1.5b-cka-grad-pretrain \
-    --cka_loss True \
+    --run_name qwen-3b-pretrain \
+    --cka_loss False \
     --cka_loss_tau 0.0 \
     --cka_loss_weight 1.0 \
-    --vsp_gradient_diagnostics True \
-    --vsp_asymmetric_pcgrad True \
-    --vsp_apply_to_projector_only True \
-    --vsp_norm_cap True \
+    --vsp_gradient_diagnostics False \
+    --vsp_asymmetric_pcgrad False \
+    --vsp_apply_to_projector_only False \
+    --vsp_norm_cap False \
     --vsp_pcgrad_threshold 0.05 \
     --vsp_proj_max_grad_ratio 0.5 \
     --vsp_llm_max_grad_ratio 0.5 \

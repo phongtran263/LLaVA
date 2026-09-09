@@ -14,15 +14,15 @@ from packaging import version
 import accelerate
 import transformers
 
-if version.parse(transformers.__version__) != version.parse("4.43.1"):
+if version.parse(transformers.__version__) != version.parse("4.51.3"):
     raise SystemExit(
-        f"Qwen2.5 training expects transformers==4.43.1, got {transformers.__version__}. "
+        f"Qwen2.5 training expects transformers==4.51.3, got {transformers.__version__}. "
         "Activate llava-qwen or downgrade this env."
     )
-if version.parse(accelerate.__version__) < version.parse("0.33.0"):
+if version.parse(accelerate.__version__) < version.parse("1.6.0"):
     raise SystemExit(
-        f"Qwen2.5 training expects accelerate>=0.33.0 with transformers 4.43.x, got {accelerate.__version__}. "
-        "Run: conda run -n llava-qwen python -m pip install accelerate==0.33.0"
+        f"Qwen2.5 training expects accelerate>=1.6.0 with transformers 4.51.x, got {accelerate.__version__}. "
+        "Run: conda run -n llava-qwen python -m pip install accelerate==1.6.0"
     )
 PY_CHECK
 

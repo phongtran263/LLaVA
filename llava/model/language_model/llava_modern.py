@@ -1,53 +1,31 @@
-#    Copyright 2023 Haotian Liu
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
+"""Shared LLaVA image/CKA plumbing around native Transformers decoder classes.
 
-
+Attention, embedding scaling, loss and KV caches remain implemented by each
+backbone. This module requires the Transformers 4.51.3 training environment.
+"""
 from typing import List, Optional, Tuple, Union
-import inspect
-import math
 
 import torch
 import torch.nn as nn
-
-from transformers import AutoConfig, AutoModelForCausalLM, \
-                         Qwen2Config, Qwen2Model, Qwen2ForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
-
+from transformers import (
+    AutoConfig, AutoModelForCausalLM,
+    Qwen3Config, Qwen3Model, Qwen3ForCausalLM,
+    Gemma3TextConfig, Gemma3TextModel, Gemma3ForCausalLM,
+    Phi3Config, Phi3Model, Phi3ForCausalLM,
+)
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
+from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb as qwen3_rotary, repeat_kv
+from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb as gemma3_rotary
+from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb as phi3_rotary
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from .llava_llama import CausalLMOutputWithPastAux, LlavaLlamaForCausalLM
+from .llava_llama import LlavaLlamaForCausalLM, CausalLMOutputWithPastAux
 
 
-_QWEN2_FORWARD_SUPPORTS_CACHE_POSITION = (
-    "cache_position" in inspect.signature(Qwen2ForCausalLM.forward).parameters
-)
-
-class LlavaQwenConfig(Qwen2Config):
-    model_type = "llava_qwen"
-
-
-class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
-    config_class = LlavaQwenConfig
-
-    def __init__(self, config: Qwen2Config):
-        super(LlavaQwenModel, self).__init__(config)
-
-
-class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
-    config_class = LlavaQwenConfig
+class LlavaModernMixin(LlavaMetaForCausalLM):
+    # The custom Trainer preserves per-microbatch text/auxiliary loss means.
+    accepts_loss_kwargs = False
     _compute_masked_linear_cka_loss = LlavaLlamaForCausalLM._compute_masked_linear_cka_loss
     _get_cka_attention_subset_kwargs = LlavaLlamaForCausalLM._get_cka_attention_subset_kwargs
     _fallback_keep_count_from_attention_mass = LlavaLlamaForCausalLM._fallback_keep_count_from_attention_mass
@@ -59,16 +37,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
     _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
     _compute_cka_vision_reference_losses = LlavaLlamaForCausalLM._compute_cka_vision_reference_losses
-
-    def __init__(self, config):
-        config.model_type = "llava_qwen"
-        super(Qwen2ForCausalLM, self).__init__(config)
-        self.model = LlavaQwenModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
 
     def get_model(self):
         return self.model
@@ -129,8 +97,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         elif position_ids.shape[0] == 1 and bsz > 1:
             position_ids = position_ids.expand(bsz, -1)
 
-        query_states = attention_module.q_proj(hidden_states)
-        key_states = attention_module.k_proj(hidden_states)
+        if hasattr(attention_module, "qkv_proj"):
+            qkv = attention_module.qkv_proj(hidden_states)
+            query_width = attention_module.config.num_attention_heads * attention_module.head_dim
+            key_width = attention_module.config.num_key_value_heads * attention_module.head_dim
+            query_states = qkv[..., :query_width]
+            key_states = qkv[..., query_width:query_width + key_width]
+        else:
+            query_states = attention_module.q_proj(hidden_states)
+            key_states = attention_module.k_proj(hidden_states)
 
         query_states = query_states.view(
             bsz, q_len, -1, attention_module.head_dim
@@ -139,18 +114,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             bsz, q_len, -1, attention_module.head_dim
         ).transpose(1, 2)
 
+        if hasattr(attention_module, "q_norm"):
+            query_states = attention_module.q_norm(query_states)
+            key_states = attention_module.k_norm(key_states)
         if position_embeddings is None:
-            rotary_seq_len = q_len
-            if position_ids is not None:
-                rotary_seq_len = max(q_len, int(position_ids.max().item()) + 1)
-            cos, sin = attention_module.rotary_emb(key_states, seq_len=rotary_seq_len)
-        else:
-            cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            raise ValueError("The modern CKA attention hook requires native position_embeddings.")
+        cos, sin = position_embeddings
+        query_states, key_states = self._apply_rotary(query_states, key_states, cos, sin)
         key_states = repeat_kv(key_states, attention_module.num_key_value_groups)
 
         selected_masks = []
-        scale = 1.0 / math.sqrt(attention_module.head_dim)
+        scale = attention_module.scaling
 
         for batch_idx in range(bsz):
             valid_mask = valid_attention_mask[batch_idx]
@@ -175,8 +149,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             q_i = query_states[batch_idx, :, text_positions, :]
             k_i = key_states[batch_idx, :, valid_positions, :]
             attn_scores = torch.matmul(q_i, k_i.transpose(-1, -2)).float() * scale
+            softcap = getattr(attention_module, "attn_logit_softcapping", None)
+            if softcap is not None:
+                attn_scores = torch.tanh(attn_scores / softcap) * softcap
 
             causal_mask = valid_positions.unsqueeze(0) <= text_positions.unsqueeze(1)
+            window = getattr(attention_module, "sliding_window", None)
+            if window is None and hasattr(attention_module, "qkv_proj"):
+                window = getattr(attention_module.config, "sliding_window", None)
+            if window:
+                causal_mask &= valid_positions.unsqueeze(0) > text_positions.unsqueeze(1) - window
             attn_scores = attn_scores.masked_fill(
                 ~causal_mask.unsqueeze(0),
                 torch.finfo(attn_scores.dtype).min,
@@ -220,6 +202,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
         vision_feature_mask = None
@@ -276,7 +260,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 )
 
         cka_layer_specs = self._get_cka_layer_specs() if cka_enabled else []
-        llm_cka_enabled = cka_enabled and len(cka_layer_specs) > 0
+        hidden_weight = getattr(self.config, "cka_loss_final_hidden_weight", None)
+        if hidden_weight is None:
+            hidden_weight = getattr(self.config, "cka_loss_weight", 1.0)
+        llm_cka_enabled = cka_enabled and bool(cka_layer_specs) and hidden_weight != 0
+        if llm_cka_enabled and vision_feature_mask is not None and pre_projector_features is None:
+            raise ValueError("Hidden CKA needs aligned raw vision features; use mm_patch_merge_type='flat'.")
         should_output_hidden_states = output_hidden_states
         should_output_attentions = output_attentions
         subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
@@ -351,10 +340,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=should_output_attentions,
             output_hidden_states=should_output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True if cka_enabled else return_dict,
         )
-        if _QWEN2_FORWARD_SUPPORTS_CACHE_POSITION:
-            forward_kwargs["cache_position"] = cache_position
+        forward_kwargs["cache_position"] = cache_position
+        forward_kwargs["logits_to_keep"] = 0 if logits_to_keep is None else logits_to_keep
+        forward_kwargs.update(kwargs)
 
         try:
             output = super().forward(**forward_kwargs)
@@ -459,6 +449,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        if inputs is None:
+            inputs = kwargs.pop("input_ids", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
@@ -503,5 +495,75 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         return inputs
 
 
-AutoConfig.register("llava_qwen", LlavaQwenConfig)
-AutoModelForCausalLM.register(LlavaQwenConfig, LlavaQwenForCausalLM)
+
+class LlavaQwen3Config(Qwen3Config):
+    model_type = "llava_qwen3"
+
+
+class LlavaQwen3Model(LlavaMetaModel, Qwen3Model):
+    config_class = LlavaQwen3Config
+
+
+class LlavaQwen3ForCausalLM(LlavaModernMixin, Qwen3ForCausalLM):
+    config_class = LlavaQwen3Config
+    _apply_rotary = staticmethod(qwen3_rotary)
+
+    def __init__(self, config):
+        super(Qwen3ForCausalLM, self).__init__(config)
+        self.model = LlavaQwen3Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+
+AutoConfig.register("llava_qwen3", LlavaQwen3Config)
+AutoModelForCausalLM.register(LlavaQwen3Config, LlavaQwen3ForCausalLM)
+
+
+class LlavaGemma3Config(Gemma3TextConfig):
+    model_type = "llava_gemma3"
+
+
+class LlavaGemma3Model(LlavaMetaModel, Gemma3TextModel):
+    config_class = LlavaGemma3Config
+
+
+class LlavaGemma3ForCausalLM(LlavaModernMixin, Gemma3ForCausalLM):
+    config_class = LlavaGemma3Config
+    _apply_rotary = staticmethod(gemma3_rotary)
+
+    def __init__(self, config):
+        super(Gemma3ForCausalLM, self).__init__(config)
+        self.model = LlavaGemma3Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+
+AutoConfig.register("llava_gemma3", LlavaGemma3Config)
+AutoModelForCausalLM.register(LlavaGemma3Config, LlavaGemma3ForCausalLM)
+
+
+class LlavaPhi3Config(Phi3Config):
+    model_type = "llava_phi3"
+
+
+class LlavaPhi3Model(LlavaMetaModel, Phi3Model):
+    config_class = LlavaPhi3Config
+
+
+class LlavaPhi3ForCausalLM(LlavaModernMixin, Phi3ForCausalLM):
+    config_class = LlavaPhi3Config
+    _apply_rotary = staticmethod(phi3_rotary)
+
+    def __init__(self, config):
+        super(Phi3ForCausalLM, self).__init__(config)
+        self.model = LlavaPhi3Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+
+AutoConfig.register("llava_phi3", LlavaPhi3Config)
+AutoModelForCausalLM.register(LlavaPhi3Config, LlavaPhi3ForCausalLM)
+

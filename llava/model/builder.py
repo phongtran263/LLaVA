@@ -16,18 +16,17 @@
 import os
 import warnings
 import shutil
+from llava.model.backbones import backbone_type, get_llava_model_class
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
-def _is_qwen_model(*names):
-    return any(name is not None and 'qwen' in str(name).lower() for name in names)
 
 
-def _set_qwen_pad_token(tokenizer, model):
+def _set_generation_pad_token(tokenizer, model, include_pad_as_eos=False):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     if tokenizer.pad_token_id is not None:
@@ -43,7 +42,10 @@ def _set_qwen_pad_token(tokenizer, model):
     if eos_ids is not None and not isinstance(eos_ids, (list, tuple)):
         eos_ids = [eos_ids]
     eos_ids = list(eos_ids or [])
-    for token_id in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+    terminal_ids = [tokenizer.eos_token_id]
+    if include_pad_as_eos:
+        terminal_ids.append(tokenizer.pad_token_id)
+    for token_id in terminal_ids:
         if token_id is not None and token_id not in eos_ids:
             eos_ids.append(token_id)
     if eos_ids:
@@ -56,9 +58,29 @@ def _set_qwen_pad_token(tokenizer, model):
     generation_config.output_hidden_states = False
 
 
+def _checkpoint_family(model_path, model_base=None):
+    from transformers import PretrainedConfig
+
+    last_error = None
+    for source in (model_path, model_base):
+        if source is None:
+            continue
+        try:
+            config_dict, _ = PretrainedConfig.get_config_dict(source, trust_remote_code=True)
+            return backbone_type(config_dict["model_type"]), config_dict["model_type"], config_dict
+        except (OSError, KeyError, ValueError) as exc:
+            last_error = exc
+    raise ValueError(f"Cannot determine backbone model_type for {model_path!r}: {last_error}")
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
-    is_qwen = _is_qwen_model(model_name, model_path, model_base)
+    family, checkpoint_type, config_dict = _checkpoint_family(model_path, model_base)
+    is_llava = checkpoint_type.startswith("llava") or "llava" in model_name.lower()
+    tokenizer_fast = family in ("qwen2", "qwen3", "gemma3_text", "phi3", "mpt") or (
+        family == "llama" and int(config_dict.get("vocab_size", 0)) >= 128000
+    )
+    llava_cls = get_llava_model_class(family) if is_llava else None
 
     if device != "cuda":
         kwargs['device_map'] = {"": device}
@@ -79,23 +101,17 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
 
-    if 'llava' in model_name.lower():
+    if is_llava:
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
         if 'lora' in model_name.lower() and model_base is not None:
-            if is_qwen:
-                from llava.model.language_model.llava_qwen import LlavaQwenConfig
-                lora_cfg_pretrained = LlavaQwenConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base)
-                print('Loading LLaVA-Qwen from base model...')
-                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
-            else:
-                from llava.model.language_model.llava_llama import LlavaConfig
-                lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                print('Loading LLaVA from base model...')
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            lora_cfg_pretrained = llava_cls.config_class.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=tokenizer_fast)
+            print(f"Loading LLaVA-{family} from base model...")
+            model = llava_cls.from_pretrained(
+                model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs
+            )
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
@@ -128,58 +144,35 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         elif model_base is not None:
             # this may be mm projector only
             print('Loading LLaVA from base model...')
-            if 'mpt' in model_name.lower():
-                if not os.path.isfile(os.path.join(model_path, 'configuration_mpt.py')):
-                    shutil.copyfile(os.path.join(model_base, 'configuration_mpt.py'), os.path.join(model_path, 'configuration_mpt.py'))
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=True)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-                model = LlavaMptForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
-            elif is_qwen:
-                tokenizer = AutoTokenizer.from_pretrained(model_base)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+            if family == "mpt" and not os.path.isfile(os.path.join(model_path, "configuration_mpt.py")):
+                shutil.copyfile(
+                    os.path.join(model_base, "configuration_mpt.py"),
+                    os.path.join(model_path, "configuration_mpt.py"),
+                )
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=tokenizer_fast)
+            cfg_pretrained = llava_cls.config_class.from_pretrained(
+                model_path, trust_remote_code=(family == "mpt")
+            )
+            model = llava_cls.from_pretrained(
+                model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs
+            )
 
             mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
         else:
-            if 'mpt' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-                model = LlavaMptForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
-            elif is_qwen:
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
-                model = LlavaQwenForCausalLM.from_pretrained(
-                    model_path,
-                    low_cpu_mem_usage=True,
-                    **kwargs
-                )
-            elif 'mistral' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
-                model = LlavaMistralForCausalLM.from_pretrained(
-                    model_path,
-                    low_cpu_mem_usage=True,
-                    **kwargs
-                )
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(
-                    model_path,
-                    low_cpu_mem_usage=True,
-                    **kwargs
-                )
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=tokenizer_fast)
+            model = llava_cls.from_pretrained(
+                model_path,
+                low_cpu_mem_usage=True,
+                **kwargs
+            )
     else:
         # Load language model
         if model_base is not None:
             # PEFT model
             from peft import PeftModel
-            if is_qwen:
-                tokenizer = AutoTokenizer.from_pretrained(model_base)
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=tokenizer_fast)
             model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
@@ -188,23 +181,20 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             print('Convert to FP16...')
             model.to(torch.float16)
         else:
-            use_fast = False
-            if 'mpt' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
-            elif is_qwen:
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=tokenizer_fast)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
+            )
 
-    if is_qwen:
-        _set_qwen_pad_token(tokenizer, model)
+    if family in ("qwen2", "qwen3", "gemma3_text", "phi3"):
+        _set_generation_pad_token(
+            tokenizer, model,
+            include_pad_as_eos=family in ("qwen2", "qwen3"),
+        )
 
     image_processor = None
 
-    if 'llava' in model_name.lower():
+    if is_llava:
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
         if mm_use_im_patch_token:

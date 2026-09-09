@@ -62,7 +62,7 @@ class Conversation:
                 else:
                     ret += role + ":"
         elif self.sep_style == SeparatorStyle.MPT:
-            ret = self.system + self.sep
+            ret = self.system + self.sep if self.system else ""
             for role, message in messages:
                 if message:
                     if type(message) is tuple:
@@ -380,6 +380,37 @@ You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
     sep="<|im_end|>\n",
 )
 
+conv_qwen3 = Conversation(
+    system="""<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
+    roles=("<|im_start|>user\n", "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+    version="qwen3",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|im_end|>\n",
+)
+
+conv_gemma3 = Conversation(
+    system="",
+    roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
+    version="gemma3",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<end_of_turn>\n",
+)
+
+conv_phi3 = Conversation(
+    system="",
+    roles=("<|user|>\n", "<|assistant|>\n"),
+    version="phi3",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|end|>\n",
+)
+
 conv_llama_3_1 = Conversation(
     # Do not include literal <|begin_of_text|>; Llama tokenizers add BOS when
     # LLaVA calls tokenizer(...), and tokenizer_image_token preserves it.
@@ -406,6 +437,9 @@ conv_templates = {
     "mistral_direct": conv_chatml_direct,
     "qwen2": conv_qwen2,
     "qwen2_5": conv_qwen2,
+    "qwen3": conv_qwen3,
+    "gemma3": conv_gemma3,
+    "phi3": conv_phi3,
     "llama3": conv_llama_3_1,
     "llama_3": conv_llama_3_1,
     "llama3_1": conv_llama_3_1,

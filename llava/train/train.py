@@ -34,6 +34,10 @@ from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
 from llava import conversation as conversation_lib
 from llava.model import *
+from llava.model.backbones import (
+    as_llava_config, backbone_type, default_conversation, get_llava_model_class,
+    is_llama3, use_fast_tokenizer,
+)
 from llava.model.llava_arch import validate_cka_loss_tau
 from llava.mm_utils import tokenizer_image_token
 
@@ -109,7 +113,7 @@ class ModelArguments:
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for LLM hidden-state CKA against the raw vision-encoder features. Defaults to cka_loss_weight for backward compatibility."})
     # CKA has two terms: projector CKA always follows `cka_loss`, while this
     # option selects LLM hidden states compared to the raw vision reference.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA against the same raw vision-encoder features, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden CKA is supported by LLaMA/Qwen; Mistral/MPT use projector CKA only."})
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA against the same raw vision-encoder features, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden CKA is supported by LLaMA, Qwen2/3, Gemma3 and Phi3; Mistral/MPT use projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
@@ -672,7 +676,7 @@ def preprocess_qwen(
         if roles[source[0]["from"]] != conv.roles[0]:
             source = source[1:]
 
-        prompt = conv.system + conv.sep
+        prompt = conv.system + conv.sep if conv.system else ""
         assistant_spans = []
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
@@ -772,7 +776,7 @@ def preprocess(
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version == "qwen2":
+    if conversation_lib.default_conversation.version in ("qwen2", "qwen3", "gemma3", "phi3"):
         return preprocess_qwen(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "llama3":
         return preprocess_llama3(sources, tokenizer, has_image=has_image)
@@ -990,7 +994,7 @@ def train(attn_implementation=None):
     validate_vsp_gradient_config(model_args)
     if vsp_gradient_requested and not model_args.cka_loss:
         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
-    if vsp_gradient_requested and training_args.gradient_checkpointing:
+    if (vsp_gradient_requested or model_args.cka_loss) and training_args.gradient_checkpointing:
         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
             raise ValueError(
                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
@@ -998,12 +1002,21 @@ def train(attn_implementation=None):
             )
         checkpointing_kwargs = dict(training_args.gradient_checkpointing_kwargs or {})
         if checkpointing_kwargs.get("use_reentrant", True):
-            rank0_print("VSP gradient controller: setting gradient checkpointing to use_reentrant=False.")
+            rank0_print("CKA/VSP: setting gradient checkpointing to use_reentrant=False.")
         checkpointing_kwargs["use_reentrant"] = False
         training_args.gradient_checkpointing_kwargs = checkpointing_kwargs
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-    model_name_lower = model_args.model_name_or_path.lower()
-    is_llama3_model = "llama-3" in model_name_lower or "llama3" in model_name_lower
+    backbone_config = transformers.AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        trust_remote_code=True,
+        force_download=model_args.force_download,
+    )
+    family = backbone_type(backbone_config)
+    is_llama3_model = is_llama3(backbone_config)
+    if model_args.version == "auto":
+        model_args.version = default_conversation(backbone_config)
+        rank0_print(f"Using conversation template {model_args.version!r} for {family}.")
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -1020,71 +1033,39 @@ def train(attn_implementation=None):
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=training_args.double_quant,
-                bnb_4bit_quant_type=training_args.quant_type # {'fp4', 'nf4'}
+                bnb_4bit_quant_type=training_args.quant_type
             )
         ))
 
+    common_load_kwargs = dict(
+        cache_dir=training_args.cache_dir,
+        force_download=model_args.force_download,
+        **bnb_model_from_pretrained_args,
+    )
     if model_args.vision_tower is not None:
-        if 'mpt' in model_name_lower:
-            config = transformers.AutoConfig.from_pretrained(
-                model_args.model_name_or_path,
-                trust_remote_code=True,
-                force_download=model_args.force_download,
-            )
-            config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMptForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                config=config,
-                cache_dir=training_args.cache_dir,
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
-            )
-        elif 'qwen' in model_name_lower:
-            model = LlavaQwenForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
-            )
-        elif 'mistral' in model_name_lower:
-            model = LlavaMistralForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
-            )
+        model_cls = get_llava_model_class(backbone_config)
+        config = as_llava_config(backbone_config)
+        if family == "mpt":
+            config.attn_config["attn_impl"] = training_args.mpt_attn_impl
         else:
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
+            common_load_kwargs.update(
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
             )
+        model = model_cls.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            **common_load_kwargs,
+        )
     else:
-        if 'qwen' in model_name_lower:
-            model = transformers.AutoModelForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
-            )
-        else:
-            model = transformers.LlamaForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                force_download=model_args.force_download,
-                **bnb_model_from_pretrained_args
-            )
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            trust_remote_code=True,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **common_load_kwargs,
+        )
+    model.config.llava_conversation_version = model_args.version
 
     if attn_implementation == "flash_attention_2" and training_args.bits not in [4, 8]:
         if not torch.cuda.is_available():
@@ -1257,31 +1238,15 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if 'mpt' in model_name_lower:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            force_download=model_args.force_download,
-        )
-    elif 'qwen' in model_name_lower:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            force_download=model_args.force_download,
-        )
-    else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=is_llama3_model,
-            force_download=model_args.force_download,
-        )
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=use_fast_tokenizer(backbone_config),
+        trust_remote_code=True,
+        force_download=model_args.force_download,
+    )
 
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -1293,7 +1258,7 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        if 'qwen' in model_name_lower:
+        if family in ("qwen2", "qwen3", "gemma3_text", "phi3"):
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
             if tokenizer.pad_token_id is not None:

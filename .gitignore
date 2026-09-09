@@ -27,6 +27,12 @@ ckpts*
 playground
 lmms-eval
 scripts
+!/scripts/
+/scripts/*
+!/scripts/v1_5/
+/scripts/v1_5/*
+!/scripts/v1_5/pretrain_backbone.sh
+!/scripts/v1_5/finetune_backbone.sh
 
 .ipynb_checkpoints
 *.ipynb

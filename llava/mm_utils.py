@@ -227,14 +227,46 @@ def get_generation_config_kwargs(model):
     return kwargs
 
 
-def maybe_override_qwen_conv_mode(args, model_name):
-    if "qwen" not in str(model_name).lower():
+def infer_conversation_mode(model_name, model_config=None):
+    stored = getattr(model_config, "llava_conversation_version", None)
+    if stored and stored != "auto":
+        return stored
+
+    if model_config is not None:
+        from llava.model.backbones import default_conversation
+        try:
+            return default_conversation(model_config)
+        except (KeyError, ValueError):
+            pass
+
+    name = str(model_name).lower()
+    if "qwen3" in name:
+        return "qwen3"
+    if "qwen" in name:
+        return "qwen2"
+    if "gemma-3" in name or "gemma3" in name:
+        return "gemma3"
+    if "phi-3" in name or "phi3" in name:
+        return "phi3"
+    if "llama-3" in name or "llama3" in name:
+        return "llama3"
+    if "llama-2" in name:
+        return "llava_llama_2"
+    if "mistral" in name:
+        return "mistral_instruct"
+    if "mpt" in name:
+        return "mpt"
+    return None
+
+
+def maybe_override_qwen_conv_mode(args, model_name, model_config=None):
+    inferred = infer_conversation_mode(model_name, model_config)
+    if inferred is None:
         return
 
     if getattr(args, "conv_mode", None) in (None, "llava_v1", "vicuna_v1", "llava_v0"):
-        args.conv_mode = "qwen2"
-        print("Auto switching conversation mode to qwen2 for Qwen model.")
-
+        args.conv_mode = inferred
+        print(f"Auto switching conversation mode to {inferred} for {model_name}.")
 
 def get_model_name_from_path(model_path):
     model_path = model_path.strip("/")
