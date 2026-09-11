@@ -776,7 +776,9 @@ def preprocess(
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version in ("qwen2", "qwen3", "gemma3", "phi3"):
+    if conversation_lib.default_conversation.version in (
+        "qwen2", "qwen3", "qwen3_instruct", "gemma3", "phi3", "tinyllama"
+    ):
         return preprocess_qwen(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "llama3":
         return preprocess_llama3(sources, tokenizer, has_image=has_image)

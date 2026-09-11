@@ -34,6 +34,11 @@ scripts
 !/scripts/v1_5/pretrain_backbone.sh
 !/scripts/v1_5/finetune_backbone.sh
 /scripts/v1_5/7b/*.sh
+eval_results
+cka_results
+analysis
+images
+llava/eval/motivation_analysis.py
 
 .ipynb_checkpoints
 *.ipynb

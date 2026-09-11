@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Required by Phi-3.5 with sentencepiece 0.1.99 and protobuf 6.x.
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="${PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION:-python}"
+
 if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     echo "Activate the project environment first (transformers==4.51.3)." >&2
     exit 1

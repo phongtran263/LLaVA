@@ -2,6 +2,7 @@ import unittest
 
 import transformers
 
+from llava import conversation as conversation_lib
 from llava.mm_utils import infer_conversation_mode
 from llava.model.backbones import (
     as_llava_config,
@@ -54,6 +55,39 @@ class BackboneRegistryTests(unittest.TestCase):
         self.assertEqual(infer_conversation_mode("Qwen3-4B"), "qwen3")
         self.assertEqual(infer_conversation_mode("gemma-3-1b-it"), "gemma3")
         self.assertEqual(infer_conversation_mode("Phi-3.5-mini-instruct"), "phi3")
+
+    def test_named_model_variants_use_their_native_chat_format(self):
+        tinyllama = transformers.LlamaConfig(vocab_size=32000)
+        tinyllama._name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        self.assertEqual(default_conversation(tinyllama), "tinyllama")
+        self.assertEqual(
+            infer_conversation_mode(tinyllama._name_or_path, tinyllama),
+            "tinyllama",
+        )
+
+        if hasattr(transformers, "Qwen3Config"):
+            qwen3_instruct = transformers.Qwen3Config()
+            qwen3_instruct._name_or_path = "Qwen/Qwen3-4B-Instruct-2507"
+            self.assertEqual(default_conversation(qwen3_instruct), "qwen3_instruct")
+            self.assertEqual(
+                infer_conversation_mode(qwen3_instruct._name_or_path, qwen3_instruct),
+                "qwen3_instruct",
+            )
+
+    def test_variant_prompt_tokens(self):
+        qwen3 = conversation_lib.conv_templates["qwen3_instruct"].copy()
+        qwen3.append_message(qwen3.roles[0], "question")
+        qwen3.append_message(qwen3.roles[1], "answer")
+        qwen3_prompt = qwen3.get_prompt()
+        self.assertIn("<|im_start|>assistant\nanswer<|im_end|>", qwen3_prompt)
+        self.assertNotIn("<think>", qwen3_prompt)
+
+        tinyllama = conversation_lib.conv_templates["tinyllama"].copy()
+        tinyllama.append_message(tinyllama.roles[0], "question")
+        tinyllama.append_message(tinyllama.roles[1], "answer")
+        tinyllama_prompt = tinyllama.get_prompt()
+        self.assertIn("<|user|>\nquestion</s>", tinyllama_prompt)
+        self.assertIn("<|assistant|>\nanswer</s>", tinyllama_prompt)
 
 
 if __name__ == "__main__":

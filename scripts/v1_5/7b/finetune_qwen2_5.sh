@@ -1,13 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
+# Required by Phi-3.5 with sentencepiece 0.1.99 and protobuf 6.x.
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="${PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION:-python}"
+
 if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     echo "Please activate the Qwen training conda env first, e.g. conda activate llava-qwen" >&2
     exit 1
 fi
 
-PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/qwen-1.5b-cka-grad/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/qwen-1.5b-cka-grad-last/llava-finetune}"
+: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-7B-Instruct}"
+: "${RUN_NAME:=qwen-7b-base}"
+: "${GPU_INCLUDE:=localhost:3}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=8}"
+: "${GRADIENT_ACCUMULATION_STEPS:=16}"
+
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/${RUN_NAME}/llava-finetune}"
 
 python - <<'PY_CHECK'
 from packaging import version
@@ -16,20 +25,20 @@ import transformers
 
 if version.parse(transformers.__version__) != version.parse("4.51.3"):
     raise SystemExit(
-        f"Qwen2.5 training expects transformers==4.51.3, got {transformers.__version__}. "
-        "Activate llava-qwen or downgrade this env."
+        f"Multibackbone training expects transformers==4.51.3, got {transformers.__version__}. "
+        "Activate the llava1 environment."
     )
 if version.parse(accelerate.__version__) < version.parse("1.6.0"):
     raise SystemExit(
-        f"Qwen2.5 training expects accelerate>=1.6.0 with transformers 4.51.x, got {accelerate.__version__}. "
+        f"Multibackbone training expects accelerate>=1.6.0 with transformers 4.51.x, got {accelerate.__version__}. "
         "Run: conda run -n llava-qwen python -m pip install accelerate==1.6.0"
     )
 PY_CHECK
 
-"${CONDA_PREFIX}/bin/deepspeed" --include localhost:3 llava/train/train_mem.py \
-    --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
-    --version qwen2 \
+"${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
+    --deepspeed "${DEEPSPEED_CONFIG:-./scripts/zero3.json}" \
+    --model_name_or_path "${MODEL_NAME_OR_PATH}" \
+    --version auto \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \
@@ -43,9 +52,9 @@ PY_CHECK
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
     --evaluation_strategy "no" \
     --save_strategy "no" \
     --learning_rate 2e-5 \
@@ -55,14 +64,14 @@ PY_CHECK
     --logging_steps 1 \
     --tf32 True \
     --model_max_length 2048 \
-    --gradient_checkpointing False \
+    --gradient_checkpointing True \
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name qwen-1.5b-cka-grad-finetune \
-    --cka_loss True \
+    --run_name "${RUN_NAME}-finetune" \
+    --cka_loss False \
     --cka_loss_tau 0.0 \
-    --cka_loss_projector_weight 0.1 \
+    --cka_loss_projector_weight 0.0 \
     --cka_loss_final_hidden_weight 0.1 \
     --cka_loss_subset_query_tokens text \
     --vsp_gradient_diagnostics False \
@@ -72,4 +81,4 @@ PY_CHECK
     --vsp_proj_max_grad_ratio 0.5 \
     --vsp_llm_max_grad_ratio 0.5 \
     --vsp_grad_log_interval 10 \
-    --cka_loss_layers "-1"
+    --cka_loss_layers "final"

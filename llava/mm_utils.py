@@ -241,13 +241,15 @@ def infer_conversation_mode(model_name, model_config=None):
 
     name = str(model_name).lower()
     if "qwen3" in name:
-        return "qwen3"
+        return "qwen3_instruct" if "instruct" in name else "qwen3"
     if "qwen" in name:
         return "qwen2"
     if "gemma-3" in name or "gemma3" in name:
         return "gemma3"
     if "phi-3" in name or "phi3" in name:
         return "phi3"
+    if "tinyllama" in name:
+        return "tinyllama"
     if "llama-3" in name or "llama3" in name:
         return "llama3"
     if "llama-2" in name:

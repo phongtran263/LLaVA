@@ -27,7 +27,7 @@ PY_CHECK
     --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
-    --version qwen2 \
+    --version auto \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \

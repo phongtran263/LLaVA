@@ -60,10 +60,16 @@ def use_fast_tokenizer(config):
 
 
 def default_conversation(config):
+    family = backbone_type(config)
+    model_name = str(getattr(config, "_name_or_path", "") or "").lower()
+    if family == "qwen3" and "instruct" in model_name:
+        return "qwen3_instruct"
+    if family == "llama" and "tinyllama" in model_name:
+        return "tinyllama"
     if is_llama3(config):
         return "llama3"
     return {
         "llama": "v1", "qwen2": "qwen2", "qwen3": "qwen3",
         "gemma3_text": "gemma3", "phi3": "phi3",
         "mistral": "mistral_instruct", "mpt": "mpt",
-    }[backbone_type(config)]
+    }[family]

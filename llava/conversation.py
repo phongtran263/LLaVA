@@ -391,6 +391,17 @@ You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
     sep="<|im_end|>\n",
 )
 
+conv_qwen3_instruct = Conversation(
+    system="""<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
+    roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+    version="qwen3_instruct",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|im_end|>\n",
+)
+
 conv_gemma3 = Conversation(
     system="",
     roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
@@ -409,6 +420,17 @@ conv_phi3 = Conversation(
     offset=0,
     sep_style=SeparatorStyle.MPT,
     sep="<|end|>\n",
+)
+
+conv_tinyllama = Conversation(
+    system="""<|system|>
+You are a helpful language and vision assistant.""",
+    roles=("<|user|>\n", "<|assistant|>\n"),
+    version="tinyllama",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="</s>\n",
 )
 
 conv_llama_3_1 = Conversation(
@@ -438,8 +460,10 @@ conv_templates = {
     "qwen2": conv_qwen2,
     "qwen2_5": conv_qwen2,
     "qwen3": conv_qwen3,
+    "qwen3_instruct": conv_qwen3_instruct,
     "gemma3": conv_gemma3,
     "phi3": conv_phi3,
+    "tinyllama": conv_tinyllama,
     "llama3": conv_llama_3_1,
     "llama_3": conv_llama_3_1,
     "llama3_1": conv_llama_3_1,

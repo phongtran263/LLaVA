@@ -1,16 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
+# sentencepiece 0.1.99 bundles protobuf bindings that are incompatible with
+# protobuf 6.x's C++ runtime. Phi-3.5's tokenizer imports those bindings.
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="${PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION:-python}"
+
 if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     echo "Please activate the Qwen training conda env first, e.g. conda activate llava-qwen" >&2
     exit 1
 fi
 
+: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-3B-Instruct}"
+: "${RUN_NAME:=qwen-3b-pretrain}"
+: "${GPU_INCLUDE:=localhost:3}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=16}"
+: "${GRADIENT_ACCUMULATION_STEPS:=16}"
+
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}"
 
-"${CONDA_PREFIX}/bin/deepspeed" --include localhost:3 llava/train/train_mem.py \
+"${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+    --model_name_or_path "${MODEL_NAME_OR_PATH}" \
     --force_download False \
     --version plain \
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
@@ -24,13 +34,11 @@ OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 16 \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
     --eval_strategy  "no" \
-    --save_strategy "steps" \
-    --save_steps 24000 \
-    --save_total_limit 1 \
+    --save_strategy "no" \
     --learning_rate 1e-3 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
@@ -42,7 +50,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name qwen-3b-pretrain \
+    --run_name "${RUN_NAME}" \
     --cka_loss False \
     --cka_loss_tau 0.0 \
     --cka_loss_weight 1.0 \
