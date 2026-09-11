@@ -33,6 +33,7 @@ scripts
 /scripts/v1_5/*
 !/scripts/v1_5/pretrain_backbone.sh
 !/scripts/v1_5/finetune_backbone.sh
+/scripts/v1_5/7b/*.sh
 
 .ipynb_checkpoints
 *.ipynb
