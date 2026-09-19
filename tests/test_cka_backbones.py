@@ -284,11 +284,11 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                 )
 
 
-    def test_hidden_vision_reference_regularizes_llama_and_qwen(self):
+    def test_hidden_pre_ffn_cka_regularizes_supported_backbones(self):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
+            if name in {"llama", "mistral", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -326,11 +326,11 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                     all(torch.isfinite(grad).all() for grad in nonzero_hidden_grads)
                 )
 
-    def test_all_selected_hiddens_use_same_raw_vision_reference(self):
+    def test_selected_layers_use_local_detached_pre_ffn_references_and_dedupe_final(self):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
+            if name in {"llama", "mistral", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -341,7 +341,6 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                 config.cka_loss_final_hidden_weight = 1.0
                 model = model_cls(config).train()
                 vision_tower = _FakeVisionTower()
-                vision_tower.features.requires_grad_(True)
                 model.get_model().vision_tower = vision_tower
                 model.get_model().mm_projector = _projector()
 
@@ -358,9 +357,8 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                         layer_hidden_states,
                         vision_feature_mask,
                     ))
-                    # Keep the synthetic loss connected only to the selected
-                    # hidden target. The raw vision endpoint must be a detached
-                    # reference, not another optimization target.
+                    # Keep the synthetic loss connected only to H_k. The local
+                    # pre-FFN_k endpoint must be a stop-gradient reference.
                     return projected_features.float().square().mean()
 
                 model._compute_masked_linear_cka_loss = record_masked_cka
@@ -370,56 +368,42 @@ class CkaBackboneSmokeTests(unittest.TestCase):
 
                 output = model(input_ids=input_ids, labels=labels, images=images)
 
-                self.assertEqual(len(recorded_calls), 3)
+                # With two decoder blocks, "final" aliases layer 2 rather than
+                # adding the final transition a second time.
+                self.assertEqual(len(recorded_calls), 2)
                 target_hiddens = [call[0] for call in recorded_calls]
-                vision_references = [call[1] for call in recorded_calls]
+                pre_ffn_references = [call[1] for call in recorded_calls]
                 vision_masks = [call[2] for call in recorded_calls]
 
                 self.assertTrue(all(hidden.shape[-1] == 16 for hidden in target_hiddens))
                 self.assertTrue(all(hidden.requires_grad for hidden in target_hiddens))
-                self.assertTrue(all(reference.shape[-1] == 6 for reference in vision_references))
-                self.assertTrue(all(not reference.requires_grad for reference in vision_references))
-                self.assertTrue(all(reference.grad_fn is None for reference in vision_references))
+                self.assertTrue(all(reference.shape[-1] == 16 for reference in pre_ffn_references))
+                self.assertTrue(all(not reference.requires_grad for reference in pre_ffn_references))
+                self.assertTrue(all(reference.grad_fn is None for reference in pre_ffn_references))
 
-                first_reference = vision_references[0]
                 first_mask = vision_masks[0]
                 self.assertEqual(int(first_mask.sum().item()), vision_tower.features.shape[0])
-                self.assertTrue(torch.equal(
-                    first_reference[first_mask],
-                    vision_tower.features.detach(),
-                ))
-                for reference, mask in zip(vision_references[1:], vision_masks[1:]):
-                    self.assertEqual(
-                        reference.untyped_storage().data_ptr(),
-                        first_reference.untyped_storage().data_ptr(),
-                    )
-                    self.assertTrue(torch.equal(reference, first_reference))
+                for mask in vision_masks[1:]:
                     self.assertTrue(torch.equal(mask, first_mask))
 
-                target_storage_ptrs = {
-                    hidden.untyped_storage().data_ptr()
-                    for hidden in target_hiddens
-                }
-                self.assertNotIn(
-                    first_reference.untyped_storage().data_ptr(),
-                    target_storage_ptrs,
-                )
+                # Each block owns a different local pre-FFN transition; the old
+                # implementation incorrectly reused one raw vision reference.
+                self.assertFalse(torch.equal(pre_ffn_references[0], pre_ffn_references[1]))
                 self.assertEqual(
                     list(model.last_cka_per_layer_losses),
                     [
-                        "vision_encoder_to_layer_1",
-                        "vision_encoder_to_layer_2",
-                        "vision_encoder_to_final",
+                        "pre_ffn_to_layer_1",
+                        "pre_ffn_to_layer_2",
                     ],
                 )
                 self.assertEqual(len(output.aux_losses), 1)
 
-    def test_selected_hidden_cka_rejects_spatial_list_and_5d_images(self):
+    def test_selected_hidden_cka_accepts_spatial_list_and_5d_images(self):
         input_ids = torch.tensor([[1, IMAGE_TOKEN_INDEX, 2, 3]])
         labels = input_ids.clone()
         image_inputs = {
-            "list": [torch.randn(2, 3, 2, 2)],
-            "5d": torch.randn(1, 2, 3, 2, 2),
+            "list": [torch.randn(1, 3, 2, 2)],
+            "5d": torch.randn(1, 1, 3, 2, 2),
         }
 
         for input_kind, images in image_inputs.items():
@@ -441,18 +425,18 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                 model.get_model().vision_tower = _FakeVisionTower()
                 model.get_model().mm_projector = _projector()
 
-                with self.assertRaisesRegex(
-                    ValueError,
-                    r"Vision-referenced LLM CKA currently requires "
-                    r"mm_patch_merge_type='flat'",
-                ):
-                    model(input_ids=input_ids, labels=labels, images=images)
+                output = model(input_ids=input_ids, labels=labels, images=images)
+                self.assertTrue(torch.isfinite(output.loss))
+                self.assertEqual(output.projector_cka_loss.item(), 0.0)
+                self.assertEqual(len(output.aux_losses), 1)
+                self.assertTrue(torch.isfinite(output.aux_losses[0]))
+                self.assertGreater(output.aux_losses[0].item(), 0.0)
 
-    def test_final_only_mode_skips_projector_cka_for_llama_and_qwen(self):
+    def test_final_only_mode_skips_projector_cka_for_supported_backbones(self):
         supported = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"llama", "qwen2", "qwen3", "gemma3", "phi3"}
+            if name in {"llama", "mistral", "qwen2", "qwen3", "gemma3", "phi3"}
         }
         for name, (model_cls, config_factory) in supported.items():
             with self.subTest(backbone=name):
@@ -479,11 +463,11 @@ class CkaBackboneSmokeTests(unittest.TestCase):
                 self.assertEqual(len(output.aux_losses), 1)
                 self.assertGreater(output.aux_losses[0].item(), 0.0)
 
-    def test_projector_only_backbones_warn_once_for_hidden_layer_config(self):
+    def test_mpt_warns_once_for_unsupported_hidden_layer_config(self):
         projector_only = {
             name: (model_cls, config_factory)
             for name, model_cls, config_factory in _backbone_factories()
-            if name in {"mistral", "mpt"}
+            if name == "mpt"
         }
         for name, (model_cls, config_factory) in projector_only.items():
             with self.subTest(backbone=name):

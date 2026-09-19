@@ -189,9 +189,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         seen = set()
 
         def add_final():
-            key = ("final", None)
+            # ``final`` aliases the last decoder block transition. Use the same
+            # key as its numeric index so "N,final" is not counted twice.
+            if num_layers <= 0:
+                return
+            key = ("layer", num_layers)
             if key not in seen:
-                specs.append({"kind": "final", "name": "final", "layer_idx": None})
+                specs.append({"kind": "final", "name": "final", "layer_idx": num_layers})
                 seen.add(key)
 
         def add_layer(layer_idx):
@@ -247,26 +251,40 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         return specs
 
-    def _register_cka_layer_hooks(self, cka_layer_specs, captured_layer_hiddens):
+    def _register_cka_layer_hooks(
+        self,
+        cka_layer_specs,
+        captured_layer_hiddens,
+        captured_pre_ffn_hiddens,
+    ):
         layers = getattr(self.get_model(), "layers", None)
         if layers is None:
             return []
 
         handles = []
         for spec in cka_layer_specs:
-            if spec["kind"] != "layer":
-                continue
-            layer_idx = spec["layer_idx"]
+            # ``final`` is the local transition of the last decoder block.
+            layer_idx = len(layers) if spec["kind"] == "final" else spec["layer_idx"]
             if layer_idx is None or layer_idx < 1 or layer_idx > len(layers):
                 continue
             layer_name = spec["name"]
+            layer = layers[layer_idx - 1]
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None:
+                continue
 
             def capture_layer_hidden(module, module_inputs, module_outputs, layer_name=layer_name):
                 hidden_states = module_outputs[0] if isinstance(module_outputs, (tuple, list)) else module_outputs
                 if torch.is_tensor(hidden_states):
                     captured_layer_hiddens[layer_name] = hidden_states
 
-            handles.append(layers[layer_idx - 1].register_forward_hook(capture_layer_hidden))
+            def capture_pre_ffn_hidden(module, module_inputs, layer_name=layer_name):
+                # This is the actual (normalized) tensor passed into FFN_k.
+                if module_inputs and torch.is_tensor(module_inputs[0]):
+                    captured_pre_ffn_hiddens[layer_name] = module_inputs[0]
+
+            handles.append(layer.register_forward_hook(capture_layer_hidden))
+            handles.append(mlp.register_forward_pre_hook(capture_pre_ffn_hidden))
 
         return handles
 
@@ -278,25 +296,24 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states=None,
     ):
         for spec in cka_layer_specs:
-            if spec["kind"] == "final":
+            hidden_states = captured_layer_hiddens.get(spec["name"])
+            if hidden_states is None and spec["kind"] == "final":
                 hidden_states = final_hidden
-            else:
-                hidden_states = captured_layer_hiddens.get(spec["name"])
-                if hidden_states is None and output_hidden_states is not None:
-                    layer_idx = spec["layer_idx"]
-                    if layer_idx is not None and 0 <= layer_idx < len(output_hidden_states):
-                        hidden_states = output_hidden_states[layer_idx]
+            if hidden_states is None and output_hidden_states is not None:
+                layer_idx = spec["layer_idx"]
+                if layer_idx is not None and 0 <= layer_idx < len(output_hidden_states):
+                    hidden_states = output_hidden_states[layer_idx]
 
             if torch.is_tensor(hidden_states):
                 yield spec["name"], hidden_states
 
-    def _compute_cka_vision_reference_losses(
+    def _compute_cka_pre_ffn_losses(
         self,
         cka_layer_specs,
         captured_layer_hiddens,
+        captured_pre_ffn_hiddens,
         final_hidden,
         output_hidden_states,
-        vision_encoder_features,
         vision_feature_mask,
         output_device,
     ):
@@ -311,15 +328,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if not ordered_hiddens:
             return layer_losses, per_layer_losses
 
-        vision_reference = vision_encoder_features.detach()
         for layer_name, layer_hidden in ordered_hiddens:
+            pre_ffn_hidden = captured_pre_ffn_hiddens.get(layer_name)
+            if not torch.is_tensor(pre_ffn_hidden):
+                raise RuntimeError(f"Missing pre-FFN activation for CKA layer {layer_name}")
             layer_loss = self._compute_masked_linear_cka_loss(
                 projected_features=layer_hidden,
-                layer_hidden_states=vision_reference,
+                layer_hidden_states=pre_ffn_hidden.detach(),
                 vision_feature_mask=vision_feature_mask,
             ).to(output_device)
             layer_losses.append(layer_loss)
-            per_layer_losses[f"vision_encoder_to_{layer_name}"] = layer_loss.detach()
+            per_layer_losses[f"pre_ffn_to_{layer_name}"] = layer_loss.detach()
 
         return layer_losses, per_layer_losses
 
@@ -793,11 +812,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
         captured_cka_layer_hiddens = {}
+        captured_cka_pre_ffn_hiddens = {}
         cka_layer_hook_handles = []
         if llm_cka_enabled:
             cka_layer_hook_handles = self._register_cka_layer_hooks(
                 cka_layer_specs,
                 captured_cka_layer_hiddens,
+                captured_cka_pre_ffn_hiddens,
             )
 
         attention_subset_hook_handle = None
@@ -896,17 +917,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None and pre_projector_features is not None:
-                # Every selected LLM hidden state uses the same detached, aligned
-                # raw vision-encoder features as its CKA reference. Gradients follow
-                # each hidden target through preceding LLM blocks and the projector.
+            if vision_feature_mask is not None:
+                # Local layer objective: CKA(sg(pre-FFN_k), H_k). Only the
+                # pre-FFN reference branch is detached; gradients through H_k
+                # still reach FFN_k, earlier decoder blocks, and the projector.
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                layer_losses, per_layer_losses = self._compute_cka_vision_reference_losses(
+                layer_losses, per_layer_losses = self._compute_cka_pre_ffn_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
+                    captured_pre_ffn_hiddens=captured_cka_pre_ffn_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
-                    vision_encoder_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )

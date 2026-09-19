@@ -20,6 +20,12 @@ fi
 
 export PYTHONNOUSERSITE=1
 CKA_LOSS_SUBSET_QUERY_TOKENS="${CKA_LOSS_SUBSET_QUERY_TOKENS:-text}"
+CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
+MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-coupling1x_gelu}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/7b-cka-grad-${MM_PROJECTOR_TYPE}}"
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-${CHECKPOINT_ROOT}/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-finetune}"
+RUN_NAME="${RUN_NAME:-7b-cka-grad-${MM_PROJECTOR_TYPE}-finetune}"
 
 "${CONDA_PREFIX}/bin/deepspeed" --include localhost:0,1 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -28,15 +34,15 @@ CKA_LOSS_SUBSET_QUERY_TOKENS="${CKA_LOSS_SUBSET_QUERY_TOKENS:-text}"
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \
-    --pretrain_mm_mlp_adapter ./checkpoints/7b-cka-grad/llava-pretrain/mm_projector.bin \
-    --mm_projector_type mlp2x_gelu \
+    --pretrain_mm_mlp_adapter "${PRETRAIN_ADAPTER}" \
+    --mm_projector_type "${MM_PROJECTOR_TYPE}" \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/7b-cka-grad/llava-finetune \
+    --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
@@ -56,13 +62,14 @@ CKA_LOSS_SUBSET_QUERY_TOKENS="${CKA_LOSS_SUBSET_QUERY_TOKENS:-text}"
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name 7b-cka-grad-finetune \
+    --run_name "${RUN_NAME}" \
     --cka_loss True \
     --use_pcgrad False \
     --vsp_asymmetric_pcgrad True \
     --vsp_apply_to_projector_only True \
     --cka_loss_projector_weight 0.1 \
     --cka_loss_final_hidden_weight 0.1 \
+    --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --cka_loss_subset_query_tokens "${CKA_LOSS_SUBSET_QUERY_TOKENS}" \
     --cka_loss_layers "-1" \
     # --cka_loss_subset_select_layer 9 \

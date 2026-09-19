@@ -29,7 +29,11 @@ import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer, sanitize_generation_config_for_save
+from llava.train.llava_trainer import (
+    LLaVATrainer,
+    sanitize_generation_config_for_save,
+    validate_cka_loss_start_ratio,
+)
 from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
 from llava import conversation as conversation_lib
@@ -110,10 +114,11 @@ class ModelArguments:
     cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
-    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for LLM hidden-state CKA against the raw vision-encoder features. Defaults to cka_loss_weight for backward compatibility."})
-    # CKA has two terms: projector CKA always follows `cka_loss`, while this
-    # option selects LLM hidden states compared to the raw vision reference.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA against the same raw vision-encoder features, e.g. '8,16,24,final'. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Hidden CKA is supported by LLaMA, Qwen2/3, Gemma3 and Phi3; Mistral/MPT use projector CKA only."})
+    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(pre-FFN_k), H_k). The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
+    cka_loss_start_ratio: float = field(default=0.0, metadata={"help": "Fraction of total optimizer steps to complete before enabling all CKA losses. Use 0.8 for CKA only during the final 20%; 0.0 preserves immediate CKA."})
+    # Projector CKA remains vision-to-projector. Numeric layer CKA is local to
+    # each selected decoder block and uses its detached FFN input as reference.
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA(sg(pre-FFN_k), H_k), e.g. '8,16,24,final'. 'final' aliases the last decoder block. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Layer CKA is supported by LLaMA, Qwen2/3, Gemma3, Phi3 and Mistral; MPT uses projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
@@ -460,6 +465,13 @@ def preprocess_llama_2(
             else:
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+            # New non-legacy SentencePiece tokenizers add a BOS token whenever
+            # a round is tokenized in isolation. The complete conversation has
+            # only one BOS, so remove the extra token from later rounds.
+            if i != 0 and not getattr(tokenizer, "legacy", True) and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len -= 1
+                instruction_len -= 1
 
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
@@ -1102,6 +1114,10 @@ def train(attn_implementation=None):
         if model_args.cka_loss_final_hidden_weight is not None
         else float(model_args.cka_loss_weight)
     )
+    model.config.cka_loss_start_ratio = validate_cka_loss_start_ratio(
+        model_args.cka_loss_start_ratio
+    )
+    model.config.cka_loss_reference = "pre_ffn"
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
     model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
     cka_subset_query_tokens = str(model_args.cka_loss_subset_query_tokens or "text").lower().replace("_", "-")
@@ -1128,11 +1144,9 @@ def train(attn_implementation=None):
         )
     model.config.cka_loss_subset_fallback_mass = max(0.0, min(1.0, float(model_args.cka_loss_subset_fallback_mass)))
     model.config.cka_loss_subset_otsu_min_separability = max(0.0, min(1.0, float(model_args.cka_loss_subset_otsu_min_separability)))
-    # cka_loss_layers accepts comma-separated 1-based decoder layer indices plus
-    # the special final/pre-norm hidden state. It also accepts "all", which
-    # expands to every transformer block output, and interval shorthands such as
-    # "every4" or "interval:4". The requested hidden states are regularized as a
-    # set against the same aligned, detached raw vision-encoder features.
+    # cka_loss_layers accepts comma-separated 1-based decoder layer indices.
+    # ``final`` aliases the last block; interval shorthands expand to multiple
+    # blocks. Each selected k uses CKA(sg(pre-FFN_k), H_k).
     if model_args.cka_loss_layers:
         cka_loss_layers_arg = model_args.cka_loss_layers.strip()
         cka_loss_layers_lower = cka_loss_layers_arg.lower()

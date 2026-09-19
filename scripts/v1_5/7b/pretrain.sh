@@ -6,6 +6,11 @@
 # TinyLlama/TinyLlama-1.1B-Chat-v1.0
 # Qwen/Qwen3-4B-Instruct-2507
 
+MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-coupling1x_gelu}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/7b-cka-grad-${MM_PROJECTOR_TYPE}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-pretrain}"
+RUN_NAME="${RUN_NAME:-7b-cka-grad-${MM_PROJECTOR_TYPE}-pretrain}"
+
 deepspeed --include localhost:3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
@@ -14,13 +19,13 @@ deepspeed --include localhost:3 llava/train/train_mem.py \
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
-    --mm_projector_type mlp2x_gelu \
+    --mm_projector_type "${MM_PROJECTOR_TYPE}" \
     --tune_mm_mlp_adapter True \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/7b-cka-grad/llava-pretrain \
+    --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
@@ -40,12 +45,13 @@ deepspeed --include localhost:3 llava/train/train_mem.py \
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name 7b-cka-grad-pretrain \
+    --run_name "${RUN_NAME}" \
     --cka_loss True \
     --use_pcgrad False \
     --vsp_asymmetric_pcgrad True \
     --vsp_apply_to_projector_only True \
     --cka_loss_weight 0.1 \
+    --cka_loss_start_ratio "${CKA_LOSS_START_RATIO:-0.0}" \
     --cka_loss_layers "-1" \
     --log_gradient_norms False \
     --train_data_fraction ${TRAIN_DATA_FRACTION:-1.0} \

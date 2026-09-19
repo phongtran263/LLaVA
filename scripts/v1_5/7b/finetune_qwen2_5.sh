@@ -9,14 +9,17 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-7B-Instruct}"
-: "${RUN_NAME:=qwen-7b-base}"
+: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-1.5B-Instruct}"
+: "${RUN_NAME:=qwen2.5-1.5b}"
 : "${GPU_INCLUDE:=localhost:3}"
-: "${PER_DEVICE_TRAIN_BATCH_SIZE:=8}"
-: "${GRADIENT_ACCUMULATION_STEPS:=16}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=16}"
+: "${GRADIENT_ACCUMULATION_STEPS:=8}"
+: "${CKA_FINAL_HIDDEN_WEIGHT:=0.1}"
+: "${CKA_LOSS_START_RATIO:=0.0}"
+: "${MM_PROJECTOR_TYPE:=coupling1x_gelu}"
 
-PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/${RUN_NAME}/llava-finetune}"
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/pretrain-coup/${RUN_NAME}-${MM_PROJECTOR_TYPE}/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-coup/${RUN_NAME}-${MM_PROJECTOR_TYPE}/base/llava-finetune}"
 
 python - <<'PY_CHECK'
 from packaging import version
@@ -43,7 +46,7 @@ PY_CHECK
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --pretrain_mm_mlp_adapter "${PRETRAIN_ADAPTER}" \
-    --mm_projector_type mlp2x_gelu \
+    --mm_projector_type "${MM_PROJECTOR_TYPE}" \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
@@ -55,7 +58,7 @@ PY_CHECK
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
-    --evaluation_strategy "no" \
+    --eval_strategy "no" \
     --save_strategy "no" \
     --learning_rate 2e-5 \
     --weight_decay 0. \
@@ -72,7 +75,8 @@ PY_CHECK
     --cka_loss False \
     --cka_loss_tau 0.0 \
     --cka_loss_projector_weight 0.0 \
-    --cka_loss_final_hidden_weight 0.1 \
+    --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
+    --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --cka_loss_subset_query_tokens text \
     --vsp_gradient_diagnostics False \
     --vsp_asymmetric_pcgrad False \
@@ -81,4 +85,4 @@ PY_CHECK
     --vsp_proj_max_grad_ratio 0.5 \
     --vsp_llm_max_grad_ratio 0.5 \
     --vsp_grad_log_interval 10 \
-    --cka_loss_layers "final"
+    --cka_loss_layers "3"

@@ -342,7 +342,10 @@ Pretrain takes around 5.5 hours for LLaVA-v1.5-13B on 8x A100 (80G), due to the 
 Training script with DeepSpeed ZeRO-2: [`pretrain.sh`](https://github.com/haotian-liu/LLaVA/blob/main/scripts/v1_5/pretrain.sh).
 
 - `--mm_projector_type mlp2x_gelu`: the two-layer MLP vision-language connector.
+- `--mm_projector_type coupling1x_gelu`: a linear vision-to-language stem followed by one two-step additive coupling block. It is the cost-comparable replacement for `mlp2x_gelu`; use `couplingNx_gelu` to select `N` coupling blocks.
 - `--vision_tower openai/clip-vit-large-patch14-336`: CLIP ViT-L/14 336px.
+
+The projector type must match between pretraining and finetuning. A coupling projector needs a newly pretrained coupling adapter; an existing `mlp2x_gelu` adapter cannot be loaded into it.
 
 <details>
 <summary>Pretrain takes around 20 hours for LLaVA-7B on 8x V100 (32G)</summary>
@@ -398,6 +401,7 @@ If you are interested in finetuning LLaVA model to your own task/data, please ch
 New options to note:
 
 - `--mm_projector_type mlp2x_gelu`: the two-layer MLP vision-language connector.
+- `--mm_projector_type coupling1x_gelu`: a linear vision-to-language stem followed by one two-step additive coupling block. `couplingNx_gelu` selects `N` coupling blocks. Use the same projector type used to create the pretraining adapter; legacy MLP adapters are incompatible with coupling projectors.
 - `--vision_tower openai/clip-vit-large-patch14-336`: CLIP ViT-L/14 336px.
 - `--image_aspect_ratio pad`: this pads the non-square images to square, instead of cropping them; it slightly reduces hallucination.
 - `--group_by_modality_length True`: this should only be used when your instruction tuning dataset contains both language (e.g. ShareGPT) and multimodal (e.g. LLaVA-Instruct). It makes the training sampler only sample a single modality (either image or language) during training, which we observe to speed up training by ~25%, and does not affect the final outcome.

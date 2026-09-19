@@ -1,5 +1,6 @@
 import math
 import os
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 
@@ -28,6 +29,36 @@ from llava.train.vsp_gradient_controller import (
 
 PCGRAD_EPS = 1e-12
 PCGRAD_STAT_CHUNK_SIZE = 1_048_576
+
+
+def validate_cka_loss_start_ratio(value):
+    """Return a finite CKA start ratio in the closed interval [0, 1]."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"cka_loss_start_ratio must be a number in [0, 1], got {value!r}"
+        ) from exc
+
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(
+            f"cka_loss_start_ratio must be finite and in [0, 1], got {value!r}"
+        )
+    return value
+
+
+def get_cka_loss_schedule_state(enabled, start_ratio, global_step, max_steps):
+    """Return whether CKA is active and its optimizer-step boundary."""
+    start_ratio = validate_cka_loss_start_ratio(start_ratio)
+    global_step = int(global_step)
+    max_steps = int(max_steps)
+    if global_step < 0:
+        raise ValueError(f"global_step must be non-negative, got {global_step}")
+    if max_steps <= 0:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+
+    start_step = int(math.ceil(start_ratio * max_steps))
+    return bool(enabled) and global_step >= start_step, start_step
 
 
 def _empty_pcgrad_stats(reference_tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -441,6 +472,54 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+
+    @contextmanager
+    def _cka_loss_runtime_context(self, model):
+        """Enable CKA only after the configured fraction of optimizer steps.
+
+        The configured flag is temporarily changed for the complete
+        forward/backward operation so inactive steps skip CKA hooks and kernels,
+        including any gradient-checkpoint recomputation. It is restored before
+        checkpoint serialization or the next Trainer operation.
+        """
+        config = self.model.config
+        configured = bool(getattr(config, 'cka_loss', False))
+        start_ratio = validate_cka_loss_start_ratio(
+            getattr(config, 'cka_loss_start_ratio', 0.0)
+        )
+        global_step = int(getattr(self.state, 'global_step', 0) or 0)
+        max_steps = int(getattr(self.state, 'max_steps', 0) or 0)
+        active, start_step = get_cka_loss_schedule_state(
+            configured,
+            start_ratio,
+            global_step,
+            max_steps,
+        )
+
+        self._last_cka_schedule_active = active
+        self._last_cka_schedule_start_step = start_step
+        self._last_cka_schedule_start_ratio = start_ratio
+
+        if not active:
+            for attr_name, value in (
+                ('last_cka_loss', None),
+                ('last_cka_projector_loss', None),
+                ('last_cka_pre_post_loss', None),
+                ('last_cka_pre_final_loss', None),
+                ('last_cka_layers_loss', None),
+                ('last_cka_per_layer_losses', {}),
+                ('last_cka_subset_vision_feature_mask', None),
+                ('last_cka_final_hidden', None),
+                ('last_cka_projector_output', None),
+                ('_aux_losses', []),
+            ):
+                self._set_model_attr(model, attr_name, value)
+
+        config.cka_loss = active
+        try:
+            yield active
+        finally:
+            config.cka_loss = configured
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Keep the existing per-microbatch text/CKA means. The new Trainer's
@@ -1284,9 +1363,18 @@ class LLaVATrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        if is_sagemaker_mp_enabled():
-            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-            return loss_mb.reduce_mean().detach().to(self.args.device)
+        with self._cka_loss_runtime_context(model):
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            return self._training_step_with_cka_runtime_state(
+                model,
+                inputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+    def _training_step_with_cka_runtime_state(self, model, inputs, num_items_in_batch=None):
 
         with self.compute_loss_context_manager():
             if not self.model.config.cka_loss:
@@ -1400,6 +1488,11 @@ class LLaVATrainer(Trainer):
     def log(self, logs, *args, **kwargs):
         logs = dict(logs)
         model = self.model.module if hasattr(self.model, 'module') else self.model
+
+        if hasattr(self, '_last_cka_schedule_active'):
+            logs['cka/schedule_active'] = float(self._last_cka_schedule_active)
+            logs['cka/schedule_start_step'] = float(self._last_cka_schedule_start_step)
+            logs['cka/schedule_start_ratio'] = float(self._last_cka_schedule_start_ratio)
 
         cka_loss = getattr(model, 'last_cka_loss', None)
         text_loss = getattr(model, 'last_text_loss', None)

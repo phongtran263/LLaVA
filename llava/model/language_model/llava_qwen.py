@@ -58,7 +58,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     _get_cka_layer_specs = LlavaLlamaForCausalLM._get_cka_layer_specs
     _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
     _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
-    _compute_cka_vision_reference_losses = LlavaLlamaForCausalLM._compute_cka_vision_reference_losses
+    _compute_cka_pre_ffn_losses = LlavaLlamaForCausalLM._compute_cka_pre_ffn_losses
 
     def __init__(self, config):
         config.model_type = "llava_qwen"
@@ -296,11 +296,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             )
 
         captured_cka_layer_hiddens = {}
+        captured_cka_pre_ffn_hiddens = {}
         cka_layer_hook_handles = []
         if llm_cka_enabled:
             cka_layer_hook_handles = self._register_cka_layer_hooks(
                 cka_layer_specs,
                 captured_cka_layer_hiddens,
+                captured_cka_pre_ffn_hiddens,
             )
 
         attention_subset_hook_handle = None
@@ -397,14 +399,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None and pre_projector_features is not None:
+            if vision_feature_mask is not None:
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                layer_losses, per_layer_losses = self._compute_cka_vision_reference_losses(
+                layer_losses, per_layer_losses = self._compute_cka_pre_ffn_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
+                    captured_pre_ffn_hiddens=captured_cka_pre_ffn_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
-                    vision_encoder_features=pre_projector_features,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )

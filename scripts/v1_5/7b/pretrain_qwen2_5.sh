@@ -10,13 +10,15 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-3B-Instruct}"
-: "${RUN_NAME:=qwen-3b-pretrain}"
+: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-1.5B-Instruct}"
+: "${RUN_NAME:=qwen-1.5b-pretrain}"
 : "${GPU_INCLUDE:=localhost:3}"
-: "${PER_DEVICE_TRAIN_BATCH_SIZE:=16}"
-: "${GRADIENT_ACCUMULATION_STEPS:=16}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=64}"
+: "${GRADIENT_ACCUMULATION_STEPS:=4}"
+: "${CKA_LOSS_START_RATIO:=0.0}"
+: "${MM_PROJECTOR_TYPE:=coupling1x_gelu}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-coup/${RUN_NAME}-${MM_PROJECTOR_TYPE}/llava-pretrain}"
 
 "${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -26,7 +28,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}
     --data_path ./playground/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
-    --mm_projector_type mlp2x_gelu \
+    --mm_projector_type "${MM_PROJECTOR_TYPE}" \
     --tune_mm_mlp_adapter True \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -54,6 +56,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-diag/qwen2.5-3b/llava-pretrain}
     --cka_loss False \
     --cka_loss_tau 0.0 \
     --cka_loss_weight 1.0 \
+    --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --vsp_gradient_diagnostics False \
     --vsp_asymmetric_pcgrad False \
     --vsp_apply_to_projector_only False \

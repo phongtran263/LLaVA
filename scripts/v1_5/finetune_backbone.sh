@@ -13,11 +13,14 @@ fi
 : "${RUN_NAME:?Set RUN_NAME, e.g. qwen3-0.6b}"
 
 GPU_INCLUDE="${GPU_INCLUDE:-localhost:0,1}"
-PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/${RUN_NAME}/llava-finetune}"
+MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-coupling1x_gelu}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/${RUN_NAME}-${MM_PROJECTOR_TYPE}}"
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-${CHECKPOINT_ROOT}/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-finetune}"
 CKA_LOSS="${CKA_LOSS:-False}"
 CKA_PROJECTOR_WEIGHT="${CKA_PROJECTOR_WEIGHT:-0.1}"
 CKA_FINAL_HIDDEN_WEIGHT="${CKA_FINAL_HIDDEN_WEIGHT:-0.1}"
+CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
 CKA_LAYERS="${CKA_LAYERS:-final}"
 VSP_DIAGNOSTICS="${VSP_DIAGNOSTICS:-False}"
 VSP_PCGRAD="${VSP_PCGRAD:-False}"
@@ -31,7 +34,7 @@ VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
     --image_folder "${IMAGE_FOLDER:-./playground/data}" \
     --vision_tower "${VISION_TOWER:-openai/clip-vit-large-patch14-336}" \
     --pretrain_mm_mlp_adapter "${PRETRAIN_ADAPTER}" \
-    --mm_projector_type "${MM_PROJECTOR_TYPE:-mlp2x_gelu}" \
+    --mm_projector_type "${MM_PROJECTOR_TYPE}" \
     --mm_vision_select_layer "${MM_VISION_SELECT_LAYER:--2}" \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
@@ -60,6 +63,7 @@ VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
     --cka_loss "${CKA_LOSS}" \
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
+    --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --cka_loss_layers "${CKA_LAYERS}" \
     --cka_loss_subset_query_tokens "${CKA_SUBSET_QUERY_TOKENS:-text}" \
     --vsp_gradient_diagnostics "${VSP_DIAGNOSTICS}" \
@@ -70,4 +74,3 @@ VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
     --vsp_proj_max_grad_ratio "${VSP_PROJ_MAX_GRAD_RATIO:-0.5}" \
     --vsp_llm_max_grad_ratio "${VSP_LLM_MAX_GRAD_RATIO:-0.5}" \
     --vsp_grad_log_interval "${VSP_GRAD_LOG_INTERVAL:-10}"
-

@@ -27,7 +27,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from .llava_llama import CausalLMOutputWithPastAux
+from .llava_llama import CausalLMOutputWithPastAux, LlavaLlamaForCausalLM
 
 
 _MISTRAL_FORWARD_SUPPORTS_CACHE_POSITION = (
@@ -48,6 +48,11 @@ class LlavaMistralModel(LlavaMetaModel, MistralModel):
 
 class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaMistralConfig
+    _compute_masked_linear_cka_loss = LlavaLlamaForCausalLM._compute_masked_linear_cka_loss
+    _get_cka_layer_specs = LlavaLlamaForCausalLM._get_cka_layer_specs
+    _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
+    _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
+    _compute_cka_pre_ffn_losses = LlavaLlamaForCausalLM._compute_cka_pre_ffn_losses
 
     def __init__(self, config):
         super(MistralForCausalLM, self).__init__(config)
@@ -80,9 +85,16 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         cka_enabled = self.get_model().training and getattr(
             self.get_model().config, 'cka_loss', False
         )
-        if cka_enabled:
-            self.warn_if_projector_only_cka()
+        vision_feature_mask = None
         projector_cka_loss = None
+        self.last_cka_loss = None
+        self.last_cka_projector_loss = None
+        self.last_cka_pre_post_loss = None
+        self.last_cka_pre_final_loss = None
+        self.last_cka_layers_loss = None
+        self.last_cka_per_layer_losses = {}
+        self.last_cka_subset_vision_feature_mask = None
+        self.last_cka_final_hidden = None
 
         if inputs_embeds is None:
             prepared_inputs = self.prepare_inputs_labels_for_multimodal(
@@ -102,7 +114,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
                     past_key_values,
                     inputs_embeds,
                     labels,
-                    _,
+                    vision_feature_mask,
                     projector_cka_loss,
                     _,
                 ) = prepared_inputs
@@ -115,6 +127,22 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
                     inputs_embeds,
                     labels,
                 ) = prepared_inputs
+
+        cka_layer_specs = self._get_cka_layer_specs() if cka_enabled else []
+        hidden_weight = getattr(self.config, 'cka_loss_final_hidden_weight', None)
+        if hidden_weight is None:
+            hidden_weight = getattr(self.config, 'cka_loss_weight', 1.0)
+        llm_cka_enabled = cka_enabled and bool(cka_layer_specs) and float(hidden_weight) != 0.0
+
+        captured_cka_layer_hiddens = {}
+        captured_cka_pre_ffn_hiddens = {}
+        cka_layer_hook_handles = []
+        if llm_cka_enabled:
+            cka_layer_hook_handles = self._register_cka_layer_hooks(
+                cka_layer_specs,
+                captured_cka_layer_hiddens,
+                captured_cka_pre_ffn_hiddens,
+            )
 
         forward_kwargs = dict(
             input_ids=input_ids,
@@ -131,7 +159,11 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         if cache_position is not None and _MISTRAL_FORWARD_SUPPORTS_CACHE_POSITION:
             forward_kwargs["cache_position"] = cache_position
 
-        output = super().forward(**forward_kwargs)
+        try:
+            output = super().forward(**forward_kwargs)
+        finally:
+            for hook_handle in cka_layer_hook_handles:
+                hook_handle.remove()
 
         if not cka_enabled or output.loss is None:
             return output
@@ -141,15 +173,35 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         else:
             projector_cka_loss = projector_cka_loss.to(output.loss.device)
 
-        zero = output.loss.new_zeros(())
-        self.last_cka_loss = projector_cka_loss.detach()
+        cka_layers_loss = output.loss.new_zeros(())
+        if llm_cka_enabled and vision_feature_mask is not None:
+            layer_losses, per_layer_losses = self._compute_cka_pre_ffn_losses(
+                cka_layer_specs=cka_layer_specs,
+                captured_layer_hiddens=captured_cka_layer_hiddens,
+                captured_pre_ffn_hiddens=captured_cka_pre_ffn_hiddens,
+                final_hidden=None,
+                output_hidden_states=output.hidden_states,
+                vision_feature_mask=vision_feature_mask,
+                output_device=output.loss.device,
+            )
+            if layer_losses:
+                cka_layers_loss = torch.stack(layer_losses).sum()
+            self.last_cka_per_layer_losses = per_layer_losses
+
+        if getattr(self.get_model().config, 'log_gradient_norms', False):
+            for spec in cka_layer_specs:
+                if spec['kind'] == 'final':
+                    self.last_cka_final_hidden = captured_cka_layer_hiddens.get(spec['name'])
+                    break
+
+        cka_loss = projector_cka_loss + cka_layers_loss
+        self.last_cka_loss = cka_loss.detach()
         self.last_cka_projector_loss = projector_cka_loss.detach()
         self.last_cka_pre_post_loss = projector_cka_loss.detach()
-        self.last_cka_pre_final_loss = zero.detach()
-        self.last_cka_layers_loss = zero.detach()
-        self.last_cka_per_layer_losses = {}
+        self.last_cka_pre_final_loss = cka_layers_loss.detach()
+        self.last_cka_layers_loss = cka_layers_loss.detach()
         self.last_text_loss = output.loss.detach()
-        self._aux_losses = []
+        self._aux_losses = [cka_layers_loss] if llm_cka_enabled else []
 
         projector_weight = getattr(self.get_model().config, 'cka_loss_projector_weight', None)
         if projector_weight is None:
@@ -162,7 +214,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             hidden_states=None,
             attentions=None,
             projector_cka_loss=projector_cka_loss * projector_weight,
-            aux_losses=[],
+            aux_losses=[cka_layers_loss * hidden_weight] if llm_cka_enabled else [],
         )
 
     @torch.no_grad()
