@@ -21,11 +21,16 @@ fi
 export PYTHONNOUSERSITE=1
 CKA_LOSS_SUBSET_QUERY_TOKENS="${CKA_LOSS_SUBSET_QUERY_TOKENS:-text}"
 CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
+CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
 MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-coupling1x_gelu}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/7b-cka-grad-${MM_PROJECTOR_TYPE}}"
 PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-${CHECKPOINT_ROOT}/llava-pretrain/mm_projector.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-finetune}"
 RUN_NAME="${RUN_NAME:-7b-cka-grad-${MM_PROJECTOR_TYPE}-finetune}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
 
 "${CONDA_PREFIX}/bin/deepspeed" --include localhost:0,1 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -72,6 +77,7 @@ RUN_NAME="${RUN_NAME:-7b-cka-grad-${MM_PROJECTOR_TYPE}-finetune}"
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --cka_loss_subset_query_tokens "${CKA_LOSS_SUBSET_QUERY_TOKENS}" \
     --cka_loss_layers "-1" \
+    "${OPTIONAL_CKA_ARGS[@]}"
     # --cka_loss_subset_select_layer 9 \
     # --cka_loss_subset_min_ratio 0.01 \
     # --cka_loss_subset_max_ratio 0.90 \

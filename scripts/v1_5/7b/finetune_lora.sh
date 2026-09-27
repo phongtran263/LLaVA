@@ -8,6 +8,12 @@
 #   openlm-research/open_llama_3b_v2       -> openllama_v1
 #   mtgv/MobileLLaMA-1.4B-Chat            -> mobilellama_v1
 #   TinyLlama/TinyLlama-1.1B-Chat-v1.0    -> tinyllama_chat
+CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
+
 
 deepspeed --include localhost:0,1 llava/train/train_mem.py \
     --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
@@ -56,4 +62,5 @@ deepspeed --include localhost:0,1 llava/train/train_mem.py \
     --cka_loss_subset_max_ratio 0.90 \
     --cka_loss_subset_fallback_mass 0.90 \
     --cka_loss_subset_otsu_min_separability 0.30 \
+    "${OPTIONAL_CKA_ARGS[@]}"
     # --cka_loss_subset_ratio 0.75 \

@@ -7,9 +7,14 @@
 # Qwen/Qwen3-4B-Instruct-2507
 
 MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-coupling1x_gelu}"
+CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/7b-cka-grad-${MM_PROJECTOR_TYPE}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-pretrain}"
 RUN_NAME="${RUN_NAME:-7b-cka-grad-${MM_PROJECTOR_TYPE}-pretrain}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
 
 deepspeed --include localhost:3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -56,6 +61,7 @@ deepspeed --include localhost:3 llava/train/train_mem.py \
     --log_gradient_norms False \
     --train_data_fraction ${TRAIN_DATA_FRACTION:-1.0} \
     --train_data_seed ${TRAIN_DATA_SEED:-42} \
+    "${OPTIONAL_CKA_ARGS[@]}"
     # --gradient_log_steps 50 \
     # --cka_loss_subset_select_layer 8 \
     # --cka_loss_subset_min_ratio 0.05 \

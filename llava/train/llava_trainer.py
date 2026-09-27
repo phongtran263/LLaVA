@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from torch.utils.data import Sampler
 
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
@@ -59,6 +59,48 @@ def get_cka_loss_schedule_state(enabled, start_ratio, global_step, max_steps):
 
     start_step = int(math.ceil(start_ratio * max_steps))
     return bool(enabled) and global_step >= start_step, start_step
+
+
+def validate_stop_after_step_ratio(value):
+    """Validate an optional fractional optimizer-step stopping point."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"stop_after_step_ratio must be a number in (0, 1), got {value!r}"
+        ) from exc
+
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(
+            f"stop_after_step_ratio must be finite and in (0, 1), got {value!r}"
+        )
+    return value
+
+
+def get_stop_after_step(step_ratio, max_steps):
+    """Return the optimizer step at which a partial full-horizon run stops."""
+    step_ratio = validate_stop_after_step_ratio(step_ratio)
+    max_steps = int(max_steps)
+    if max_steps <= 0:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+    return int(math.ceil(step_ratio * max_steps))
+
+
+class StopAfterStepRatioCallback(TrainerCallback):
+    """Save a resumable checkpoint and stop at a fraction of the full run."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step_ratio = getattr(args, "stop_after_step_ratio", None)
+        if step_ratio is None:
+            return control
+
+        stop_step = get_stop_after_step(step_ratio, state.max_steps)
+        if state.global_step >= stop_step:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
 
 
 def _empty_pcgrad_stats(reference_tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -1511,6 +1553,9 @@ class LLaVATrainer(Trainer):
             logs['loss/cka_pre_final_loss'] = cka_pre_final_loss.item() if torch.is_tensor(cka_pre_final_loss) else float(cka_pre_final_loss)
         if cka_layers_loss is not None:
             logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
+            if (getattr(model.config, 'cka_loss_random_heads', False)
+                    or getattr(model.config, 'cka_loss_head_ids', None)):
+                logs['loss/cka_heads_loss'] = logs['loss/cka_layers_loss']
         if isinstance(cka_per_layer_losses, dict):
             for layer_name, layer_loss in sorted(cka_per_layer_losses.items()):
                 logs[f'loss/cka_layers/{layer_name}'] = layer_loss.item() if torch.is_tensor(layer_loss) else float(layer_loss)

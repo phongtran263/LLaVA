@@ -29,6 +29,14 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from llava.constants import IGNORE_INDEX
+from ..head_cka import (
+    compute_head_cka_loss,
+    parse_head_ids,
+    select_head_indices,
+    validate_head_count,
+    validate_head_fraction,
+    validate_head_seed,
+)
 from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
@@ -169,6 +177,65 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return cka_similarity_to_loss(cka, tau=tau).mean()
 
     def _get_cka_layer_specs(self):
+        config = self.get_model().config
+        manual_heads = parse_head_ids(getattr(config, "cka_loss_head_ids", None))
+        if manual_heads is not None or getattr(config, "cka_loss_random_heads", False):
+            if getattr(config, "cka_loss_anchor_layer", None) is not None:
+                raise ValueError("Head CKA requires the vision anchor V; omit cka_loss_anchor_layer.")
+            fraction, selected_count, seed = None, None, None
+            if manual_heads is None:
+                fraction = validate_head_fraction(getattr(config, "cka_loss_head_fraction", 0.25))
+                selected_count = validate_head_count(getattr(config, "cka_loss_num_heads", None))
+                seed = validate_head_seed(getattr(config, "cka_loss_head_seed", 42))
+            layers = getattr(self.get_model(), "layers", None)
+            if layers is None or not len(layers):
+                raise ValueError("Head CKA requires decoder layers with self_attn.o_proj.")
+            if manual_heads is not None and max(manual_heads) > len(layers):
+                raise ValueError(f"cka_loss_head_ids layer IDs must be in [1, {len(layers)}].")
+            layout = []
+            for layer_idx, layer in enumerate(layers, start=1):
+                if manual_heads is not None and layer_idx not in manual_heads:
+                    continue
+                attention = getattr(layer, "self_attn", None)
+                if getattr(attention, "o_proj", None) is None:
+                    raise ValueError("Head CKA requires self_attn.o_proj in every selected decoder layer.")
+                num_heads = int(getattr(attention, "num_heads", config.num_attention_heads))
+                head_dim = int(getattr(attention, "head_dim", None) or
+                               getattr(config, "head_dim", None) or config.hidden_size // num_heads)
+                if manual_heads is not None and max(manual_heads[layer_idx]) >= num_heads:
+                    raise ValueError(
+                        f"cka_loss_head_ids layer {layer_idx}: head IDs must be in [0, {num_heads - 1}] "
+                        "(query/output heads, not KV heads)."
+                    )
+                layout.append((layer_idx, num_heads, head_dim))
+            manual_signature = (
+                tuple((layer, tuple(heads)) for layer, heads in manual_heads.items())
+                if manual_heads is not None else None
+            )
+            signature = (manual_signature, fraction, selected_count, seed, tuple(layout))
+            cached = getattr(self, "_cka_head_specs_cache", None)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            specs = []
+            for layer_idx, num_heads, head_dim in layout:
+                indices = (
+                    torch.tensor(manual_heads[layer_idx], dtype=torch.long)
+                    if manual_heads is not None else select_head_indices(
+                        num_heads, fraction, seed, layer_idx, selected_count=selected_count,
+                    )
+                )
+                specs.append({
+                    "kind": "heads", "name": f"layer_{layer_idx}_heads",
+                    "layer_idx": layer_idx, "num_heads": num_heads, "head_dim": head_dim,
+                    "head_indices": indices,
+                })
+            # Plain lists persist the exact selection in config.json/W&B.
+            config.cka_loss_head_indices = {
+                str(spec["layer_idx"]): spec["head_indices"].tolist() for spec in specs
+            }
+            self._cka_head_specs_cache = (signature, specs)
+            return specs
+
         raw_layers = getattr(self.get_model().config, 'cka_loss_layers', "final")
         if raw_layers == [-1] or raw_layers in (None, "", False):
             return []
@@ -251,15 +318,63 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         return specs
 
+    def _get_cka_anchor_spec(self, cka_layer_specs):
+        """Return the optional 1-based decoder-layer anchor hook spec.
+
+        ``None`` keeps the raw vision-encoder anchor. If the anchor is already
+        one of the target layers, reuse its hook rather than registering a
+        duplicate hook on the same decoder block.
+        """
+        raw_anchor_layer = getattr(
+            self.get_model().config, "cka_loss_anchor_layer", None
+        )
+        if raw_anchor_layer is None:
+            return None
+
+        try:
+            anchor_layer_idx = int(raw_anchor_layer)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cka_loss_anchor_layer must be a 1-based decoder layer index, "
+                f"got {raw_anchor_layer!r}"
+            ) from exc
+
+        layers = getattr(self.get_model(), "layers", None)
+        num_layers = len(layers) if layers is not None else 0
+        if anchor_layer_idx < 1 or anchor_layer_idx > num_layers:
+            raise ValueError(
+                "cka_loss_anchor_layer must be in "
+                f"[1, {num_layers}], got {anchor_layer_idx}"
+            )
+
+        for spec in cka_layer_specs:
+            if spec.get("layer_idx") == anchor_layer_idx:
+                return spec
+
+        return {
+            "kind": "layer",
+            "name": f"layer_{anchor_layer_idx}",
+            "layer_idx": anchor_layer_idx,
+        }
+
     def _register_cka_layer_hooks(
         self,
         cka_layer_specs,
         captured_layer_hiddens,
-        captured_pre_ffn_hiddens,
     ):
         layers = getattr(self.get_model(), "layers", None)
         if layers is None:
             return []
+
+        if any(spec["kind"] == "heads" for spec in cka_layer_specs) and self.training:
+            # Reentrant checkpointing executes its first forward under no_grad,
+            # so a captured intermediate cannot serve as an auxiliary target.
+            decoder = self.get_model()
+            for module in (decoder, *layers):
+                if getattr(module, "gradient_checkpointing", False):
+                    checkpoint_fn = getattr(module, "_gradient_checkpointing_func", None)
+                    if getattr(checkpoint_fn, "keywords", {}).get("use_reentrant", True):
+                        raise ValueError("Random-head CKA requires gradient checkpointing with use_reentrant=False.")
 
         handles = []
         for spec in cka_layer_specs:
@@ -269,8 +384,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 continue
             layer_name = spec["name"]
             layer = layers[layer_idx - 1]
-            mlp = getattr(layer, "mlp", None)
-            if mlp is None:
+
+            if spec["kind"] == "heads":
+                def capture_heads(module, module_inputs, layer_name=layer_name):
+                    # Capture only: gather/reshape outside the checkpointed
+                    # block to keep non-reentrant recomputation identical.
+                    captured_layer_hiddens[layer_name] = module_inputs[0]
+
+                handles.append(layer.self_attn.o_proj.register_forward_pre_hook(capture_heads))
                 continue
 
             def capture_layer_hidden(module, module_inputs, module_outputs, layer_name=layer_name):
@@ -278,13 +399,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 if torch.is_tensor(hidden_states):
                     captured_layer_hiddens[layer_name] = hidden_states
 
-            def capture_pre_ffn_hidden(module, module_inputs, layer_name=layer_name):
-                # This is the actual (normalized) tensor passed into FFN_k.
-                if module_inputs and torch.is_tensor(module_inputs[0]):
-                    captured_pre_ffn_hiddens[layer_name] = module_inputs[0]
-
             handles.append(layer.register_forward_hook(capture_layer_hidden))
-            handles.append(mlp.register_forward_pre_hook(capture_pre_ffn_hidden))
 
         return handles
 
@@ -307,16 +422,35 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if torch.is_tensor(hidden_states):
                 yield spec["name"], hidden_states
 
-    def _compute_cka_pre_ffn_losses(
+    def _compute_cka_reference_losses(
         self,
         cka_layer_specs,
         captured_layer_hiddens,
-        captured_pre_ffn_hiddens,
         final_hidden,
         output_hidden_states,
+        reference_features,
+        reference_name,
         vision_feature_mask,
         output_device,
     ):
+        if cka_layer_specs and cka_layer_specs[0]["kind"] == "heads":
+            layer_losses, per_layer_losses = [], {}
+            for spec in cka_layer_specs:
+                hidden = captured_layer_hiddens.pop(spec["name"], None)
+                if hidden is None:
+                    raise RuntimeError(f"Missing pre-o_proj head output for {spec['name']}.")
+                if hidden.ndim != 3 or hidden.shape[-1] != spec["num_heads"] * spec["head_dim"]:
+                    raise ValueError(f"Unexpected attention head output shape for {spec['name']}: {hidden.shape}")
+                heads = hidden.reshape(*hidden.shape[:2], spec["num_heads"], spec["head_dim"])
+                heads = heads.index_select(2, spec["head_indices"].to(hidden.device))
+                layer_loss = compute_head_cka_loss(
+                    heads, reference_features.detach().to(hidden.device), vision_feature_mask,
+                    tau=getattr(self.get_model().config, "cka_loss_tau", 0.0),
+                ).to(output_device)
+                layer_losses.append(layer_loss)
+                per_layer_losses[f"{reference_name}_to_{spec['name']}"] = layer_loss.detach()
+            return layer_losses, per_layer_losses
+
         ordered_hiddens = list(self._iter_cka_layer_hiddens(
             cka_layer_specs,
             captured_layer_hiddens,
@@ -328,19 +462,39 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if not ordered_hiddens:
             return layer_losses, per_layer_losses
 
+        reference = reference_features.detach()
         for layer_name, layer_hidden in ordered_hiddens:
-            pre_ffn_hidden = captured_pre_ffn_hiddens.get(layer_name)
-            if not torch.is_tensor(pre_ffn_hidden):
-                raise RuntimeError(f"Missing pre-FFN activation for CKA layer {layer_name}")
             layer_loss = self._compute_masked_linear_cka_loss(
                 projected_features=layer_hidden,
-                layer_hidden_states=pre_ffn_hidden.detach(),
+                layer_hidden_states=reference,
                 vision_feature_mask=vision_feature_mask,
             ).to(output_device)
             layer_losses.append(layer_loss)
-            per_layer_losses[f"pre_ffn_to_{layer_name}"] = layer_loss.detach()
+            per_layer_losses[f"{reference_name}_to_{layer_name}"] = layer_loss.detach()
 
         return layer_losses, per_layer_losses
+
+    def _compute_cka_vision_reference_losses(
+        self,
+        cka_layer_specs,
+        captured_layer_hiddens,
+        final_hidden,
+        output_hidden_states,
+        vision_encoder_features,
+        vision_feature_mask,
+        output_device,
+    ):
+        """Backward-compatible wrapper for the default raw-vision anchor."""
+        return self._compute_cka_reference_losses(
+            cka_layer_specs=cka_layer_specs,
+            captured_layer_hiddens=captured_layer_hiddens,
+            final_hidden=final_hidden,
+            output_hidden_states=output_hidden_states,
+            reference_features=vision_encoder_features,
+            reference_name="vision_encoder",
+            vision_feature_mask=vision_feature_mask,
+            output_device=output_device,
+        )
 
     def _get_cka_attention_subset_kwargs(self):
         config = self.get_model().config
@@ -791,7 +945,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     image_sizes
                 )
         cka_layer_specs = self._get_cka_layer_specs() if cka_enabled else []
-        llm_cka_enabled = cka_enabled and len(cka_layer_specs) > 0
+        hidden_weight = getattr(self.get_model().config, 'cka_loss_final_hidden_weight', None)
+        if hidden_weight is None:
+            hidden_weight = getattr(self.get_model().config, 'cka_loss_weight', 1.0)
+        llm_cka_enabled = cka_enabled and bool(cka_layer_specs) and float(hidden_weight) != 0.0
+        cka_anchor_spec = self._get_cka_anchor_spec(cka_layer_specs) if llm_cka_enabled else None
+        uses_vision_anchor = cka_anchor_spec is None
+        if llm_cka_enabled and uses_vision_anchor and vision_feature_mask is not None and pre_projector_features is None:
+            raise ValueError(
+                "Vision-anchored hidden CKA requires aligned raw vision encoder features; "
+                "use mm_patch_merge_type='flat'."
+            )
         should_output_hidden_states = output_hidden_states
         should_output_attentions = output_attentions
         subset_select_layer = getattr(self.get_model().config, 'cka_loss_subset_select_layer', None)
@@ -812,13 +976,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
         captured_cka_layer_hiddens = {}
-        captured_cka_pre_ffn_hiddens = {}
         cka_layer_hook_handles = []
         if llm_cka_enabled:
+            cka_hook_specs = list(cka_layer_specs)
+            if cka_anchor_spec is not None and cka_anchor_spec not in cka_hook_specs:
+                cka_hook_specs.append(cka_anchor_spec)
             cka_layer_hook_handles = self._register_cka_layer_hooks(
-                cka_layer_specs,
+                cka_hook_specs,
                 captured_cka_layer_hiddens,
-                captured_cka_pre_ffn_hiddens,
             )
 
         attention_subset_hook_handle = None
@@ -917,23 +1082,36 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if getattr(self.get_model().config, 'log_gradient_norms', False):
                 self.last_cka_final_hidden = final_hidden
 
-            if vision_feature_mask is not None:
-                # Local layer objective: CKA(sg(pre-FFN_k), H_k). Only the
-                # pre-FFN reference branch is detached; gradients through H_k
-                # still reach FFN_k, earlier decoder blocks, and the projector.
+            if cka_anchor_spec is None:
+                cka_reference = pre_projector_features
+                cka_reference_name = "vision_encoder"
+            else:
+                cka_reference = captured_cka_layer_hiddens.get(cka_anchor_spec["name"])
+                cka_reference_name = f"layer_{cka_anchor_spec['layer_idx']}"
+                if vision_feature_mask is not None and not torch.is_tensor(cka_reference):
+                    raise RuntimeError(
+                        f"Missing CKA anchor activation for {cka_reference_name}"
+                    )
+
+            if vision_feature_mask is not None and torch.is_tensor(cka_reference):
+                # The common reference is detached. Gradients still follow every
+                # selected H_k target through preceding LLM blocks and projector.
                 layer_mask = subset_vision_feature_mask if subset_vision_feature_mask is not None else vision_feature_mask
-                layer_losses, per_layer_losses = self._compute_cka_pre_ffn_losses(
+                layer_losses, per_layer_losses = self._compute_cka_reference_losses(
                     cka_layer_specs=cka_layer_specs,
                     captured_layer_hiddens=captured_cka_layer_hiddens,
-                    captured_pre_ffn_hiddens=captured_cka_pre_ffn_hiddens,
                     final_hidden=final_hidden,
                     output_hidden_states=output.hidden_states,
+                    reference_features=cka_reference,
+                    reference_name=cka_reference_name,
                     vision_feature_mask=layer_mask,
                     output_device=output.loss.device,
                 )
 
                 if layer_losses:
-                    cka_layers_loss = torch.stack(layer_losses).sum()
+                    stacked = torch.stack(layer_losses)
+                    average_layers = cka_layer_specs[0]["kind"] == "heads"
+                    cka_layers_loss = stacked.mean() if average_layers else stacked.sum()
                 self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None

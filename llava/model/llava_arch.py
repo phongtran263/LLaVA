@@ -261,6 +261,10 @@ class LlavaMetaForCausalLM(ABC):
     def warn_if_projector_only_cka(self):
         """Warn once when a backbone cannot honor hidden-layer CKA settings."""
         config = self.get_model().config
+        if getattr(config, "cka_loss_head_ids", None):
+            raise ValueError("Manual head CKA is not supported by this projector-only CKA backbone.")
+        if getattr(config, "cka_loss_random_heads", False):
+            raise ValueError("Random-head CKA is not supported by this projector-only CKA backbone.")
         raw_layers = getattr(config, 'cka_loss_layers', 'final')
         disabled_tokens = {"-1", "none", "off", "false"}
         hidden_layers_disabled = (
@@ -307,10 +311,24 @@ class LlavaMetaForCausalLM(ABC):
                     projected_image_features,
                     tau=getattr(config, 'cka_loss_tau', 0.0),
                 )
-            # Selected LLM-layer CKA is local to each decoder block:
-            # CKA(sg(pre-FFN_k), H_k). It therefore needs no raw vision feature
-            # buffer; retain the third tuple item only for API compatibility.
-            return projected_image_features, cka_loss, None
+            final_hidden_weight = getattr(config, "cka_loss_final_hidden_weight", None)
+            if final_hidden_weight is None:
+                final_hidden_weight = getattr(config, "cka_loss_weight", 1.0)
+            selected_hidden_specs = (
+                self._get_cka_layer_specs()
+                if hasattr(self, "_get_cka_layer_specs")
+                else []
+            )
+            cka_anchor_layer = getattr(config, "cka_loss_anchor_layer", None)
+            needs_vision_reference = (
+                float(final_hidden_weight) != 0.0
+                and bool(selected_hidden_specs)
+                and cka_anchor_layer is None
+            )
+            # Carry one detached raw vision feature per image token only when a
+            # selected LLM-hidden CKA term needs the fixed vision reference.
+            vision_reference = image_features.detach() if needs_vision_reference else None
+            return projected_image_features, cka_loss, vision_reference
 
         return projected_image_features
 
@@ -380,9 +398,17 @@ class LlavaMetaForCausalLM(ABC):
                 if pre_projector_image_features is not None:
                     pre_projector_image_features = [x.flatten(0, 1) for x in pre_projector_image_features]
             elif mm_patch_merge_type.startswith('spatial'):
-                # Spatial/unpad can add learned newline tokens after the projector; skip
-                # pre-projector-vs-LLM CKA there unless an aligned raw newline exists.
-                pre_projector_image_features = None
+                # Spatial/unpad rearranges patches and can add learned newline tokens
+                # after projection, so its LLM image-token sequence has no one-to-one
+                # raw-V anchor. Projector-only CKA remains supported because it does
+                # not request this buffer.
+                if pre_projector_image_features is not None:
+                    raise ValueError(
+                        "Selected-layer CKA with the raw vision-encoder anchor requires "
+                        "aligned image tokens and currently supports "
+                        "mm_patch_merge_type='flat' only; got "
+                        f"{mm_patch_merge_type!r}."
+                    )
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:

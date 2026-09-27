@@ -34,6 +34,11 @@ scripts
 !/scripts/v1_5/pretrain_backbone.sh
 !/scripts/v1_5/finetune_backbone.sh
 /scripts/v1_5/7b/*.sh
+!/scripts/v1_5/7b/
+!/scripts/v1_5/7b/finetune_qwen2_5_cka_80_20_sweep.sh
+!/scripts/v1_5/7b/finetune_qwen2_5_random_heads.sh
+!/scripts/v1_5/7b/finetune_min_drift_heads_list.sh
+!/scripts/v1_5/7b/pretrain_qwen2_5_random_heads.sh
 eval_results
 cka_results
 analysis

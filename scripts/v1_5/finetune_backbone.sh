@@ -22,9 +22,22 @@ CKA_PROJECTOR_WEIGHT="${CKA_PROJECTOR_WEIGHT:-0.1}"
 CKA_FINAL_HIDDEN_WEIGHT="${CKA_FINAL_HIDDEN_WEIGHT:-0.1}"
 CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
 CKA_LAYERS="${CKA_LAYERS:-final}"
+CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
+CKA_RANDOM_HEADS="${CKA_RANDOM_HEADS:-False}"
+CKA_HEAD_IDS="${CKA_HEAD_IDS:-}"
+# Example manual selection: CKA_HEAD_IDS='{"1":[0,3],"4":[2,5,7]}'
+CKA_HEAD_FRACTION="${CKA_HEAD_FRACTION:-0.25}"
+CKA_HEAD_SEED="${CKA_HEAD_SEED:-42}"
 VSP_DIAGNOSTICS="${VSP_DIAGNOSTICS:-False}"
 VSP_PCGRAD="${VSP_PCGRAD:-False}"
 VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_HEAD_IDS}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_head_ids "${CKA_HEAD_IDS}")
+fi
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
 
 "${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
     --deepspeed "${DEEPSPEED_CONFIG:-./scripts/zero2.json}" \
@@ -64,6 +77,9 @@ VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
+    --cka_loss_random_heads "${CKA_RANDOM_HEADS}" \
+    --cka_loss_head_fraction "${CKA_HEAD_FRACTION}" \
+    --cka_loss_head_seed "${CKA_HEAD_SEED}" \
     --cka_loss_layers "${CKA_LAYERS}" \
     --cka_loss_subset_query_tokens "${CKA_SUBSET_QUERY_TOKENS:-text}" \
     --vsp_gradient_diagnostics "${VSP_DIAGNOSTICS}" \
@@ -73,4 +89,5 @@ VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
     --vsp_pcgrad_threshold "${VSP_PCGRAD_THRESHOLD:-0.05}" \
     --vsp_proj_max_grad_ratio "${VSP_PROJ_MAX_GRAD_RATIO:-0.5}" \
     --vsp_llm_max_grad_ratio "${VSP_LLM_MAX_GRAD_RATIO:-0.5}" \
-    --vsp_grad_log_interval "${VSP_GRAD_LOG_INTERVAL:-10}"
+    --vsp_grad_log_interval "${VSP_GRAD_LOG_INTERVAL:-10}" \
+    "${OPTIONAL_CKA_ARGS[@]}"

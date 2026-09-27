@@ -10,15 +10,20 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     exit 1
 fi
 
-: "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-1.5B-Instruct}"
-: "${RUN_NAME:=qwen-1.5b-pretrain}"
+: "${MODEL_NAME_OR_PATH:=Qwen/Qwen3-1.7B}"
+: "${RUN_NAME:=qwen3-1.7b}"
 : "${GPU_INCLUDE:=localhost:3}"
-: "${PER_DEVICE_TRAIN_BATCH_SIZE:=64}"
-: "${GRADIENT_ACCUMULATION_STEPS:=4}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=32}"
+: "${GRADIENT_ACCUMULATION_STEPS:=8}"
 : "${CKA_LOSS_START_RATIO:=0.0}"
-: "${MM_PROJECTOR_TYPE:=coupling1x_gelu}"
+: "${CKA_ANCHOR_LAYER:=}"
+: "${MM_PROJECTOR_TYPE:=mlp2x_gelu}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-coup/${RUN_NAME}-${MM_PROJECTOR_TYPE}/llava-pretrain}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-cka/${RUN_NAME}-3/llava-pretrain}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
 
 "${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -53,16 +58,17 @@ OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-coup/${RUN_NAME}-${MM_PROJECTOR
     --lazy_preprocess True \
     --report_to wandb \
     --run_name "${RUN_NAME}" \
-    --cka_loss False \
+    --cka_loss True \
     --cka_loss_tau 0.0 \
-    --cka_loss_weight 1.0 \
+    --cka_loss_weight 0.1 \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --vsp_gradient_diagnostics False \
     --vsp_asymmetric_pcgrad False \
     --vsp_apply_to_projector_only False \
-    --vsp_norm_cap False \
+    --vsp_norm_cap True \
     --vsp_pcgrad_threshold 0.05 \
     --vsp_proj_max_grad_ratio 0.5 \
     --vsp_llm_max_grad_ratio 0.5 \
     --vsp_grad_log_interval 10 \
-    --cka_loss_layers "-1"
+    --cka_loss_layers "3" \
+    "${OPTIONAL_CKA_ARGS[@]}"

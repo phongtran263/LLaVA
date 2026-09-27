@@ -50,9 +50,11 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaMistralConfig
     _compute_masked_linear_cka_loss = LlavaLlamaForCausalLM._compute_masked_linear_cka_loss
     _get_cka_layer_specs = LlavaLlamaForCausalLM._get_cka_layer_specs
+    _get_cka_anchor_spec = LlavaLlamaForCausalLM._get_cka_anchor_spec
     _register_cka_layer_hooks = LlavaLlamaForCausalLM._register_cka_layer_hooks
     _iter_cka_layer_hiddens = LlavaLlamaForCausalLM._iter_cka_layer_hiddens
-    _compute_cka_pre_ffn_losses = LlavaLlamaForCausalLM._compute_cka_pre_ffn_losses
+    _compute_cka_reference_losses = LlavaLlamaForCausalLM._compute_cka_reference_losses
+    _compute_cka_vision_reference_losses = LlavaLlamaForCausalLM._compute_cka_vision_reference_losses
 
     def __init__(self, config):
         super(MistralForCausalLM, self).__init__(config)
@@ -87,6 +89,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         )
         vision_feature_mask = None
         projector_cka_loss = None
+        pre_projector_features = None
         self.last_cka_loss = None
         self.last_cka_projector_loss = None
         self.last_cka_pre_post_loss = None
@@ -116,7 +119,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
                     labels,
                     vision_feature_mask,
                     projector_cka_loss,
-                    _,
+                    pre_projector_features,
                 ) = prepared_inputs
             else:
                 (
@@ -133,15 +136,23 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         if hidden_weight is None:
             hidden_weight = getattr(self.config, 'cka_loss_weight', 1.0)
         llm_cka_enabled = cka_enabled and bool(cka_layer_specs) and float(hidden_weight) != 0.0
+        cka_anchor_spec = self._get_cka_anchor_spec(cka_layer_specs) if llm_cka_enabled else None
+        uses_vision_anchor = cka_anchor_spec is None
+        if llm_cka_enabled and uses_vision_anchor and vision_feature_mask is not None and pre_projector_features is None:
+            raise ValueError(
+                "Vision-anchored hidden CKA requires aligned raw vision encoder features; "
+                "use mm_patch_merge_type='flat'."
+            )
 
         captured_cka_layer_hiddens = {}
-        captured_cka_pre_ffn_hiddens = {}
         cka_layer_hook_handles = []
         if llm_cka_enabled:
+            cka_hook_specs = list(cka_layer_specs)
+            if cka_anchor_spec is not None and cka_anchor_spec not in cka_hook_specs:
+                cka_hook_specs.append(cka_anchor_spec)
             cka_layer_hook_handles = self._register_cka_layer_hooks(
-                cka_layer_specs,
+                cka_hook_specs,
                 captured_cka_layer_hiddens,
-                captured_cka_pre_ffn_hiddens,
             )
 
         forward_kwargs = dict(
@@ -174,18 +185,32 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             projector_cka_loss = projector_cka_loss.to(output.loss.device)
 
         cka_layers_loss = output.loss.new_zeros(())
-        if llm_cka_enabled and vision_feature_mask is not None:
-            layer_losses, per_layer_losses = self._compute_cka_pre_ffn_losses(
+        if cka_anchor_spec is None:
+            cka_reference = pre_projector_features
+            cka_reference_name = "vision_encoder"
+        else:
+            cka_reference = captured_cka_layer_hiddens.get(cka_anchor_spec["name"])
+            cka_reference_name = f"layer_{cka_anchor_spec['layer_idx']}"
+            if vision_feature_mask is not None and not torch.is_tensor(cka_reference):
+                raise RuntimeError(
+                    f"Missing CKA anchor activation for {cka_reference_name}"
+                )
+
+        if llm_cka_enabled and vision_feature_mask is not None and torch.is_tensor(cka_reference):
+            layer_losses, per_layer_losses = self._compute_cka_reference_losses(
                 cka_layer_specs=cka_layer_specs,
                 captured_layer_hiddens=captured_cka_layer_hiddens,
-                captured_pre_ffn_hiddens=captured_cka_pre_ffn_hiddens,
                 final_hidden=None,
                 output_hidden_states=output.hidden_states,
+                reference_features=cka_reference,
+                reference_name=cka_reference_name,
                 vision_feature_mask=vision_feature_mask,
                 output_device=output.loss.device,
             )
             if layer_losses:
-                cka_layers_loss = torch.stack(layer_losses).sum()
+                stacked = torch.stack(layer_losses)
+                average_layers = cka_layer_specs[0]["kind"] == "heads"
+                cka_layers_loss = stacked.mean() if average_layers else stacked.sum()
             self.last_cka_per_layer_losses = per_layer_losses
 
         if getattr(self.get_model().config, 'log_gradient_norms', False):

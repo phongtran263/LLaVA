@@ -5,6 +5,12 @@ if [ -z "${CONDA_PREFIX:-}" ] || [ ! -x "${CONDA_PREFIX}/bin/deepspeed" ]; then
     echo "Please activate the Qwen training conda env first, e.g. conda activate llava-qwen" >&2
     exit 1
 fi
+CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
+OPTIONAL_CKA_ARGS=()
+if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
+
 
 python - <<'PY_CHECK'
 from packaging import version
@@ -69,4 +75,5 @@ PY_CHECK
     --cka_loss_subset_min_ratio 0.01 \
     --cka_loss_subset_max_ratio 0.90 \
     --cka_loss_subset_fallback_mass 0.90 \
-    --cka_loss_subset_otsu_min_separability 0.30
+    --cka_loss_subset_otsu_min_separability 0.30 \
+    "${OPTIONAL_CKA_ARGS[@]}"

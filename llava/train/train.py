@@ -31,8 +31,10 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import (
     LLaVATrainer,
+    StopAfterStepRatioCallback,
     sanitize_generation_config_for_save,
     validate_cka_loss_start_ratio,
+    validate_stop_after_step_ratio,
 )
 from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
@@ -43,6 +45,7 @@ from llava.model.backbones import (
     is_llama3, use_fast_tokenizer,
 )
 from llava.model.llava_arch import validate_cka_loss_tau
+from llava.model.head_cka import parse_head_ids, validate_head_count, validate_head_fraction, validate_head_seed
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -114,11 +117,17 @@ class ModelArguments:
     cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
-    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(pre-FFN_k), H_k). The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
+    cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
+    cka_loss_anchor_layer: Optional[int] = field(default=None, metadata={"help": "Optional 1-based decoder layer used as the detached hidden-CKA anchor. Omit it to keep the raw vision-encoder feature V as the anchor."})
+    cka_loss_random_heads: bool = field(default=False, metadata={"help": "Use fixed random attention output heads before o_proj at EVERY decoder layer, anchored to V; replaces layer-output CKA, overrides cka_loss_layers, and leaves full projector CKA unchanged."})
+    cka_loss_head_fraction: float = field(default=0.25, metadata={"help": "Fraction of query/output heads selected per layer; ceil(num_attention_heads * fraction), averaged over heads and layers."})
+    cka_loss_num_heads: Optional[int] = field(default=None, metadata={"help": "Optional exact number of query/output heads selected per layer. When set, this takes precedence over cka_loss_head_fraction."})
+    cka_loss_head_seed: int = field(default=42, metadata={"help": "Fixed head selection seed. Layer k (1-based) uses seed + k, independent of the global training RNG."})
+    cka_loss_head_ids: Optional[str] = field(default=None, metadata={"help": 'Manual head CKA: JSON mapping 1-based decoder layers to lists of 0-based query/output head IDs, e.g. {"1":[0,3],"4":[2,5]}. Only listed layers receive head CKA. Overrides random selection, count, fraction, seed and cka_loss_layers; requires the vision anchor V.'})
     cka_loss_start_ratio: float = field(default=0.0, metadata={"help": "Fraction of total optimizer steps to complete before enabling all CKA losses. Use 0.8 for CKA only during the final 20%; 0.0 preserves immediate CKA."})
-    # Projector CKA remains vision-to-projector. Numeric layer CKA is local to
-    # each selected decoder block and uses its detached FFN input as reference.
-    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA(sg(pre-FFN_k), H_k), e.g. '8,16,24,final'. 'final' aliases the last decoder block. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Layer CKA is supported by LLaMA, Qwen2/3, Gemma3, Phi3 and Mistral; MPT uses projector CKA only."})
+    # Every selected decoder-layer CKA term uses the same detached anchor:
+    # raw vision V by default, or H_N when cka_loss_anchor_layer=N.
+    cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA(sg(A), H_k), e.g. '8,16,24,final'. A is raw vision V by default or H_N when --cka_loss_anchor_layer N is set. 'final' aliases the last decoder block. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Layer CKA is supported by LLaMA, Qwen2/3, Gemma3, Phi3 and Mistral; MPT uses projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
     # text-to-image attention; it is not the hidden layer used for CKA.
@@ -184,6 +193,14 @@ class TrainingArguments(transformers.TrainingArguments):
     debug_compare_grad_param: Optional[str] = field(default=None, metadata={"help": "Optional substring used to choose a reference parameter when comparing gradients."})
     log_gradient_norms: bool = field(default=False, metadata={"help": "Log per-loss gradient norms for projector parameters and final hidden states."})
     gradient_log_steps: int = field(default=50, metadata={"help": "How often, in optimizer steps, to compute gradient norm debug logs."})
+    stop_after_step_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help":
+            "Save a resumable checkpoint and stop after this fraction of the full optimizer-step horizon. "
+            "For example, 0.8 stops at ceil(0.8 * max_steps) without shortening the LR scheduler."
+        },
+    )
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -997,6 +1014,12 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    manual_head_ids = parse_head_ids(model_args.cka_loss_head_ids)
+    if manual_head_ids is not None and not model_args.cka_loss:
+        raise ValueError("--cka_loss_head_ids requires --cka_loss True.")
+    training_args.stop_after_step_ratio = validate_stop_after_step_ratio(
+        training_args.stop_after_step_ratio
+    )
     local_rank = training_args.local_rank
     if model_args.use_pcgrad:
         model_args.vsp_asymmetric_pcgrad = True
@@ -1090,6 +1113,26 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    model.config.cka_loss_random_heads = bool(model_args.cka_loss_random_heads)
+    model.config.cka_loss_head_ids = (
+        {str(layer): heads for layer, heads in manual_head_ids.items()}
+        if manual_head_ids is not None else None
+    )
+    # In manual mode these random-selection settings are recorded but unused.
+    model.config.cka_loss_head_fraction = (
+        validate_head_fraction(model_args.cka_loss_head_fraction)
+        if manual_head_ids is None else model_args.cka_loss_head_fraction
+    )
+    model.config.cka_loss_num_heads = (
+        validate_head_count(model_args.cka_loss_num_heads)
+        if manual_head_ids is None else model_args.cka_loss_num_heads
+    )
+    model.config.cka_loss_head_seed = (
+        validate_head_seed(model_args.cka_loss_head_seed)
+        if manual_head_ids is None else model_args.cka_loss_head_seed
+    )
+    if model.config.cka_loss_random_heads and not model_args.cka_loss:
+        raise ValueError("--cka_loss_random_heads True requires --cka_loss True.")
     model.config.use_pcgrad = bool(model_args.use_pcgrad)
     model.config.vsp_gradient_diagnostics = bool(model_args.vsp_gradient_diagnostics)
     model.config.vsp_asymmetric_pcgrad = bool(model_args.vsp_asymmetric_pcgrad)
@@ -1117,7 +1160,31 @@ def train(attn_implementation=None):
     model.config.cka_loss_start_ratio = validate_cka_loss_start_ratio(
         model_args.cka_loss_start_ratio
     )
-    model.config.cka_loss_reference = "pre_ffn"
+    cka_anchor_layer = model_args.cka_loss_anchor_layer
+    if cka_anchor_layer is not None:
+        cka_anchor_layer = int(cka_anchor_layer)
+        decoder_model = model.get_model() if hasattr(model, "get_model") else None
+        decoder_layers = getattr(decoder_model, "layers", None)
+        num_decoder_layers = len(decoder_layers) if decoder_layers is not None else 0
+        if num_decoder_layers <= 0:
+            text_config = getattr(model.config, "text_config", None)
+            num_decoder_layers = int(
+                getattr(model.config, "num_hidden_layers", 0)
+                or getattr(model.config, "n_layers", 0)
+                or getattr(model.config, "n_layer", 0)
+                or getattr(text_config, "num_hidden_layers", 0)
+                or 0
+            )
+        if cka_anchor_layer < 1 or cka_anchor_layer > num_decoder_layers:
+            raise ValueError(
+                "--cka_loss_anchor_layer must be a 1-based decoder layer index "
+                f"in [1, {num_decoder_layers}], got {cka_anchor_layer}."
+            )
+        model.config.cka_loss_anchor_layer = cka_anchor_layer
+        model.config.cka_loss_reference = f"layer_{cka_anchor_layer}"
+    else:
+        model.config.cka_loss_anchor_layer = None
+        model.config.cka_loss_reference = "vision_encoder"
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
     model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
     cka_subset_query_tokens = str(model_args.cka_loss_subset_query_tokens or "text").lower().replace("_", "-")
@@ -1146,7 +1213,7 @@ def train(attn_implementation=None):
     model.config.cka_loss_subset_otsu_min_separability = max(0.0, min(1.0, float(model_args.cka_loss_subset_otsu_min_separability)))
     # cka_loss_layers accepts comma-separated 1-based decoder layer indices.
     # ``final`` aliases the last block; interval shorthands expand to multiple
-    # blocks. Each selected k uses CKA(sg(pre-FFN_k), H_k).
+    # blocks. Every H_k is compared with the same detached configured anchor.
     if model_args.cka_loss_layers:
         cka_loss_layers_arg = model_args.cka_loss_layers.strip()
         cka_loss_layers_lower = cka_loss_layers_arg.lower()
@@ -1219,6 +1286,28 @@ def train(attn_implementation=None):
                 model.config.cka_loss_layers = parsed_cka_layers
     else:
         model.config.cka_loss_layers = "final"
+
+    if manual_head_ids is not None or model.config.cka_loss_random_heads:
+        if not hasattr(model, "_get_cka_layer_specs"):
+            raise ValueError("Head CKA supports LLaMA/Vicuna, Qwen2/3, Gemma3, Phi3 and Mistral, not this backbone.")
+        model.config.cka_loss_layers = list(manual_head_ids) if manual_head_ids is not None else "all"
+        head_specs = model._get_cka_layer_specs()
+        if manual_head_ids is not None:
+            selection_description = "manual head IDs; only listed layers are supervised"
+        else:
+            selection_description = (
+                f"exact heads/layer={model.config.cka_loss_num_heads}"
+                if model.config.cka_loss_num_heads is not None
+                else f"fraction={model.config.cka_loss_head_fraction}"
+            )
+            selection_description += f", base seed={model.config.cka_loss_head_seed}"
+        rank0_print(
+            "Head CKA: V anchor, mean over heads per layer, then mean over selected layers; "
+            f"{selection_description}. "
+            "Full projector CKA is unchanged. Head IDs below are 0-based."
+        )
+        for spec in head_specs:
+            rank0_print(f"  layer {spec['layer_idx']}: heads {spec['head_indices'].tolist()} / {spec['num_heads']}")
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -1352,6 +1441,7 @@ def train(attn_implementation=None):
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
+                    callbacks=[StopAfterStepRatioCallback()],
                     **data_module)
 
     if training_args.debug_compare_cka:
@@ -1372,7 +1462,9 @@ def train(attn_implementation=None):
             print(json.dumps(debug_results, indent=2, sort_keys=True))
         return
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    if training_args.resume_from_checkpoint:
+        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    elif list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
