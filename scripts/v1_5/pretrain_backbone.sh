@@ -19,18 +19,10 @@ CKA_FINAL_HIDDEN_WEIGHT="${CKA_FINAL_HIDDEN_WEIGHT:-0.0}"
 CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
 CKA_LAYERS="${CKA_LAYERS:--1}"
 CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
-CKA_RANDOM_HEADS="${CKA_RANDOM_HEADS:-False}"
-CKA_HEAD_IDS="${CKA_HEAD_IDS:-}"
-# Example manual selection: CKA_HEAD_IDS='{"1":[0,3],"4":[2,5,7]}'
-CKA_HEAD_FRACTION="${CKA_HEAD_FRACTION:-0.25}"
-CKA_HEAD_SEED="${CKA_HEAD_SEED:-42}"
 VSP_DIAGNOSTICS="${VSP_DIAGNOSTICS:-False}"
 VSP_PCGRAD="${VSP_PCGRAD:-False}"
 VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
 OPTIONAL_CKA_ARGS=()
-if [[ -n "${CKA_HEAD_IDS}" ]]; then
-    OPTIONAL_CKA_ARGS+=(--cka_loss_head_ids "${CKA_HEAD_IDS}")
-fi
 if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
     OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
 fi
@@ -73,9 +65,6 @@ fi
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
-    --cka_loss_random_heads "${CKA_RANDOM_HEADS}" \
-    --cka_loss_head_fraction "${CKA_HEAD_FRACTION}" \
-    --cka_loss_head_seed "${CKA_HEAD_SEED}" \
     --cka_loss_layers "${CKA_LAYERS}" \
     --vsp_gradient_diagnostics "${VSP_DIAGNOSTICS}" \
     --vsp_asymmetric_pcgrad "${VSP_PCGRAD}" \

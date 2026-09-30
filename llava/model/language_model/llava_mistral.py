@@ -209,8 +209,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             )
             if layer_losses:
                 stacked = torch.stack(layer_losses)
-                average_layers = cka_layer_specs[0]["kind"] == "heads"
-                cka_layers_loss = stacked.mean() if average_layers else stacked.sum()
+                cka_layers_loss = stacked.sum()
             self.last_cka_per_layer_losses = per_layer_losses
 
         if getattr(self.get_model().config, 'log_gradient_norms', False):

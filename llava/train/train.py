@@ -31,11 +31,21 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import (
     LLaVATrainer,
+    SaveAtStepRatioCallback,
     StopAfterStepRatioCallback,
     sanitize_generation_config_for_save,
     validate_cka_loss_start_ratio,
+    validate_save_at_step_ratio,
     validate_stop_after_step_ratio,
 )
+from llava.train.adaptive_projector_pcgrad import (
+    AdaptiveProjectorPCGradConfig,
+    METADATA_FILE as ADAPTIVE_PCGRAD_METADATA_FILE,
+    load_json as load_adaptive_pcgrad_json,
+    projector_sha256,
+    projector_signature,
+)
+from llava.train.projector_replay_reference import ordered_trainable_parameters, validate_replayable_projector
 from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
 from llava import conversation as conversation_lib
@@ -45,7 +55,6 @@ from llava.model.backbones import (
     is_llama3, use_fast_tokenizer,
 )
 from llava.model.llava_arch import validate_cka_loss_tau
-from llava.model.head_cka import parse_head_ids, validate_head_count, validate_head_fraction, validate_head_seed
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -76,6 +85,221 @@ def format_parameter_shape(param):
         return f"partitioned(numel={get_parameter_numel(param)})"
     return list(param.shape)
 
+_ADAPTIVE_PCGRAD_FIELDS = (
+    "max_aux_ratio",
+    "warmup_ratio",
+    "norm_ema_beta",
+    "lambda_max",
+    "ce_norm_floor",
+    "aux_norm_floor",
+    "residual_rtol",
+)
+
+
+def resolve_adaptive_projector_pcgrad_config(model_args, training_args):
+    """Resolve stage-local controller settings without guessing total steps.
+
+    The Trainer owns ``planned_optimizer_steps`` because only it knows the
+    resolved dataloader/accumulation horizon. Everything else is validated here
+    once, before model/backend initialization.
+    """
+    enabled = bool(model_args.adaptive_projector_pcgrad)
+    supplied_without_enable = (
+        model_args.adaptive_pcgrad_stage is not None
+        or model_args.adaptive_pcgrad_config is not None
+        or any(
+            getattr(model_args, f"adaptive_pcgrad_{name}") is not None
+            for name in _ADAPTIVE_PCGRAD_FIELDS
+        )
+    )
+    if not enabled:
+        if supplied_without_enable:
+            raise ValueError(
+                "Adaptive projector PCGrad settings were supplied, but "
+                "--adaptive_projector_pcgrad is False."
+            )
+        return None
+
+    try:
+        stage = int(model_args.adaptive_pcgrad_stage)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "--adaptive_pcgrad_stage must be explicitly set to 1 or 2 when "
+            "adaptive projector PCGrad is enabled."
+        ) from exc
+    if stage not in (1, 2):
+        raise ValueError(f"--adaptive_pcgrad_stage must be 1 or 2, got {stage}.")
+
+    legacy_flags = {
+        "cka_loss": model_args.cka_loss,
+        "use_pcgrad": model_args.use_pcgrad,
+        "vsp_gradient_diagnostics": model_args.vsp_gradient_diagnostics,
+        "vsp_asymmetric_pcgrad": model_args.vsp_asymmetric_pcgrad,
+        "vsp_apply_to_projector_only": model_args.vsp_apply_to_projector_only,
+        "vsp_norm_cap": model_args.vsp_norm_cap,
+        "debug_compare_cka": training_args.debug_compare_cka,
+        "log_gradient_norms": training_args.log_gradient_norms,
+    }
+    active_legacy = [name for name, value in legacy_flags.items() if bool(value)]
+    if active_legacy:
+        raise ValueError(
+            "Adaptive projector PCGrad is mutually exclusive with legacy CKA/VSP paths; "
+            f"disable: {', '.join(active_legacy)}."
+        )
+    if float(model_args.cka_loss_start_ratio) != 0.0:
+        raise ValueError(
+            "--cka_loss_start_ratio belongs to the legacy CKA path and must remain 0 "
+            "with adaptive projector PCGrad."
+        )
+    if model_args.vision_tower is None:
+        raise ValueError("Adaptive projector PCGrad requires --vision_tower.")
+    if training_args.freeze_mm_mlp_adapter:
+        raise ValueError("Adaptive projector PCGrad requires a trainable mm_projector.")
+    if int(training_args.bits) != 16:
+        raise ValueError(
+            "Adaptive projector PCGrad supports full-parameter BF16/FP32 ZeRO-2 only; "
+            f"quantized bits={training_args.bits} is unsupported."
+        )
+    if stage == 1 and not model_args.tune_mm_mlp_adapter:
+        raise ValueError("Stage 1 adaptive PCGrad requires --tune_mm_mlp_adapter True.")
+    if stage == 2 and model_args.tune_mm_mlp_adapter:
+        raise ValueError(
+            "Stage 2 adaptive PCGrad must preserve the finetuning recipe; "
+            "--tune_mm_mlp_adapter must be False."
+        )
+    if stage == 2 and not model_args.pretrain_mm_mlp_adapter:
+        raise ValueError(
+            "Stage 2 adaptive PCGrad requires --pretrain_mm_mlp_adapter from an "
+            "adaptive-PCGrad stage-1 checkpoint."
+        )
+    if int(model_args.adaptive_pcgrad_cka_chunk_size) <= 0:
+        raise ValueError("--adaptive_pcgrad_cka_chunk_size must be positive.")
+
+    payload = {}
+    if model_args.adaptive_pcgrad_config is not None:
+        config_path = pathlib.Path(model_args.adaptive_pcgrad_config).expanduser()
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Adaptive PCGrad config does not exist: {config_path}")
+        payload = load_adaptive_pcgrad_json(str(config_path))
+
+    config_stage = payload.pop("stage", stage)
+    try:
+        config_stage = int(config_stage)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Adaptive PCGrad JSON field 'stage' must be 1 or 2.") from exc
+    if config_stage != stage:
+        raise ValueError(
+            f"Adaptive PCGrad JSON is for stage {config_stage}, but launcher requested stage {stage}."
+        )
+    forbidden = {"planned_optimizer_steps", "warmup_steps"}.intersection(payload)
+    if forbidden:
+        raise ValueError(
+            "Trainer resolves these adaptive PCGrad fields; remove them from JSON: "
+            + ", ".join(sorted(forbidden))
+        )
+    unknown = set(payload).difference(_ADAPTIVE_PCGRAD_FIELDS)
+    if unknown:
+        raise ValueError(
+            "Unknown adaptive PCGrad JSON fields: " + ", ".join(sorted(unknown))
+        )
+    for name in _ADAPTIVE_PCGRAD_FIELDS:
+        override = getattr(model_args, f"adaptive_pcgrad_{name}")
+        if override is not None:
+            payload[name] = override
+
+    validated = AdaptiveProjectorPCGradConfig(
+        stage=stage,
+        planned_optimizer_steps=1,
+        **payload,
+    ).validate()
+    resolved = {
+        name: getattr(validated, name)
+        for name in ("stage", *_ADAPTIVE_PCGRAD_FIELDS)
+    }
+    return resolved
+
+
+def validate_adaptive_projector_setup(model, model_args, resolved_config):
+    """Validate exact module identity/trainability before backend wrapping."""
+    if resolved_config is None:
+        return
+    inner_model = model.get_model()
+    projector = getattr(inner_model, "mm_projector", None)
+    if projector is None:
+        raise RuntimeError("Adaptive projector PCGrad could not resolve model.mm_projector.")
+    validate_replayable_projector(projector)
+
+    projector_names, projector_params = ordered_trainable_parameters(projector)
+    projector_ids = {id(parameter) for parameter in projector_params}
+    if not projector_params:
+        raise RuntimeError("Adaptive projector PCGrad requires trainable projector parameters.")
+
+    vision_tower = model.get_vision_tower()
+    trainable_vision = [name for name, parameter in vision_tower.named_parameters() if parameter.requires_grad]
+    if trainable_vision:
+        preview = ", ".join(trainable_vision[:5])
+        raise RuntimeError(
+            "Adaptive projector PCGrad requires a frozen vision encoder; trainable parameters: "
+            f"{preview}"
+        )
+
+    if int(resolved_config["stage"]) == 1:
+        frozen_projector = [name for name, parameter in projector.named_parameters() if not parameter.requires_grad]
+        if frozen_projector:
+            raise RuntimeError(
+                "Stage 1 requires the complete projector to be trainable; frozen parameters: "
+                + ", ".join(frozen_projector[:5])
+            )
+        outside_projector = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and id(parameter) not in projector_ids
+        ]
+        if outside_projector:
+            raise RuntimeError(
+                "Stage 1 adaptive PCGrad must train only the projector; extra trainable parameters: "
+                + ", ".join(outside_projector[:5])
+            )
+
+    model.config.adaptive_pcgrad_projector_parameter_names = projector_names
+
+
+def validate_adaptive_stage2_handoff(model, model_args, resolved_config):
+    """Prove stage 2 loaded the intended adaptive-PCGrad stage-1 projector."""
+    if resolved_config is None or int(resolved_config["stage"]) != 2:
+        return None
+    adapter_path = pathlib.Path(model_args.pretrain_mm_mlp_adapter).expanduser()
+    metadata_path = adapter_path.parent / ADAPTIVE_PCGRAD_METADATA_FILE
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            "Stage 2 adaptive PCGrad requires stage-1 provenance metadata next to the adapter: "
+            f"{metadata_path}"
+        )
+    metadata = load_adaptive_pcgrad_json(str(metadata_path))
+    if int(metadata.get("stage", -1)) != 1:
+        raise RuntimeError(f"Stage-2 handoff metadata must declare stage=1: {metadata_path}")
+    expected_base = str(model_args.model_name_or_path)
+    if metadata.get("base_model_identifier") != expected_base:
+        raise RuntimeError(
+            "Stage-1 projector base model does not match stage 2: "
+            f"{metadata.get('base_model_identifier')!r} != {expected_base!r}."
+        )
+    expected_signature = metadata.get("projector_signature")
+    expected_hash = metadata.get("projector_sha256")
+    if not expected_signature or not isinstance(expected_hash, str) or not expected_hash:
+        raise RuntimeError(f"Incomplete stage-1 projector provenance metadata: {metadata_path}")
+
+    projector = model.get_model().mm_projector
+    actual_signature = projector_signature(projector)
+    actual_hash = projector_sha256(projector)
+    if actual_signature != expected_signature:
+        raise RuntimeError("Loaded stage-1 projector signature does not match its metadata.")
+    if actual_hash != expected_hash:
+        raise RuntimeError("Loaded stage-1 projector hash does not match its metadata.")
+    model.config.adaptive_pcgrad_stage1_metadata = str(metadata_path)
+    model.config.adaptive_pcgrad_stage1_projector_sha256 = actual_hash
+    return metadata
+
 
 from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
@@ -102,6 +326,33 @@ class ModelArguments:
     router_dropout: Optional[float] = field(default=None)
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
+    adaptive_projector_pcgrad: bool = field(
+        default=False,
+        metadata={"help": "Enable stage-local adaptive one-sided PCGrad for unweighted projector CKA."},
+    )
+    adaptive_pcgrad_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Required adaptive projector PCGrad stage: 1 (projector pretrain) or 2 (finetune)."},
+    )
+    adaptive_pcgrad_config: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional stage-specific adaptive projector PCGrad JSON config."},
+    )
+    adaptive_pcgrad_max_aux_ratio: Optional[float] = field(default=None)
+    adaptive_pcgrad_warmup_ratio: Optional[float] = field(default=None)
+    adaptive_pcgrad_norm_ema_beta: Optional[float] = field(default=None)
+    adaptive_pcgrad_lambda_max: Optional[float] = field(default=None)
+    adaptive_pcgrad_ce_norm_floor: Optional[float] = field(default=None)
+    adaptive_pcgrad_aux_norm_floor: Optional[float] = field(default=None)
+    adaptive_pcgrad_residual_rtol: Optional[float] = field(default=None)
+    adaptive_pcgrad_cka_chunk_size: int = field(
+        default=4,
+        metadata={"help": "Number of image observations per projector-sidecar CKA replay chunk."},
+    )
+    adaptive_pcgrad_profile: bool = field(
+        default=False,
+        metadata={"help": "Log measured optimizer-step wall time and peak allocated memory."},
+    )
     cka_loss: bool = field(default=False)
     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
@@ -119,14 +370,9 @@ class ModelArguments:
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
     cka_loss_anchor_layer: Optional[int] = field(default=None, metadata={"help": "Optional 1-based decoder layer used as the detached hidden-CKA anchor. Omit it to keep the raw vision-encoder feature V as the anchor."})
-    cka_loss_random_heads: bool = field(default=False, metadata={"help": "Use fixed random attention output heads before o_proj at EVERY decoder layer, anchored to V; replaces layer-output CKA, overrides cka_loss_layers, and leaves full projector CKA unchanged."})
-    cka_loss_head_fraction: float = field(default=0.25, metadata={"help": "Fraction of query/output heads selected per layer; ceil(num_attention_heads * fraction), averaged over heads and layers."})
-    cka_loss_num_heads: Optional[int] = field(default=None, metadata={"help": "Optional exact number of query/output heads selected per layer. When set, this takes precedence over cka_loss_head_fraction."})
-    cka_loss_head_seed: int = field(default=42, metadata={"help": "Fixed head selection seed. Layer k (1-based) uses seed + k, independent of the global training RNG."})
-    cka_loss_head_ids: Optional[str] = field(default=None, metadata={"help": 'Manual head CKA: JSON mapping 1-based decoder layers to lists of 0-based query/output head IDs, e.g. {"1":[0,3],"4":[2,5]}. Only listed layers receive head CKA. Overrides random selection, count, fraction, seed and cka_loss_layers; requires the vision anchor V.'})
-    cka_loss_start_ratio: float = field(default=0.0, metadata={"help": "Fraction of total optimizer steps to complete before enabling all CKA losses. Use 0.8 for CKA only during the final 20%; 0.0 preserves immediate CKA."})
+    cka_loss_start_ratio: float = field(default=0.0, metadata={"help": "Fraction of total optimizer steps to complete before enabling all CKA losses. Use 0.8 for CKA only during the final fifth; 0.0 preserves immediate CKA."})
     # Every selected decoder-layer CKA term uses the same detached anchor:
-    # raw vision V by default, or H_N when cka_loss_anchor_layer=N.
+    # Raw vision V by default, or H_N when cka_loss_anchor_layer=N.
     cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA(sg(A), H_k), e.g. '8,16,24,final'. A is raw vision V by default or H_N when --cka_loss_anchor_layer N is set. 'final' aliases the last decoder block. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Layer CKA is supported by LLaMA, Qwen2/3, Gemma3, Phi3 and Mistral; MPT uses projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
@@ -199,6 +445,14 @@ class TrainingArguments(transformers.TrainingArguments):
             "help":
             "Save a resumable checkpoint and stop after this fraction of the full optimizer-step horizon. "
             "For example, 0.8 stops at ceil(0.8 * max_steps) without shortening the LR scheduler."
+        },
+    )
+    save_at_step_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help":
+            "Save one resumable checkpoint at ceil(ratio * max_steps) without stopping training. "
+            "For example, 0.75 saves once at 75% of the full optimizer-step horizon."
         },
     )
 
@@ -1014,11 +1268,14 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    manual_head_ids = parse_head_ids(model_args.cka_loss_head_ids)
-    if manual_head_ids is not None and not model_args.cka_loss:
-        raise ValueError("--cka_loss_head_ids requires --cka_loss True.")
     training_args.stop_after_step_ratio = validate_stop_after_step_ratio(
         training_args.stop_after_step_ratio
+    )
+    training_args.save_at_step_ratio = validate_save_at_step_ratio(
+        training_args.save_at_step_ratio
+    )
+    adaptive_pcgrad_config = resolve_adaptive_projector_pcgrad_config(
+        model_args, training_args
     )
     local_rank = training_args.local_rank
     if model_args.use_pcgrad:
@@ -1110,29 +1367,18 @@ def train(attn_implementation=None):
         model.to(training_args.device)
 
     model.config.use_cache = False
+    model.config.adaptive_projector_pcgrad = bool(model_args.adaptive_projector_pcgrad)
+    model.config.adaptive_pcgrad_stage = (
+        None if adaptive_pcgrad_config is None else int(adaptive_pcgrad_config["stage"])
+    )
+    model.config.adaptive_projector_pcgrad_config = adaptive_pcgrad_config
+    model.config.adaptive_pcgrad_base_model_identifier = str(model_args.model_name_or_path)
+    model.config.adaptive_pcgrad_cka_chunk_size = int(model_args.adaptive_pcgrad_cka_chunk_size)
+    model.config.adaptive_pcgrad_profile = bool(model_args.adaptive_pcgrad_profile)
+
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
-    model.config.cka_loss_random_heads = bool(model_args.cka_loss_random_heads)
-    model.config.cka_loss_head_ids = (
-        {str(layer): heads for layer, heads in manual_head_ids.items()}
-        if manual_head_ids is not None else None
-    )
-    # In manual mode these random-selection settings are recorded but unused.
-    model.config.cka_loss_head_fraction = (
-        validate_head_fraction(model_args.cka_loss_head_fraction)
-        if manual_head_ids is None else model_args.cka_loss_head_fraction
-    )
-    model.config.cka_loss_num_heads = (
-        validate_head_count(model_args.cka_loss_num_heads)
-        if manual_head_ids is None else model_args.cka_loss_num_heads
-    )
-    model.config.cka_loss_head_seed = (
-        validate_head_seed(model_args.cka_loss_head_seed)
-        if manual_head_ids is None else model_args.cka_loss_head_seed
-    )
-    if model.config.cka_loss_random_heads and not model_args.cka_loss:
-        raise ValueError("--cka_loss_random_heads True requires --cka_loss True.")
     model.config.use_pcgrad = bool(model_args.use_pcgrad)
     model.config.vsp_gradient_diagnostics = bool(model_args.vsp_gradient_diagnostics)
     model.config.vsp_asymmetric_pcgrad = bool(model_args.vsp_asymmetric_pcgrad)
@@ -1287,28 +1533,6 @@ def train(attn_implementation=None):
     else:
         model.config.cka_loss_layers = "final"
 
-    if manual_head_ids is not None or model.config.cka_loss_random_heads:
-        if not hasattr(model, "_get_cka_layer_specs"):
-            raise ValueError("Head CKA supports LLaMA/Vicuna, Qwen2/3, Gemma3, Phi3 and Mistral, not this backbone.")
-        model.config.cka_loss_layers = list(manual_head_ids) if manual_head_ids is not None else "all"
-        head_specs = model._get_cka_layer_specs()
-        if manual_head_ids is not None:
-            selection_description = "manual head IDs; only listed layers are supervised"
-        else:
-            selection_description = (
-                f"exact heads/layer={model.config.cka_loss_num_heads}"
-                if model.config.cka_loss_num_heads is not None
-                else f"fraction={model.config.cka_loss_head_fraction}"
-            )
-            selection_description += f", base seed={model.config.cka_loss_head_seed}"
-        rank0_print(
-            "Head CKA: V anchor, mean over heads per layer, then mean over selected layers; "
-            f"{selection_description}. "
-            "Full projector CKA is unchanged. Head IDs below are 0-based."
-        )
-        for spec in head_specs:
-            rank0_print(f"  layer {spec['layer_idx']}: heads {spec['head_indices'].tolist()} / {spec['num_heads']}")
-
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -1429,6 +1653,10 @@ def train(attn_implementation=None):
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
+    validate_adaptive_projector_setup(model, model_args, adaptive_pcgrad_config)
+    validate_adaptive_stage2_handoff(model, model_args, adaptive_pcgrad_config)
+
+
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(f"✅ TRAINABLE: {name} | Shape: {format_parameter_shape(param)}")
@@ -1441,7 +1669,7 @@ def train(attn_implementation=None):
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
-                    callbacks=[StopAfterStepRatioCallback()],
+                    callbacks=[StopAfterStepRatioCallback(), SaveAtStepRatioCallback()],
                     **data_module)
 
     if training_args.debug_compare_cka:

@@ -2,437 +2,230 @@ import copy
 import unittest
 
 import torch
-import torch.nn as nn
 
-from llava.model.llava_arch import project_features_with_pcgrad
+from llava.train.adaptive_projector_pcgrad import (
+    AdaptiveProjectorPCGradConfig,
+    AdaptiveProjectorPCGradController,
+)
 
 
-class ProjectorPcGradTests(unittest.TestCase):
-    def _exact_parameter_grads(
-        self,
-        projector,
-        inputs,
-        main_gradient,
-        cka_gradient,
-        *,
-        cka_scale=1.0,
-        common_scale=1.0,
-    ):
-        parameters = tuple(
-            parameter
-            for parameter in projector.parameters()
-            if parameter.requires_grad
-        )
-        projected_features = projector(inputs)
-        task_loss = common_scale * (projected_features * main_gradient).sum()
-        cka_loss = (
-            common_scale
-            * cka_scale
-            * (projected_features * cka_gradient).sum()
-        )
-        task_grads = torch.autograd.grad(
-            task_loss,
-            parameters,
-            retain_graph=True,
-            allow_unused=True,
-        )
-        cka_grads = torch.autograd.grad(
-            cka_loss,
-            parameters,
-            allow_unused=True,
-        )
+def _config(**overrides):
+    values = {
+        "stage": 1,
+        "planned_optimizer_steps": 10,
+        "max_aux_ratio": 0.5,
+        "warmup_ratio": 0.0,
+        "norm_ema_beta": 0.9,
+        "lambda_max": 100.0,
+        "ce_norm_floor": 1e-12,
+        "aux_norm_floor": 1e-12,
+        "residual_rtol": 1e-6,
+    }
+    values.update(overrides)
+    return AdaptiveProjectorPCGradConfig(**values)
 
-        reduction_dtype = (
-            torch.float64
-            if projected_features.dtype == torch.float64
-            else torch.float32
-        )
-        dot_product = projected_features.new_zeros((), dtype=reduction_dtype)
-        task_norm_sq = projected_features.new_zeros((), dtype=reduction_dtype)
-        for task_grad, cka_grad in zip(task_grads, cka_grads):
-            if task_grad is not None:
-                task_float = task_grad.to(reduction_dtype)
-                task_norm_sq = task_norm_sq + task_float.square().sum()
-                if cka_grad is not None:
-                    dot_product = dot_product + (
-                        task_float * cka_grad.to(reduction_dtype)
-                    ).sum()
 
-        coefficient = torch.where(
-            torch.isfinite(dot_product)
-            & torch.isfinite(task_norm_sq)
-            & (dot_product < 0)
-            & (task_norm_sq > 0),
-            dot_product
-            / task_norm_sq.clamp_min(torch.finfo(reduction_dtype).tiny),
-            dot_product.new_zeros(()),
-        )
-        expected = []
-        for parameter, task_grad, cka_grad in zip(
-            parameters,
-            task_grads,
-            cka_grads,
-        ):
-            if task_grad is None and cka_grad is None:
-                merged = torch.zeros_like(parameter)
-            elif task_grad is None:
-                merged = cka_grad
-            elif cka_grad is None:
-                merged = task_grad
-            else:
-                task_float = task_grad.to(reduction_dtype)
-                merged = (
-                    task_float
-                    + cka_grad.to(reduction_dtype)
-                    - coefficient * task_float
-                ).to(parameter.dtype)
-            expected.append(merged)
-        return tuple(expected), task_grads, cka_grads
+def _prepare(controller, main, auxiliary, *, valid_count=1.0):
+    main = [torch.as_tensor(main, dtype=torch.float32)]
+    auxiliary = [torch.as_tensor(auxiliary, dtype=torch.float32)]
+    merged, logs = controller.prepare(
+        main,
+        auxiliary,
+        valid_count=valid_count,
+        reference_tensor=main[0],
+    )
+    update = merged[0] - main[0]
+    return main[0], auxiliary[0], merged[0], update, logs
 
-    def _actual_parameter_grads(
-        self,
-        projector,
-        inputs,
-        main_gradient,
-        cka_gradient,
-        *,
-        cka_scale=1.0,
-        common_scale=1.0,
-    ):
-        projector.zero_grad(set_to_none=True)
-        main_branch, cka_branch = project_features_with_pcgrad(
-            projector,
-            inputs,
-        )
-        loss = common_scale * (
-            (main_branch * main_gradient).sum()
-            + cka_scale * (cka_branch * cka_gradient).sum()
-        )
-        loss.backward()
-        return tuple(
-            parameter.grad.detach().clone()
-            for parameter in projector.parameters()
-            if parameter.requires_grad
-        )
 
-    def test_parameter_conflict_is_projected_even_when_output_dot_is_positive(self):
-        projector = nn.Linear(2, 1, bias=False)
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[1.0, 0.0], [0.0, 2.0]])
-        main_gradient = torch.tensor([[1.0], [1.0]])
-        cka_gradient = torch.tensor([[2.0], [-1.0]])
+class AdaptiveProjectorPCGradMathTests(unittest.TestCase):
+    def test_antiparallel_auxiliary_is_removed_without_changing_main(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        main, _, merged, update, logs = _prepare(controller, [1.0, 0.0], [-2.0, 0.0])
 
-        self.assertGreater(
-            float((main_gradient * cka_gradient).sum()),
-            0.0,
-        )
-        expected, task_grads, cka_grads = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-        parameter_dot = sum(
-            (task_grad * cka_grad).sum()
-            for task_grad, cka_grad in zip(task_grads, cka_grads)
-        )
-        self.assertLess(float(parameter_dot), 0.0)
+        torch.testing.assert_close(update, torch.zeros_like(update), atol=1e-7, rtol=0.0)
+        torch.testing.assert_close(merged, main, atol=1e-7, rtol=0.0)
+        self.assertEqual(logs["conflict"], 1.0)
+        self.assertGreater(logs["lambda"], 0.0)
+        self.assertLessEqual(logs["effective_aux_ratio"], controller.rho + 1e-7)
 
-        actual = self._actual_parameter_grads(
-            projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
+    def test_two_dimensional_conflict_projects_to_feasible_half_space(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        main, _, merged, update, logs = _prepare(controller, [1.0, 0.0], [-1.0, 1.0])
 
-        for actual_grad, expected_grad in zip(actual, expected):
-            torch.testing.assert_close(actual_grad, expected_grad)
+        expected_y = controller.rho / (2.0 ** 0.5)
         torch.testing.assert_close(
-            actual[0],
-            torch.tensor([[3.4, 0.8]]),
+            update,
+            torch.tensor([0.0, expected_y]),
+            atol=2e-7,
+            rtol=2e-7,
+        )
+        self.assertGreaterEqual(float(torch.dot(main, update)), -1e-7)
+        self.assertLessEqual(float(torch.linalg.vector_norm(update)), controller.rho + 1e-7)
+        torch.testing.assert_close(merged, main + update)
+        self.assertEqual(logs["cap_scale"], 1.0)
+
+    def test_projection_does_not_reinflate_discarded_conflicting_component(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        _, _, _, update, logs = _prepare(controller, [1.0, 0.0], [-1.0, 1.0])
+
+        # The raw scaled auxiliary has norm rho. Orthogonal projection removes
+        # one component, and the cap must not stretch the remainder back to rho.
+        self.assertAlmostEqual(logs["projection_retention"], 2.0 ** -0.5, places=6)
+        self.assertAlmostEqual(logs["cap_scale"], 1.0, places=7)
+        self.assertLess(float(torch.linalg.vector_norm(update)), controller.rho)
+
+    def test_hard_cap_uses_current_ce_norm_when_ema_ratio_is_stale(self):
+        controller = AdaptiveProjectorPCGradController(
+            _config(max_aux_ratio=0.25, norm_ema_beta=0.9)
+        )
+        _prepare(controller, [10.0, 0.0], [1.0, 0.0])
+        controller.finish(optimizer_stepped=True)
+
+        main, _, _, update, logs = _prepare(controller, [1.0, 0.0], [10.0, 0.0])
+        allowed = controller.rho * float(torch.linalg.vector_norm(main))
+        self.assertLess(logs["cap_scale"], 1.0)
+        self.assertAlmostEqual(float(torch.linalg.vector_norm(update)), allowed, places=6)
+        self.assertLessEqual(logs["effective_aux_ratio"], controller.rho + 1e-7)
+
+    def test_missing_gradient_entries_are_supported(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        main = [torch.tensor([1.0]), None]
+        auxiliary = [None, torch.tensor([2.0])]
+        merged, logs = controller.prepare(
+            main,
+            auxiliary,
+            valid_count=1.0,
+            reference_tensor=main[0],
         )
 
-    def test_non_conflicting_parameter_gradients_are_summed(self):
-        projector = nn.Linear(2, 2)
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[0.25, -0.75], [1.0, 0.5]])
-        main_gradient = torch.tensor([[1.0, 2.0], [0.5, 1.0]])
-        cka_gradient = torch.tensor([[2.0, 1.0], [1.0, 0.5]])
+        # Main and auxiliary live in disjoint coordinates. The auxiliary is
+        # capped but retained, while the original main coordinate is untouched.
+        torch.testing.assert_close(merged[0], main[0])
+        self.assertIsNotNone(merged[1])
+        self.assertLessEqual(float(merged[1].norm()), controller.rho + 1e-7)
+        self.assertEqual(logs["conflict"], 0.0)
 
-        expected, task_grads, cka_grads = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-        self.assertGreaterEqual(
-            float(
-                sum(
-                    (task_grad * cka_grad).sum()
-                    for task_grad, cka_grad in zip(task_grads, cka_grads)
-                )
-            ),
-            0.0,
-        )
-        actual = self._actual_parameter_grads(
-            projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
+    def test_invalid_valid_count_is_rejected(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        with self.assertRaisesRegex(ValueError, "valid_count"):
+            _prepare(controller, [1.0], [1.0], valid_count=float("nan"))
 
-        for actual_grad, expected_grad in zip(actual, expected):
-            torch.testing.assert_close(actual_grad, expected_grad)
-
-    def test_static_cka_weight_and_common_loss_scale_reach_exact_pcgrad(self):
-        torch.manual_seed(17)
-        projector = nn.Sequential(
-            nn.Linear(2, 3, bias=False),
-            nn.GELU(),
-            nn.Linear(3, 2, bias=False),
-        )
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[0.25, -0.75], [1.0, 0.5]])
-        main_gradient = torch.tensor([[1.0, -2.0], [0.5, 1.0]])
-        cka_gradient = torch.tensor([[-3.0, 1.0], [2.0, -1.0]])
-        cka_scale = 0.25 * 0.4
-        common_scale = 128.0
-
-        expected, _, _ = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-            cka_scale=cka_scale,
-            common_scale=common_scale,
-        )
-        actual = self._actual_parameter_grads(
-            projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-            cka_scale=cka_scale,
-            common_scale=common_scale,
-        )
-
-        for actual_grad, expected_grad in zip(actual, expected):
-            torch.testing.assert_close(actual_grad, expected_grad)
-
-    def test_unused_branch_matches_ordinary_projector_backward(self):
-        inputs = torch.tensor([[0.25, -0.75], [1.0, 0.5]])
-        branch_gradient = torch.tensor([[2.0, -3.0], [1.0, 4.0]])
-
-        for active_branch in ("main", "cka"):
-            with self.subTest(active_branch=active_branch):
-                projector = nn.Sequential(
-                    nn.Linear(2, 3),
-                    nn.GELU(),
-                    nn.Linear(3, 2),
-                )
-                reference_projector = copy.deepcopy(projector)
-                main_branch, cka_branch = project_features_with_pcgrad(
-                    projector,
-                    inputs,
-                )
-                ordinary_output = reference_projector(inputs)
-                torch.testing.assert_close(main_branch, ordinary_output)
-                torch.testing.assert_close(cka_branch, ordinary_output)
-
-                active = (
-                    main_branch
-                    if active_branch == "main"
-                    else cka_branch
-                )
-                (active * branch_gradient).sum().backward()
-                (ordinary_output * branch_gradient).sum().backward()
-
-                for actual_parameter, expected_parameter in zip(
-                    projector.parameters(),
-                    reference_projector.parameters(),
-                ):
-                    torch.testing.assert_close(
-                        actual_parameter.grad,
-                        expected_parameter.grad,
-                    )
-
-    def test_zero_task_gradient_leaves_cka_gradient_finite_and_unchanged(self):
-        projector = nn.Linear(2, 2)
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[1.0, -1.0], [0.5, 2.0]])
-        main_gradient = torch.zeros(2, 2)
-        cka_gradient = torch.tensor([[2.0, -3.0], [0.5, 7.0]])
-
-        expected, _, _ = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-        actual = self._actual_parameter_grads(
-            projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-
-        for actual_grad, expected_grad in zip(actual, expected):
-            self.assertTrue(torch.isfinite(actual_grad).all())
-            torch.testing.assert_close(actual_grad, expected_grad)
-
-    def test_projector_input_keeps_the_ordinary_summed_gradient(self):
-        torch.manual_seed(23)
-        projector = nn.Sequential(
-            nn.Linear(2, 3),
-            nn.GELU(),
-            nn.Linear(3, 2),
-        )
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor(
-            [[0.25, -0.75], [1.0, 0.5]],
-            requires_grad=True,
-        )
-        reference_inputs = inputs.detach().clone().requires_grad_(True)
-        main_gradient = torch.tensor([[1.0, 0.0], [0.5, -1.0]])
-        cka_gradient = torch.tensor([[-2.0, 1.0], [1.0, 2.0]])
-
-        main_branch, cka_branch = project_features_with_pcgrad(
-            projector,
-            inputs,
-        )
-        (
-            (main_branch * main_gradient).sum()
-            + (cka_branch * cka_gradient).sum()
-        ).backward()
-
-        reference_output = reference_projector(reference_inputs)
-        (reference_output * (main_gradient + cka_gradient)).sum().backward()
-
-        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
-
-    def test_fp16_large_projection_coefficient_stays_finite(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        projector = nn.Linear(1, 2, bias=False).to(
-            device=device,
-            dtype=torch.float16,
-        )
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.ones(1, 1, device=device, dtype=torch.float16)
-        main_gradient = torch.tensor(
-            [[1e-5, 0.0]],
-            device=device,
-            dtype=torch.float16,
-        )
-        cka_gradient = torch.tensor(
-            [[-1.0, 1.0]],
-            device=device,
-            dtype=torch.float16,
-        )
-
-        expected, _, _ = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-        actual = self._actual_parameter_grads(
-            projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
-        )
-
-        for actual_grad, expected_grad in zip(actual, expected):
-            self.assertTrue(torch.isfinite(actual_grad).all())
-            torch.testing.assert_close(
-                actual_grad,
-                expected_grad,
-                rtol=1e-3,
-                atol=1e-3,
+    def test_fp32_boundary_roundoff_is_corrected_before_invariant_check(self):
+        controller = AdaptiveProjectorPCGradController(
+            _config(
+                max_aux_ratio=0.1,
+                norm_ema_beta=0.95,
+                lambda_max=1.0,
+                residual_rtol=1e-7,
             )
-
-    def test_gradient_logging_probes_do_not_consume_private_graph(self):
-        torch.manual_seed(31)
-        projector = nn.Sequential(
-            nn.Linear(2, 3),
-            nn.GELU(),
-            nn.Linear(3, 2),
         )
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[0.25, -0.75], [1.0, 0.5]])
-        main_gradient = torch.tensor([[1.0, -2.0], [0.5, 1.0]])
-        cka_gradient = torch.tensor([[-3.0, 1.0], [2.0, -1.0]])
-
-        expected, expected_task, expected_cka = self._exact_parameter_grads(
-            reference_projector,
-            inputs,
-            main_gradient,
-            cka_gradient,
+        main, _, _, update, logs = _prepare(
+            controller,
+            [1.5409960746765137, -0.293428897857666],
+            [-2.3328890800476074, 0.5977741479873657],
         )
-        main_branch, cka_branch = project_features_with_pcgrad(
-            projector,
-            inputs,
+
+        tolerance = 2e-7 * float(main.norm()) * max(float(update.norm()), 1e-30)
+        self.assertGreaterEqual(float(torch.dot(main, update)), -tolerance)
+        self.assertLessEqual(float(update.norm()), controller.rho * float(main.norm()) + 1e-7)
+        self.assertEqual(logs["conflict"], 1.0)
+
+
+class AdaptiveProjectorPCGradStateTests(unittest.TestCase):
+    def test_ema_is_proposed_then_committed_only_after_successful_step(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        _prepare(controller, [3.0, 4.0], [0.0, 2.0])
+
+        self.assertIsNone(controller.ema_g)
+        self.assertIsNone(controller.ema_b)
+        self.assertEqual(controller.successful_steps, 0)
+        controller.finish(optimizer_stepped=False)
+        self.assertIsNone(controller.ema_g)
+        self.assertIsNone(controller.ema_b)
+        self.assertEqual(controller.successful_steps, 0)
+        self.assertEqual(controller.overflow_skips, 1)
+
+        _prepare(controller, [3.0, 4.0], [0.0, 2.0])
+        controller.finish(optimizer_stepped=True)
+        self.assertEqual(controller.ema_g, 5.0)
+        self.assertEqual(controller.ema_b, 2.0)
+        self.assertEqual(controller.successful_steps, 1)
+        self.assertEqual(controller.valid_proposals, 1)
+
+    def test_skipped_optimizer_step_does_not_advance_warmup(self):
+        controller = AdaptiveProjectorPCGradController(
+            _config(planned_optimizer_steps=10, warmup_ratio=0.5)
         )
-        task_loss = (main_branch * main_gradient).sum()
-        cka_loss = (cka_branch * cka_gradient).sum()
-        parameters = tuple(projector.parameters())
+        initial_rho = controller.rho
+        _prepare(controller, [1.0], [1.0])
+        controller.finish(optimizer_stepped=False)
+        self.assertEqual(controller.rho, initial_rho)
 
-        task_probe = torch.autograd.grad(
-            task_loss,
-            parameters,
-            retain_graph=True,
+        _prepare(controller, [1.0], [1.0])
+        controller.finish(optimizer_stepped=True)
+        self.assertGreater(controller.rho, initial_rho)
+
+    def test_all_invalid_window_advances_successful_step_but_not_ema(self):
+        controller = AdaptiveProjectorPCGradController(_config())
+        _, _, _, update, logs = _prepare(
+            controller,
+            [1.0, 2.0],
+            [7.0, 8.0],
+            valid_count=0.0,
         )
-        cka_probe = torch.autograd.grad(
-            cka_loss,
-            parameters,
-            retain_graph=True,
-        )
-        for actual_grad, expected_grad in zip(task_probe, expected_task):
-            torch.testing.assert_close(actual_grad, expected_grad)
-        for actual_grad, expected_grad in zip(cka_probe, expected_cka):
-            torch.testing.assert_close(actual_grad, expected_grad)
+        torch.testing.assert_close(update, torch.zeros_like(update))
+        self.assertEqual(logs["lambda"], 0.0)
+        controller.finish(optimizer_stepped=True)
+        self.assertEqual(controller.successful_steps, 1)
+        self.assertIsNone(controller.ema_g)
+        self.assertIsNone(controller.ema_b)
 
-        (task_loss + cka_loss).backward()
-        for parameter, expected_grad in zip(parameters, expected):
-            torch.testing.assert_close(parameter.grad, expected_grad)
+    def test_resume_round_trip_preserves_adaptive_state(self):
+        controller = AdaptiveProjectorPCGradController(_config(stage=2))
+        _prepare(controller, [3.0, 4.0], [0.0, 2.0])
+        controller.finish(optimizer_stepped=True)
+        state = copy.deepcopy(controller.state_dict())
 
-    def test_zero3_partitioned_projector_fails_fast(self):
-        projector = nn.Linear(2, 2)
-        parameter = next(projector.parameters())
-        parameter.ds_id = 0
-        try:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "does not support DeepSpeed ZeRO-3",
-            ):
-                project_features_with_pcgrad(
-                    projector,
-                    torch.ones(1, 2),
-                )
-        finally:
-            del parameter.ds_id
+        restored = AdaptiveProjectorPCGradController(_config(stage=2))
+        restored.load_state_dict(state)
+        self.assertEqual(restored.state_dict(), state)
 
-    def test_frozen_projector_bypasses_pcgrad_and_preserves_input_gradient(self):
-        projector = nn.Linear(2, 2)
-        for parameter in projector.parameters():
-            parameter.requires_grad_(False)
-        reference_projector = copy.deepcopy(projector)
-        inputs = torch.tensor([[1.0, -1.0]], requires_grad=True)
-        reference_inputs = inputs.detach().clone().requires_grad_(True)
-        main_gradient = torch.tensor([[1.0, 2.0]])
-        cka_gradient = torch.tensor([[-3.0, 4.0]])
+        _, _, merged_a, _, logs_a = _prepare(controller, [1.0, 2.0], [-2.0, 1.0])
+        _, _, merged_b, _, logs_b = _prepare(restored, [1.0, 2.0], [-2.0, 1.0])
+        torch.testing.assert_close(merged_a, merged_b)
+        self.assertEqual(logs_a, logs_b)
 
-        main_branch, cka_branch = project_features_with_pcgrad(
-            projector,
-            inputs,
-        )
-        (
-            (main_branch * main_gradient).sum()
-            + (cka_branch * cka_gradient).sum()
-        ).backward()
-        reference_output = reference_projector(reference_inputs)
-        (reference_output * (main_gradient + cka_gradient)).sum().backward()
+    def test_resume_rejects_stage_or_planned_step_mismatch(self):
+        source = AdaptiveProjectorPCGradController(_config(stage=1))
+        state = source.state_dict()
+        with self.assertRaisesRegex(RuntimeError, "another stage"):
+            AdaptiveProjectorPCGradController(_config(stage=2)).load_state_dict(state)
+        with self.assertRaisesRegex(RuntimeError, "planned[_ ]optimizer[_ ]steps"):
+            AdaptiveProjectorPCGradController(
+                _config(planned_optimizer_steps=11)
+            ).load_state_dict(state)
 
-        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    def test_resume_rejects_other_controller_config_mismatch(self):
+        source = AdaptiveProjectorPCGradController(_config(max_aux_ratio=0.5))
+        state = source.state_dict()
+        with self.assertRaisesRegex(RuntimeError, "config"):
+            AdaptiveProjectorPCGradController(
+                _config(max_aux_ratio=0.25)
+            ).load_state_dict(state)
+
+    def test_resume_rejects_nonfinite_ema_and_invalid_counters(self):
+        state = AdaptiveProjectorPCGradController(_config()).state_dict()
+        bad_ema = copy.deepcopy(state)
+        bad_ema["ema_g"] = float("nan")
+        bad_ema["ema_b"] = 1.0
+        with self.assertRaisesRegex(RuntimeError, "invalid ema_g"):
+            AdaptiveProjectorPCGradController(_config()).load_state_dict(bad_ema)
+
+        bad_counter = copy.deepcopy(state)
+        bad_counter["valid_proposals"] = 1
+        with self.assertRaisesRegex(RuntimeError, "more valid proposals"):
+            AdaptiveProjectorPCGradController(_config()).load_state_dict(bad_counter)
 
 
 if __name__ == "__main__":

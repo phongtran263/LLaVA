@@ -261,10 +261,6 @@ class LlavaMetaForCausalLM(ABC):
     def warn_if_projector_only_cka(self):
         """Warn once when a backbone cannot honor hidden-layer CKA settings."""
         config = self.get_model().config
-        if getattr(config, "cka_loss_head_ids", None):
-            raise ValueError("Manual head CKA is not supported by this projector-only CKA backbone.")
-        if getattr(config, "cka_loss_random_heads", False):
-            raise ValueError("Random-head CKA is not supported by this projector-only CKA backbone.")
         raw_layers = getattr(config, 'cka_loss_layers', 'final')
         disabled_tokens = {"-1", "none", "off", "false"}
         hidden_layers_disabled = (
@@ -290,9 +286,34 @@ class LlavaMetaForCausalLM(ABC):
         )
         self._projector_only_cka_warned = True
 
-    def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+    def encode_images(self, images, adaptive_observation_mask=None):
+        config = self.get_model().config
+        vision_tower = self.get_model().get_vision_tower()
+        image_features = vision_tower(images)
         projected_image_features = self.get_model().mm_projector(image_features)
+        if self.get_model().training and getattr(
+            self.get_model().config, 'adaptive_projector_pcgrad', False
+        ):
+            if adaptive_observation_mask is None:
+                adaptive_observation_mask = torch.ones(
+                    image_features.shape[0], dtype=torch.bool, device=image_features.device
+                )
+            else:
+                adaptive_observation_mask = adaptive_observation_mask.to(
+                    device=image_features.device, dtype=torch.bool
+                )
+            if adaptive_observation_mask.ndim != 1 or adaptive_observation_mask.numel() != image_features.shape[0]:
+                raise ValueError(
+                    "Adaptive projector replay observation mask must have one entry per "
+                    f"vision observation, got {tuple(adaptive_observation_mask.shape)} for "
+                    f"{image_features.shape[0]} observations."
+                )
+            capture = image_features[adaptive_observation_mask].detach()
+            capture_buffer = getattr(self.get_model(), '_adaptive_projector_replay_features', None)
+            if capture_buffer is None:
+                capture_buffer = []
+                self.get_model()._adaptive_projector_replay_features = capture_buffer
+            capture_buffer.append(capture)
         if self.get_model().training and getattr(self.get_model().config, 'log_gradient_norms', False):
             self.last_cka_projector_output = projected_image_features
 
@@ -369,6 +390,15 @@ class LlavaMetaForCausalLM(ABC):
         images, image_sizes=None
     ):
         vision_tower = self.get_vision_tower()
+        adaptive_capture_enabled = bool(
+            self.get_model().training
+            and getattr(self.get_model().config, 'adaptive_projector_pcgrad', False)
+        )
+        if adaptive_capture_enabled:
+            # Scoped to one main VLM forward and consumed after CE backward.
+            # Captures are detached, so they never retain the decoder graph.
+            self.get_model()._adaptive_projector_replay_features = []
+
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
                 return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None
@@ -376,18 +406,41 @@ class LlavaMetaForCausalLM(ABC):
 
         pre_post_cka_loss = None
         pre_projector_image_features = None
+        adaptive_sample_has_image = None
+        if adaptive_capture_enabled:
+            image_tokens = input_ids.eq(IMAGE_TOKEN_INDEX)
+            if attention_mask is not None:
+                image_tokens = image_tokens & attention_mask.bool()
+            adaptive_sample_has_image = image_tokens.any(dim=1)
 
         if type(images) is list or (not isinstance(images, dict) and images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+            split_sizes = [image.shape[0] for image in images]
+            if adaptive_capture_enabled and len(split_sizes) != input_ids.shape[0]:
+                raise ValueError(
+                    "Adaptive projector replay requires one image/crop group per sample: "
+                    f"got {len(split_sizes)} groups for batch size {input_ids.shape[0]}."
+                )
+            adaptive_observation_mask = None
+            if adaptive_capture_enabled:
+                adaptive_observation_mask = torch.repeat_interleave(
+                    adaptive_sample_has_image,
+                    torch.as_tensor(split_sizes, device=adaptive_sample_has_image.device),
+                    output_size=sum(split_sizes),
+                )
+
             concat_images = torch.cat([image for image in images], dim=0)
             if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
-                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(concat_images)
+                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(
+                    concat_images, adaptive_observation_mask=adaptive_observation_mask
+                )
             else:
-                image_features = self.encode_images(concat_images)
+                image_features = self.encode_images(
+                    concat_images, adaptive_observation_mask=adaptive_observation_mask
+                )
                 if isinstance(image_features, tuple):
                     image_features = image_features[0]
-            split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             if pre_projector_image_features is not None:
                 pre_projector_image_features = torch.split(pre_projector_image_features, split_sizes, dim=0)
@@ -446,10 +499,23 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
+            adaptive_observation_mask = None
+            if adaptive_capture_enabled:
+                if images.shape[0] != input_ids.shape[0]:
+                    raise ValueError(
+                        "Adaptive projector replay requires one image observation per sample "
+                        "for rank-4 image batches: "
+                        f"got {images.shape[0]} images for batch size {input_ids.shape[0]}."
+                    )
+                adaptive_observation_mask = adaptive_sample_has_image
             if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
-                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(images)
+                image_features, pre_post_cka_loss, pre_projector_image_features = self.encode_images(
+                    images, adaptive_observation_mask=adaptive_observation_mask
+                )
             else:
-                image_features = self.encode_images(images)
+                image_features = self.encode_images(
+                    images, adaptive_observation_mask=adaptive_observation_mask
+                )
                 if isinstance(image_features, tuple):
                     image_features = image_features[0]
 

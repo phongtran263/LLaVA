@@ -29,6 +29,9 @@ lmms-eval
 scripts
 !/scripts/
 /scripts/*
+!/scripts/adaptive_projector_pcgrad/
+!/scripts/adaptive_projector_pcgrad/stage1_defaults.json
+!/scripts/adaptive_projector_pcgrad/stage2_defaults.json
 !/scripts/v1_5/
 /scripts/v1_5/*
 !/scripts/v1_5/pretrain_backbone.sh
@@ -39,6 +42,11 @@ scripts
 !/scripts/v1_5/7b/finetune_qwen2_5_random_heads.sh
 !/scripts/v1_5/7b/finetune_min_drift_heads_list.sh
 !/scripts/v1_5/7b/pretrain_qwen2_5_random_heads.sh
+!/scripts/v1_5/7b/pretrain_qwen2_5_adaptive_pcgrad.sh
+!/scripts/v1_5/7b/finetune_qwen2_5_adaptive_pcgrad.sh
+!/scripts/v1_5/7b/train_qwen2_5_adaptive_pcgrad.sh
+!/scripts/v1_5/7b/pretrain_list.sh
+!/scripts/v1_5/7b/finetune_list.sh
 eval_results
 cka_results
 analysis

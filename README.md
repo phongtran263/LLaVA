@@ -113,80 +113,8 @@ bash scripts/v1_5/finetune_backbone.sh
 The same scripts accept any supported checkpoint through `MODEL_NAME_OR_PATH`.
 Use `CKA_LOSS=True` and the `CKA_*` / `VSP_*` environment variables to
 enable the optional CKA and gradient-controller settings; they are off by default.
-
-For CKA on a fixed random 25% of attention heads in every decoder layer, with
-full-representation projector CKA enabled as well, use:
-
-```Shell
-CKA_HEAD_FRACTION=0.25 CKA_HEAD_SEED=42 \
-    bash scripts/v1_5/7b/finetune_qwen2_5_random_heads.sh
-```
-
-The same mode is available for projector pretraining. It can be toggled without
-editing the script, and the two modes write to separate checkpoint directories:
-
-```Shell
-# Pretrain with full projector CKA + fixed random-head CKA at every layer.
-bash scripts/v1_5/7b/pretrain_qwen2_5_random_heads.sh
-
-# Baseline pretrain with all CKA computation disabled.
-CKA_LOSS_ENABLED=False \
-    bash scripts/v1_5/7b/pretrain_qwen2_5_random_heads.sh
-```
-
-Each 1-based layer `k` uses seed `CKA_HEAD_SEED + k` and selects
-`ceil(num_attention_heads * CKA_HEAD_FRACTION)` query/output heads (not KV heads).
-Its sample is fixed across steps and reproducible when resuming with the same seed.
-Heads are sampled without
-replacement within a layer; head indices may overlap between layers. CKA is
-computed per selected head before `o_proj`, then averaged over heads and layers.
-`CKA_FINAL_HIDDEN_WEIGHT` controls this head loss and `CKA_PROJECTOR_WEIGHT`
-controls the unchanged full projector branch (both default to `0.1` in this
-launcher). The random-head mode uses all decoder layers and the detached visual
-features as its reference, so the launcher clears `CKA_ANCHOR_LAYER`. Default
-checkpoint paths and W&B run names include the head fraction and seed. Existing
-`MODEL_NAME_OR_PATH`, `RUN_NAME`, `MM_PROJECTOR_TYPE`, and `PRETRAIN_ADAPTER`
-overrides are preserved.
-
-The base Qwen launcher also accepts `CKA_RANDOM_HEADS=True`, `CKA_HEAD_FRACTION`,
-and `CKA_HEAD_SEED`; set `CKA_PROJECTOR_WEIGHT` explicitly there to enable its
-projector branch. For the generic backbone launcher, also set `CKA_LOSS=True`
-and leave `CKA_ANCHOR_LAYER` empty. These options do not resample heads each step.
-All heads/tokens still participate in the normal forward and CE objective; this
-mode adds per-head CKA, not attention pruning. It does not enable PCGrad or an
-extra model forward/backward. The auxiliary computation and retained activations
-still add cost; throughput has not been benchmarked. Head IDs are logged at
-startup and saved in `config.json`; `loss/cka_heads_loss` logs their raw mean loss.
-
-#### Manually selected attention-head CKA
-
-The existing Qwen base launcher accepts a JSON mapping from 1-based decoder layer
-IDs to 0-based query/output head IDs (not KV heads):
-
-```Shell
-CKA_HEAD_IDS='{"1":[0,3],"4":[2,5,7]}' \
-CKA_RANDOM_HEADS=False CKA_LOSS_ENABLED=True CKA_FINAL_HIDDEN_WEIGHT=0.1 \
-CKA_ANCHOR_LAYER= \
-OUTPUT_DIR=./checkpoints/finetune-cka/qwen2.5-0.5b/manual-heads-example/llava-finetune \
-WANDB_RUN_NAME=qwen2.5-0.5b-manual-heads-example \
-    bash scripts/v1_5/7b/finetune_qwen2_5.sh
-```
-
-Choose a fresh output directory and W&B run name for each new experiment to avoid
-mixing prior runs. The mapping enables manual-head mode even with
-`CKA_RANDOM_HEADS=False`, overriding random fraction/count/seed settings and
-`CKA_LAYERS`; only the listed layers receive head CKA. Each layer's head list must
-be nonempty, unique, and in bounds, and layer IDs must be unique and in bounds.
-This mode uses only the detached visual-feature (V) anchor; leave
-`CKA_ANCHOR_LAYER` empty. Head losses are averaged within each layer, then equally
-across selected layers. Projector CKA weighting and CE are unchanged, and no
-extra projection parameters are introduced.
-
-Both generic backbone launchers also accept `CKA_HEAD_IDS`; set `CKA_LOSS=True`
-and a nonzero `CKA_FINAL_HIDDEN_WEIGHT` for the head loss to take effect
-(pretraining defaults that weight to zero). Direct training commands use
-`--cka_loss_head_ids '{"1":[0,3],"4":[2,5,7]}'` with `--cka_loss True` and a
-nonzero `--cka_loss_final_hidden_weight`.
+The separate two-stage adaptive projector-only PCGrad path is documented in
+[docs/Adaptive_Projector_PCGrad.md](docs/Adaptive_Projector_PCGrad.md).
 
 CPU training, accumulation, checkpoint, CKA, and backbone compatibility checks:
 `python -m unittest -v tests.test_training_compatibility tests.test_backbone_registry`.

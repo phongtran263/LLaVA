@@ -423,8 +423,7 @@ class LlavaModernMixin(LlavaMetaForCausalLM):
 
                 if layer_losses:
                     stacked = torch.stack(layer_losses)
-                    average_layers = cka_layer_specs[0]["kind"] == "heads"
-                    cka_layers_loss = stacked.mean() if average_layers else stacked.sum()
+                    cka_layers_loss = stacked.sum()
                 self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None

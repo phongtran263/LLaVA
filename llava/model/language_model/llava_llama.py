@@ -29,14 +29,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from llava.constants import IGNORE_INDEX
-from ..head_cka import (
-    compute_head_cka_loss,
-    parse_head_ids,
-    select_head_indices,
-    validate_head_count,
-    validate_head_fraction,
-    validate_head_seed,
-)
 from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
@@ -178,64 +170,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def _get_cka_layer_specs(self):
         config = self.get_model().config
-        manual_heads = parse_head_ids(getattr(config, "cka_loss_head_ids", None))
-        if manual_heads is not None or getattr(config, "cka_loss_random_heads", False):
-            if getattr(config, "cka_loss_anchor_layer", None) is not None:
-                raise ValueError("Head CKA requires the vision anchor V; omit cka_loss_anchor_layer.")
-            fraction, selected_count, seed = None, None, None
-            if manual_heads is None:
-                fraction = validate_head_fraction(getattr(config, "cka_loss_head_fraction", 0.25))
-                selected_count = validate_head_count(getattr(config, "cka_loss_num_heads", None))
-                seed = validate_head_seed(getattr(config, "cka_loss_head_seed", 42))
-            layers = getattr(self.get_model(), "layers", None)
-            if layers is None or not len(layers):
-                raise ValueError("Head CKA requires decoder layers with self_attn.o_proj.")
-            if manual_heads is not None and max(manual_heads) > len(layers):
-                raise ValueError(f"cka_loss_head_ids layer IDs must be in [1, {len(layers)}].")
-            layout = []
-            for layer_idx, layer in enumerate(layers, start=1):
-                if manual_heads is not None and layer_idx not in manual_heads:
-                    continue
-                attention = getattr(layer, "self_attn", None)
-                if getattr(attention, "o_proj", None) is None:
-                    raise ValueError("Head CKA requires self_attn.o_proj in every selected decoder layer.")
-                num_heads = int(getattr(attention, "num_heads", config.num_attention_heads))
-                head_dim = int(getattr(attention, "head_dim", None) or
-                               getattr(config, "head_dim", None) or config.hidden_size // num_heads)
-                if manual_heads is not None and max(manual_heads[layer_idx]) >= num_heads:
-                    raise ValueError(
-                        f"cka_loss_head_ids layer {layer_idx}: head IDs must be in [0, {num_heads - 1}] "
-                        "(query/output heads, not KV heads)."
-                    )
-                layout.append((layer_idx, num_heads, head_dim))
-            manual_signature = (
-                tuple((layer, tuple(heads)) for layer, heads in manual_heads.items())
-                if manual_heads is not None else None
-            )
-            signature = (manual_signature, fraction, selected_count, seed, tuple(layout))
-            cached = getattr(self, "_cka_head_specs_cache", None)
-            if cached is not None and cached[0] == signature:
-                return cached[1]
-            specs = []
-            for layer_idx, num_heads, head_dim in layout:
-                indices = (
-                    torch.tensor(manual_heads[layer_idx], dtype=torch.long)
-                    if manual_heads is not None else select_head_indices(
-                        num_heads, fraction, seed, layer_idx, selected_count=selected_count,
-                    )
-                )
-                specs.append({
-                    "kind": "heads", "name": f"layer_{layer_idx}_heads",
-                    "layer_idx": layer_idx, "num_heads": num_heads, "head_dim": head_dim,
-                    "head_indices": indices,
-                })
-            # Plain lists persist the exact selection in config.json/W&B.
-            config.cka_loss_head_indices = {
-                str(spec["layer_idx"]): spec["head_indices"].tolist() for spec in specs
-            }
-            self._cka_head_specs_cache = (signature, specs)
-            return specs
-
         raw_layers = getattr(self.get_model().config, 'cka_loss_layers', "final")
         if raw_layers == [-1] or raw_layers in (None, "", False):
             return []
@@ -366,16 +300,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if layers is None:
             return []
 
-        if any(spec["kind"] == "heads" for spec in cka_layer_specs) and self.training:
-            # Reentrant checkpointing executes its first forward under no_grad,
-            # so a captured intermediate cannot serve as an auxiliary target.
-            decoder = self.get_model()
-            for module in (decoder, *layers):
-                if getattr(module, "gradient_checkpointing", False):
-                    checkpoint_fn = getattr(module, "_gradient_checkpointing_func", None)
-                    if getattr(checkpoint_fn, "keywords", {}).get("use_reentrant", True):
-                        raise ValueError("Random-head CKA requires gradient checkpointing with use_reentrant=False.")
-
         handles = []
         for spec in cka_layer_specs:
             # ``final`` is the local transition of the last decoder block.
@@ -385,14 +309,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             layer_name = spec["name"]
             layer = layers[layer_idx - 1]
 
-            if spec["kind"] == "heads":
-                def capture_heads(module, module_inputs, layer_name=layer_name):
-                    # Capture only: gather/reshape outside the checkpointed
-                    # block to keep non-reentrant recomputation identical.
-                    captured_layer_hiddens[layer_name] = module_inputs[0]
-
-                handles.append(layer.self_attn.o_proj.register_forward_pre_hook(capture_heads))
-                continue
 
             def capture_layer_hidden(module, module_inputs, module_outputs, layer_name=layer_name):
                 hidden_states = module_outputs[0] if isinstance(module_outputs, (tuple, list)) else module_outputs
@@ -433,24 +349,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         vision_feature_mask,
         output_device,
     ):
-        if cka_layer_specs and cka_layer_specs[0]["kind"] == "heads":
-            layer_losses, per_layer_losses = [], {}
-            for spec in cka_layer_specs:
-                hidden = captured_layer_hiddens.pop(spec["name"], None)
-                if hidden is None:
-                    raise RuntimeError(f"Missing pre-o_proj head output for {spec['name']}.")
-                if hidden.ndim != 3 or hidden.shape[-1] != spec["num_heads"] * spec["head_dim"]:
-                    raise ValueError(f"Unexpected attention head output shape for {spec['name']}: {hidden.shape}")
-                heads = hidden.reshape(*hidden.shape[:2], spec["num_heads"], spec["head_dim"])
-                heads = heads.index_select(2, spec["head_indices"].to(hidden.device))
-                layer_loss = compute_head_cka_loss(
-                    heads, reference_features.detach().to(hidden.device), vision_feature_mask,
-                    tau=getattr(self.get_model().config, "cka_loss_tau", 0.0),
-                ).to(output_device)
-                layer_losses.append(layer_loss)
-                per_layer_losses[f"{reference_name}_to_{spec['name']}"] = layer_loss.detach()
-            return layer_losses, per_layer_losses
-
         ordered_hiddens = list(self._iter_cka_layer_hiddens(
             cka_layer_specs,
             captured_layer_hiddens,
@@ -1110,8 +1008,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
                 if layer_losses:
                     stacked = torch.stack(layer_losses)
-                    average_layers = cka_layer_specs[0]["kind"] == "heads"
-                    cka_layers_loss = stacked.mean() if average_layers else stacked.sum()
+                    cka_layers_loss = stacked.sum()
                 self.last_cka_per_layer_losses = per_layer_losses
                 self.last_cka_subset_vision_feature_mask = (
                     subset_vision_feature_mask.detach() if subset_vision_feature_mask is not None else None

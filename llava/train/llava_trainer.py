@@ -1,8 +1,10 @@
 import math
 import os
+import time
 from contextlib import contextmanager
 import torch
 import torch.nn as nn
+from packaging import version
 
 from torch.utils.data import Sampler
 
@@ -24,6 +26,21 @@ from llava.train.vsp_gradient_controller import (
     validate_vsp_gradient_config,
     vsp_controller_requested,
     vsp_rewrites_gradients,
+)
+from llava.train.adaptive_projector_pcgrad import (
+    AdaptiveProjectorPCGradConfig,
+    AdaptiveProjectorPCGradController,
+    METADATA_FILE as ADAPTIVE_PCGRAD_METADATA_FILE,
+    RESOLVED_CONFIG_FILE as ADAPTIVE_PCGRAD_CONFIG_FILE,
+    STATE_FILE as ADAPTIVE_PCGRAD_STATE_FILE,
+    projector_sha256,
+    projector_signature,
+    load_json,
+    write_json,
+)
+from llava.train.projector_replay_reference import (
+    ProjectorReplayAccumulator,
+    ordered_trainable_parameters,
 )
 
 
@@ -88,6 +105,33 @@ def get_stop_after_step(step_ratio, max_steps):
     return int(math.ceil(step_ratio * max_steps))
 
 
+def validate_save_at_step_ratio(value):
+    """Validate an optional fractional optimizer-step checkpoint boundary."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"save_at_step_ratio must be a number in (0, 1), got {value!r}"
+        ) from exc
+
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(
+            f"save_at_step_ratio must be finite and in (0, 1), got {value!r}"
+        )
+    return value
+
+
+def get_save_at_step(step_ratio, max_steps):
+    """Return the optimizer step at which the fractional checkpoint is saved."""
+    step_ratio = validate_save_at_step_ratio(step_ratio)
+    max_steps = int(max_steps)
+    if max_steps <= 0:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+    return int(math.ceil(step_ratio * max_steps))
+
+
 class StopAfterStepRatioCallback(TrainerCallback):
     """Save a resumable checkpoint and stop at a fraction of the full run."""
 
@@ -100,6 +144,20 @@ class StopAfterStepRatioCallback(TrainerCallback):
         if state.global_step >= stop_step:
             control.should_save = True
             control.should_training_stop = True
+        return control
+
+
+class SaveAtStepRatioCallback(TrainerCallback):
+    """Save once at a fraction of the full run without stopping training."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step_ratio = getattr(args, "save_at_step_ratio", None)
+        if step_ratio is None:
+            return control
+
+        save_step = get_save_at_step(step_ratio, state.max_steps)
+        if state.global_step == save_step:
+            control.should_save = True
         return control
 
 
@@ -513,7 +571,560 @@ class LengthGroupedSampler(Sampler):
         return iter(indices)
 
 
+def adaptive_projector_pcgrad_enabled(config) -> bool:
+    return bool(getattr(config, "adaptive_projector_pcgrad", False))
+
+
+def resolve_mm_projector_module(model) -> nn.Module:
+    """Resolve the actual projector module without broad name matching."""
+    queue = [model]
+    try:
+        queue.append(unwrap_model(model))
+    except Exception:
+        pass
+    visited = set()
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        projector = getattr(current, "mm_projector", None)
+        if isinstance(projector, nn.Module):
+            return projector
+        for attribute in ("module", "base_model", "model", "get_model"):
+            try:
+                child = getattr(current, attribute)
+            except Exception:
+                continue
+            if attribute == "get_model" and callable(child):
+                try:
+                    child = child()
+                except Exception:
+                    continue
+            if isinstance(child, (list, tuple)):
+                queue.extend(child)
+            else:
+                queue.append(child)
+    raise RuntimeError("Adaptive projector PCGrad could not resolve model.mm_projector.")
+
+
 class LLaVATrainer(Trainer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._adaptive_pcgrad_controller = None
+        self._adaptive_pcgrad_resume_state = None
+        self._adaptive_pcgrad_resume_checkpoint = None
+        self._adaptive_pcgrad_backend_validated = False
+        self._adaptive_pcgrad_ce_sum = None
+        self._adaptive_pcgrad_ce_count = None
+        self._adaptive_pcgrad_window_start = None
+
+        if not adaptive_projector_pcgrad_enabled(self.model.config):
+            return
+        if bool(getattr(self.args, "fp16", False)):
+            raise RuntimeError(
+                "Adaptive projector PCGrad currently supports bf16/fp32 ZeRO-2 only; "
+                "fp16 loss-scaler integration is intentionally fail-fast."
+            )
+        if bool(getattr(self, "use_apex", False)):
+            raise RuntimeError("Adaptive projector PCGrad does not support Apex AMP.")
+
+        self._adaptive_pcgrad_projector = resolve_mm_projector_module(self.model)
+        chunk_size = int(getattr(self.model.config, "adaptive_pcgrad_cka_chunk_size", 1) or 1)
+        resolved = dict(getattr(self.model.config, "adaptive_projector_pcgrad_config", {}) or {})
+        self._adaptive_pcgrad_replay = ProjectorReplayAccumulator(
+            self._adaptive_pcgrad_projector,
+            chunk_size=chunk_size,
+            norm_floor=float(resolved.get("aux_norm_floor", 1e-12)),
+            score_rtol=float(resolved.get("residual_rtol", 1e-7)),
+        )
+        names, parameters = ordered_trainable_parameters(self._adaptive_pcgrad_projector)
+        self._adaptive_pcgrad_projector_names = tuple(names)
+        self._adaptive_pcgrad_projector_parameters = tuple(parameters)
+        self._adaptive_pcgrad_projector_parameter_ids = {id(parameter) for parameter in parameters}
+        if not parameters:
+            raise RuntimeError("Adaptive projector PCGrad found no trainable projector parameters.")
+
+        try:
+            import accelerate
+            import deepspeed
+            import transformers
+            logger.info(
+                "Adaptive projector PCGrad runtime: torch=%s transformers=%s accelerate=%s "
+                "deepspeed=%s; requested backend=DeepSpeed ZeRO-2 bf16/fp32.",
+                torch.__version__,
+                transformers.__version__,
+                accelerate.__version__,
+                deepspeed.__version__,
+            )
+        except Exception as exc:
+            logger.warning("Could not log all adaptive PCGrad package versions: %s", exc)
+
+    def _get_adaptive_pcgrad_controller(self) -> AdaptiveProjectorPCGradController:
+        controller = self._adaptive_pcgrad_controller
+        if controller is not None:
+            return controller
+
+        resolved = dict(getattr(self.model.config, "adaptive_projector_pcgrad_config", {}) or {})
+        resolved.pop("warmup_steps", None)
+        resolved.pop("cka_chunk_size", None)
+        resolved.pop("profile", None)
+        resolved["planned_optimizer_steps"] = int(getattr(self.state, "max_steps", 0) or 0)
+        allowed = {
+            "stage",
+            "planned_optimizer_steps",
+            "max_aux_ratio",
+            "warmup_ratio",
+            "norm_ema_beta",
+            "lambda_max",
+            "ce_norm_floor",
+            "aux_norm_floor",
+            "residual_rtol",
+        }
+        unknown = sorted(set(resolved) - allowed)
+        if unknown:
+            raise RuntimeError(f"Unknown adaptive projector PCGrad config fields: {unknown}.")
+        controller = AdaptiveProjectorPCGradController(
+            AdaptiveProjectorPCGradConfig(**resolved)
+        )
+        if self._adaptive_pcgrad_resume_state is not None:
+            controller.load_state_dict(self._adaptive_pcgrad_resume_state)
+            self._adaptive_pcgrad_resume_state = None
+        self._adaptive_pcgrad_controller = controller
+        return controller
+
+    def _validate_adaptive_pcgrad_backend(self, model):
+        if self._adaptive_pcgrad_backend_validated:
+            return self._get_deepspeed_engine(model), self._adaptive_pcgrad_zero_optimizer
+        if not self.is_deepspeed_enabled:
+            raise RuntimeError(
+                "Adaptive projector PCGrad currently supports only non-offloaded "
+                "DeepSpeed ZeRO-2. Use scripts/zero2.json."
+            )
+        if getattr(self, "is_fsdp_enabled", False):
+            raise RuntimeError("Adaptive projector PCGrad does not support FSDP.")
+        engine = self._get_deepspeed_engine(model)
+        if engine is None or int(engine.zero_optimization_stage()) != 2:
+            actual = None if engine is None else engine.zero_optimization_stage()
+            raise RuntimeError(
+                "Adaptive projector PCGrad requires DeepSpeed ZeRO-2; "
+                f"detected stage {actual}."
+            )
+        zero_optimizer = self._validate_zero2_pcgrad_engine(engine)
+        if getattr(zero_optimizer, "cpu_offload", False):
+            raise RuntimeError("Adaptive projector PCGrad does not support ZeRO optimizer offload.")
+        if getattr(engine, "has_moe_layers", False) or getattr(engine, "pipeline_parallelism", False):
+            raise RuntimeError("Adaptive projector PCGrad does not support MoE or pipeline parallelism.")
+        import accelerate
+        import deepspeed
+        import tokenizers
+        import transformers
+        supported_versions = {
+            "torch": (torch.__version__, "2.7.1"),
+            "transformers": (transformers.__version__, "4.51.3"),
+            "tokenizers": (tokenizers.__version__, "0.21.2"),
+            "accelerate": (accelerate.__version__, "1.6.0"),
+            "deepspeed": (deepspeed.__version__, "0.18.9"),
+        }
+        version_mismatches = {
+            package: (actual, expected)
+            for package, (actual, expected) in supported_versions.items()
+            if version.parse(actual).base_version != version.parse(expected).base_version
+        }
+        if version_mismatches:
+            raise RuntimeError(
+                "Adaptive projector PCGrad's ZeRO-2 storage adapter is restricted to its "
+                f"pinned supported runtime stack; version mismatches: {version_mismatches}."
+            )
+        fp16_enabled = bool(engine.fp16_enabled())
+        bf16_enabled = bool(engine.bfloat16_enabled())
+        torch_autocast_enabled = bool(engine.torch_autocast_enabled())
+        if (
+            fp16_enabled
+            or torch_autocast_enabled
+            or getattr(self.accelerator, "scaler", None) is not None
+        ):
+            raise RuntimeError(
+                "Adaptive projector PCGrad supports DeepSpeed BF16/FP32 only; "
+                "an FP16/scaler/custom torch-autocast runtime was detected."
+            )
+        if bf16_enabled != bool(getattr(self.args, "bf16", False)):
+            raise RuntimeError(
+                "Adaptive projector PCGrad precision mismatch between Trainer and DeepSpeed: "
+                f"args.bf16={bool(getattr(self.args, 'bf16', False))}, "
+                f"engine.bfloat16_enabled()={bf16_enabled}."
+            )
+        self._adaptive_pcgrad_precision = "bf16" if bf16_enabled else "fp32"
+
+        projector_ids = self._adaptive_pcgrad_projector_parameter_ids
+        seen = set()
+        for group_index, group in enumerate(zero_optimizer.round_robin_bit16_groups):
+            group_ids = {id(parameter) for parameter in group}
+            overlap = group_ids & projector_ids
+            if overlap and overlap != group_ids:
+                raise RuntimeError(
+                    f"ZeRO optimizer group {group_index} mixes projector and decoder parameters."
+                )
+            seen.update(overlap)
+        if seen != projector_ids:
+            missing = len(projector_ids - seen)
+            raise RuntimeError(
+                f"ZeRO optimizer is missing {missing} trainable projector parameters."
+            )
+        self._adaptive_pcgrad_backend_validated = True
+        self._adaptive_pcgrad_zero_optimizer = zero_optimizer
+        logger.info(
+            "Adaptive projector PCGrad backend validated: ZeRO-2, offload=false, "
+            "precision=%s, projector_parameters=%d.",
+            "bf16" if getattr(self.args, "bf16", False) else "fp32",
+            len(projector_ids),
+        )
+        return engine, zero_optimizer
+
+    @staticmethod
+    def _adaptive_all_reduce_sum(tensor, process_group=None):
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+        ):
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=process_group,
+            )
+
+    def _adaptive_global_auxiliary(self, zero_optimizer):
+        flat_sum, cka_sum, valid_count, invalid = self._adaptive_pcgrad_replay.consume_flat()
+        process_group = getattr(zero_optimizer, "dp_process_group", None)
+
+        ce_sum = self._adaptive_pcgrad_ce_sum
+        ce_count = self._adaptive_pcgrad_ce_count
+        if ce_sum is None or ce_count is None:
+            ce_sum = cka_sum.new_zeros(())
+            ce_count = cka_sum.new_zeros(())
+        stat_names = (
+            "cka_sum",
+            "valid_count",
+            *(f"invalid/{name}" for name in sorted(invalid)),
+            "ce_sum",
+            "ce_count",
+        )
+        stat_values = [cka_sum, valid_count]
+        stat_values.extend(invalid[name] for name in sorted(invalid))
+        stat_values.extend((ce_sum.double(), ce_count.double()))
+        stat_names = (*stat_names, "aux_finite_ranks")
+        stat_values.append(torch.isfinite(flat_sum).all().to(torch.float64))
+        stats = torch.stack(stat_values)
+        self._adaptive_all_reduce_sum(stats, process_group)
+        # The boundary decision needs host scalars anyway. Copy this tiny
+        # vector once instead of synchronizing once per logged statistic.
+        global_stats = dict(zip(stat_names, stats.detach().cpu().unbind()))
+
+        self._adaptive_pcgrad_ce_sum = None
+        self._adaptive_pcgrad_ce_count = None
+        global_count = float(global_stats["valid_count"].item())
+        severe_invalid = (
+            float(global_stats["invalid/nonfinite_input"].item())
+            + float(global_stats["invalid/nonfinite_gram"].item())
+            + float(global_stats["invalid/score_out_of_range"].item())
+        )
+        if severe_invalid > 0.0:
+            self._adaptive_pcgrad_replay.recycle_flat_buffer(flat_sum)
+            raise RuntimeError(
+                "Adaptive projector CKA found non-finite/materially invalid observations; "
+                "the whole effective update is aborted by policy."
+            )
+        expected_finite_ranks = float(
+            torch.distributed.get_world_size(group=process_group)
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 1
+        )
+        if float(global_stats["aux_finite_ranks"].item()) != expected_finite_ranks:
+            self._adaptive_pcgrad_replay.recycle_flat_buffer(flat_sum)
+            raise RuntimeError("Adaptive projector CKA produced non-finite auxiliary gradients.")
+        if global_count > 0.0:
+            # The expensive projector-vector collective is unnecessary for an
+            # all-text/all-invalid (but non-severe) effective batch.
+            self._adaptive_all_reduce_sum(flat_sum, process_group)
+            flat_sum.div_(global_count)
+        else:
+            flat_sum.zero_()
+        return flat_sum, global_stats, process_group
+
+    def _adaptive_zero2_projector_parts(self, zero_optimizer, flat_auxiliary):
+        auxiliary_by_parameter = {}
+        offset = 0
+        for parameter in self._adaptive_pcgrad_projector_parameters:
+            auxiliary_by_parameter[id(parameter)] = flat_auxiliary.narrow(
+                0, offset, parameter.numel()
+            ).view_as(parameter)
+            offset += parameter.numel()
+        if offset != flat_auxiliary.numel():
+            raise RuntimeError("Projector replay gradient buffer no longer matches live parameters.")
+
+        main_parts = []
+        auxiliary_parts = []
+        destinations = []
+        process_group = None
+        averaged = zero_optimizer.averaged_gradients
+        projector_ids = self._adaptive_pcgrad_projector_parameter_ids
+        for group_index, group in enumerate(zero_optimizer.round_robin_bit16_groups):
+            group_ids = {id(parameter) for parameter in group}
+            if not (group_ids & projector_ids):
+                continue
+            if group_ids != (group_ids & projector_ids):
+                raise RuntimeError(f"Mixed ZeRO optimizer group {group_index} is unsupported.")
+            group_main = averaged.get(group_index)
+            if not isinstance(group_main, (list, tuple)):
+                raise RuntimeError(
+                    f"ZeRO-2 did not materialize projector gradient shard {group_index}."
+                )
+            group_process = zero_optimizer.real_dp_process_group[group_index]
+            if process_group is None:
+                process_group = group_process
+            elif process_group is not group_process:
+                raise RuntimeError("Projector optimizer groups use different data-parallel groups.")
+            rank = torch.distributed.get_rank(group=group_process)
+            partition_size = int(zero_optimizer.partition_size[group_index])
+            partition_start = rank * partition_size
+            partition_end = partition_start + partition_size
+            device = group_main[0].device
+            buffers = getattr(self, "_adaptive_pcgrad_local_auxiliary_buffers", None)
+            if buffers is None:
+                buffers = {}
+                self._adaptive_pcgrad_local_auxiliary_buffers = buffers
+            buffer_key = (group_index, device, partition_size)
+            local_auxiliary = buffers.get(buffer_key)
+            if local_auxiliary is None:
+                local_auxiliary = torch.zeros(
+                    partition_size, device=device, dtype=torch.float32
+                )
+                buffers[buffer_key] = local_auxiliary
+            else:
+                local_auxiliary.zero_()
+            group_offset = 0
+            for parameter in group:
+                parameter_end = group_offset + parameter.numel()
+                overlap_start = max(group_offset, partition_start)
+                overlap_end = min(parameter_end, partition_end)
+                if overlap_end > overlap_start:
+                    source_offset = overlap_start - group_offset
+                    destination_offset = overlap_start - partition_start
+                    length = overlap_end - overlap_start
+                    source = auxiliary_by_parameter[id(parameter)].reshape(-1).narrow(
+                        0, source_offset, length
+                    )
+                    local_auxiliary.narrow(0, destination_offset, length).copy_(source)
+                group_offset = parameter_end
+
+            local_offset = 0
+            for main_part in group_main:
+                numel = main_part.numel()
+                auxiliary_part = local_auxiliary.narrow(0, local_offset, numel).view_as(main_part)
+                main_parts.append(main_part)
+                auxiliary_parts.append(auxiliary_part)
+                destinations.append(main_part)
+                local_offset += numel
+            if local_offset != partition_size:
+                raise RuntimeError(
+                    f"ZeRO projector shard {group_index} has {local_offset} elements; "
+                    f"expected {partition_size}."
+                )
+        if not main_parts:
+            raise RuntimeError("No ZeRO-2 projector gradient shards were found.")
+        return main_parts, auxiliary_parts, destinations, process_group
+
+    def _adaptive_training_step(self, model, inputs, num_items_in_batch=None):
+        controller = self._get_adaptive_pcgrad_controller()
+        engine, zero_optimizer = self._validate_adaptive_pcgrad_backend(model)
+        sync_gradients = bool(self.accelerator.sync_gradients)
+        engine.set_gradient_accumulation_boundary(sync_gradients)
+
+        new_window = self._adaptive_pcgrad_replay.snapshot_token is None
+        self._adaptive_pcgrad_replay.begin_window(
+            controller.config.stage,
+            controller.successful_steps,
+        )
+        profile = bool(getattr(self.model.config, "adaptive_pcgrad_profile", False))
+        if new_window and profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            self._adaptive_pcgrad_window_start = time.perf_counter()
+
+        self._set_model_attr(model, "_adaptive_projector_replay_features", [])
+        with self.compute_loss_context_manager():
+            text_loss = self.compute_loss(model, inputs)
+        if self.args.n_gpu > 1:
+            text_loss = text_loss.mean()
+
+        captured = self._find_model_attr(model, "_adaptive_projector_replay_features")
+        if captured is None:
+            captured = []
+        if not isinstance(captured, (list, tuple)):
+            raise RuntimeError("Adaptive projector replay capture must be a list of tensors.")
+        detached_loss = text_loss.detach().double()
+        if self._adaptive_pcgrad_ce_sum is None:
+            self._adaptive_pcgrad_ce_sum = torch.zeros_like(detached_loss)
+            self._adaptive_pcgrad_ce_count = torch.zeros_like(detached_loss)
+        self._adaptive_pcgrad_ce_sum.add_(detached_loss)
+        self._adaptive_pcgrad_ce_count.add_(1.0)
+
+        engine.backward(text_loss)
+        # The full VLM graph is gone here. Only the plain projector is replayed.
+        try:
+            self._adaptive_pcgrad_replay.add(
+                captured,
+                loss_scale=1.0,
+            )
+        finally:
+            # Do not keep detached vision-feature batches alive while the
+            # boundary collectives, surgery, clipping, and optimizer step run.
+            # After add() returns, replay owns only detached gradient sums.
+            self._set_model_attr(model, "_adaptive_projector_replay_features", [])
+            del captured
+
+        if not sync_gradients:
+            # DeepSpeed requires ``engine.step()`` after every backward call,
+            # including non-boundary microbatches. At this point it only
+            # advances its accumulation lifecycle; the optimizer/scheduler do
+            # not update until the boundary explicitly set above.
+            engine.step()
+            if bool(engine.was_step_applied()):
+                raise RuntimeError(
+                    "DeepSpeed applied an optimizer update before the adaptive "
+                    "PCGrad accumulation boundary."
+                )
+            return text_loss.detach() / self.args.gradient_accumulation_steps
+
+        flat_auxiliary, global_stats, process_group = self._adaptive_global_auxiliary(zero_optimizer)
+        main_parts, auxiliary_parts, destinations, shard_process_group = (
+            self._adaptive_zero2_projector_parts(zero_optimizer, flat_auxiliary)
+        )
+        self._adaptive_pcgrad_replay.recycle_flat_buffer(flat_auxiliary)
+        auxiliary_group_ranks = tuple(torch.distributed.get_process_group_ranks(process_group))
+        shard_group_ranks = tuple(torch.distributed.get_process_group_ranks(shard_process_group))
+        if auxiliary_group_ranks != shard_group_ranks:
+            raise RuntimeError("Auxiliary and ZeRO projector reductions use different process groups.")
+        # Non-MoE ZeRO-2 uses the same DP membership for both handles. Use the
+        # shard handle for controller statistics because those coordinates are
+        # disjoint according to that exact group.
+        process_group = shard_process_group
+        valid_count = float(global_stats["valid_count"].item())
+        merged, controller_logs = controller.prepare(
+            main_parts,
+            auxiliary_parts,
+            valid_count=valid_count,
+            reference_tensor=text_loss,
+            distributed_shards=True,
+            process_group=process_group,
+        )
+        with torch.no_grad():
+            for destination, value in zip(destinations, merged):
+                if value is None or value is destination:
+                    continue
+                destination.copy_(value.to(dtype=destination.dtype))
+        # Keep only DeepSpeed's live gradient shards across engine.step().
+        # The merged proposal is no longer needed after the copy-back.
+        del merged, value, destination
+
+        try:
+            engine.step()
+        except Exception:
+            controller.finish(optimizer_stepped=False)
+            raise
+        optimizer_stepped = bool(engine.was_step_applied())
+        controller.finish(optimizer_stepped=optimizer_stepped)
+
+        stage_prefix = f"s{controller.config.stage}/"
+        cka_count = float(global_stats["valid_count"].item())
+        cka_sum = float(global_stats["cka_sum"].item())
+        ce_count = float(global_stats["ce_count"].item())
+        ce_sum = float(global_stats["ce_sum"].item())
+        invalid_total = sum(
+            float(value.item())
+            for key, value in global_stats.items()
+            if key.startswith("invalid/") and key != "invalid/score_roundoff_clamped"
+        )
+        observation_total = cka_count + invalid_total
+        invalid_fraction = invalid_total / observation_total if observation_total > 0.0 else 0.0
+        logs = {
+            f"{stage_prefix}ce_mean": ce_sum / ce_count if ce_count > 0.0 else 0.0,
+            f"{stage_prefix}cka_sum": cka_sum,
+            f"{stage_prefix}cka_count": cka_count,
+            f"{stage_prefix}cka_mean": cka_sum / cka_count if cka_count > 0.0 else 0.0,
+            f"{stage_prefix}cka_ce_only_no_valid": float(cka_count <= 0.0),
+            f"{stage_prefix}cka_invalid_fraction": invalid_fraction,
+            f"{stage_prefix}optimizer_stepped": float(optimizer_stepped),
+            f"{stage_prefix}overflow_skips": float(controller.overflow_skips),
+            f"{stage_prefix}ema_ce_norm": float(controller.ema_g or 0.0),
+            f"{stage_prefix}ema_cka_norm": float(controller.ema_b or 0.0),
+            f"{stage_prefix}lambda_ceiling_frequency": (
+                float(controller.lambda_ceiling_hits) / float(controller.valid_proposals)
+                if controller.valid_proposals > 0 else 0.0
+            ),
+            f"{stage_prefix}conflict_rate": (
+                float(controller.conflict_proposals) / float(controller.valid_proposals)
+                if controller.valid_proposals > 0 else 0.0
+            ),
+            f"{stage_prefix}near_zero_skip_frequency": (
+                float(controller.near_zero_skips) / float(max(controller.successful_steps, 1))
+            ),
+        }
+        logs.update({f"{stage_prefix}{key}": value for key, value in controller_logs.items()})
+        for key, value in global_stats.items():
+            if key.startswith("invalid/"):
+                logs[f"{stage_prefix}cka_{key}"] = float(value.item())
+        if (
+            invalid_fraction >= 0.10
+            and not getattr(self, "_adaptive_pcgrad_invalid_warning_emitted", False)
+            and self.is_world_process_zero()
+        ):
+            logger.warning(
+                "Adaptive projector CKA skipped %.1f%% of image observations in an effective "
+                "batch (zero Gram norm/too few patches). Inspect s%d/cka_invalid_* logs.",
+                100.0 * invalid_fraction,
+                controller.config.stage,
+            )
+            self._adaptive_pcgrad_invalid_warning_emitted = True
+        if (
+            controller.valid_proposals >= 100
+            and controller.lambda_ceiling_hits * 2 >= controller.valid_proposals
+            and not getattr(self, "_adaptive_pcgrad_ceiling_warning_emitted", False)
+            and self.is_world_process_zero()
+        ):
+            logger.warning(
+                "Adaptive projector PCGrad lambda has reached lambda_max in at least half "
+                "of valid proposals; the ceiling remains enforced. Inspect s%d/lambda and "
+                "s%d/effective_aux_ratio before tuning.",
+                controller.config.stage,
+                controller.config.stage,
+            )
+            self._adaptive_pcgrad_ceiling_warning_emitted = True
+        global_norm = float(getattr(zero_optimizer, "_global_grad_norm", 0.0) or 0.0)
+        max_norm = float(getattr(self.args, "max_grad_norm", 0.0) or 0.0)
+        logs[f"{stage_prefix}preclip_norm"] = global_norm
+        logs[f"{stage_prefix}clip_factor"] = (
+            1.0 / max(1.0, (global_norm + 1e-6) / max_norm) if max_norm > 0.0 else 1.0
+        )
+        try:
+            logs[f"{stage_prefix}learning_rate"] = float(self._get_learning_rate())
+        except Exception:
+            pass
+        if profile and self._adaptive_pcgrad_window_start is not None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                logs[f"{stage_prefix}peak_allocated_mb"] = float(
+                    torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                )
+            logs[f"{stage_prefix}optimizer_step_wall_ms"] = float(
+                (time.perf_counter() - self._adaptive_pcgrad_window_start) * 1000.0
+            )
+            self._adaptive_pcgrad_window_start = None
+        self._last_adaptive_pcgrad_logs = logs
+        return text_loss.detach() / self.args.gradient_accumulation_steps
 
     @contextmanager
     def _cka_loss_runtime_context(self, model):
@@ -1405,6 +2016,15 @@ class LLaVATrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
+        if adaptive_projector_pcgrad_enabled(self.model.config):
+            if is_sagemaker_mp_enabled():
+                raise RuntimeError("Adaptive projector PCGrad does not support SageMaker model parallelism.")
+            return self._adaptive_training_step(
+                model,
+                inputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
         with self._cka_loss_runtime_context(model):
             if is_sagemaker_mp_enabled():
                 loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -1553,9 +2173,6 @@ class LLaVATrainer(Trainer):
             logs['loss/cka_pre_final_loss'] = cka_pre_final_loss.item() if torch.is_tensor(cka_pre_final_loss) else float(cka_pre_final_loss)
         if cka_layers_loss is not None:
             logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
-            if (getattr(model.config, 'cka_loss_random_heads', False)
-                    or getattr(model.config, 'cka_loss_head_ids', None)):
-                logs['loss/cka_heads_loss'] = logs['loss/cka_layers_loss']
         if isinstance(cka_per_layer_losses, dict):
             for layer_name, layer_loss in sorted(cka_per_layer_losses.items()):
                 logs[f'loss/cka_layers/{layer_name}'] = layer_loss.item() if torch.is_tensor(layer_loss) else float(layer_loss)
@@ -1577,6 +2194,11 @@ class LLaVATrainer(Trainer):
         if vsp_gradient_logs:
             logs.update(vsp_gradient_logs)
             self._last_vsp_gradient_logs = None
+
+        adaptive_logs = getattr(self, '_last_adaptive_pcgrad_logs', None)
+        if adaptive_logs:
+            logs.update(adaptive_logs)
+            self._last_adaptive_pcgrad_logs = None
 
         return super().log(logs, *args, **kwargs)
 
@@ -1610,9 +2232,26 @@ class LLaVATrainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
-            split_projector_groups = self.args.mm_projector_lr is not None or vsp_controller_requested(getattr(opt_model, 'config', self.model.config))
+            adaptive_pcgrad = adaptive_projector_pcgrad_enabled(
+                getattr(opt_model, 'config', self.model.config)
+            )
+            split_projector_groups = (
+                self.args.mm_projector_lr is not None
+                or vsp_controller_requested(getattr(opt_model, 'config', self.model.config))
+                or adaptive_pcgrad
+            )
             if split_projector_groups:
-                projector_parameters = [name for name, _ in opt_model.named_parameters() if is_projector_parameter(name)]
+                if adaptive_pcgrad:
+                    projector = resolve_mm_projector_module(opt_model)
+                    exact_projector_ids = {
+                        id(parameter) for parameter in projector.parameters() if parameter.requires_grad
+                    }
+                    projector_parameters = [
+                        name for name, parameter in opt_model.named_parameters()
+                        if id(parameter) in exact_projector_ids
+                    ]
+                else:
+                    projector_parameters = [name for name, _ in opt_model.named_parameters() if is_projector_parameter(name)]
                 projector_lr_kwargs = {"lr": self.args.mm_projector_lr} if self.args.mm_projector_lr is not None else {}
                 optimizer_grouped_parameters = [
                     {
@@ -1646,6 +2285,12 @@ class LLaVATrainer(Trainer):
                         **projector_lr_kwargs,
                     },
                 ]
+                if adaptive_pcgrad:
+                    # Empty LLM groups are common in stage 1 and are rejected by
+                    # ZeRO-2 while it inspects the first parameter dtype.
+                    optimizer_grouped_parameters = [
+                        group for group in optimizer_grouped_parameters if group["params"]
+                    ]
             else:
                 optimizer_grouped_parameters = [
                     {
@@ -1683,7 +2328,189 @@ class LLaVATrainer(Trainer):
 
         return self.optimizer
 
+    def _save_adaptive_pcgrad_artifacts(self, output_dir):
+        if not adaptive_projector_pcgrad_enabled(self.model.config):
+            return
+        if not self.is_world_process_zero():
+            return
+        controller = self._get_adaptive_pcgrad_controller()
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(
+            controller.state_dict(),
+            os.path.join(output_dir, ADAPTIVE_PCGRAD_STATE_FILE),
+        )
+        resolved = controller.config.to_dict()
+        write_json(os.path.join(output_dir, ADAPTIVE_PCGRAD_CONFIG_FILE), resolved)
+        base_identifier = (
+            getattr(self.model.config, "adaptive_pcgrad_base_model_identifier", None)
+            or getattr(self.model.config, "_name_or_path", None)
+            or "unknown"
+        )
+        metadata = {
+            "version": 1,
+            "stage": int(controller.config.stage),
+            "base_model_identifier": str(base_identifier),
+            "projector_sha256": projector_sha256(self._adaptive_pcgrad_projector),
+            "projector_signature": projector_signature(self._adaptive_pcgrad_projector),
+            "resolved_config": resolved,
+            "successful_steps": int(controller.successful_steps),
+            "parent_projector_sha256": getattr(
+                self.model.config,
+                "adaptive_pcgrad_parent_projector_sha256",
+                getattr(self.model.config, "adaptive_pcgrad_stage1_projector_sha256", None),
+            ),
+            "backend": {
+                "name": "deepspeed_zero2",
+                "offload": False,
+                "precision": getattr(
+                    self,
+                    "_adaptive_pcgrad_precision",
+                    "bf16" if getattr(self.args, "bf16", False) else "fp32",
+                ),
+                "deepspeed": __import__("deepspeed").__version__,
+                "torch": str(torch.__version__),
+            },
+            "ce_reduction": (
+                "repository baseline: accumulated per-microbatch loss means; "
+                "projector CKA: global valid-image SUM/count"
+            ),
+        }
+        write_json(os.path.join(output_dir, ADAPTIVE_PCGRAD_METADATA_FILE), metadata)
+
+    def _save_adaptive_stage1_adapter(self, output_dir):
+        keys_to_match = ['mm_projector', 'vision_resampler']
+        if getattr(self.args, "use_im_start_end", False):
+            keys_to_match.extend(['embed_tokens', 'embed_in'])
+        weight_to_save = get_mm_adapter_state_maybe_zero_3(
+            self.model.named_parameters(), keys_to_match
+        )
+        if self.is_world_process_zero():
+            os.makedirs(output_dir, exist_ok=True)
+            self.model.config.save_pretrained(output_dir)
+            torch.save(weight_to_save, os.path.join(output_dir, 'mm_projector.bin'))
+
+    def _load_adaptive_pcgrad_resume_artifacts(self, resume_from_checkpoint):
+        """Validate provenance and restore stage-local controller state.
+
+        DeepSpeed model/optimizer state is loaded by Transformers without
+        calling ``_load_from_checkpoint``. This helper therefore runs from
+        ``_load_optimizer_and_scheduler`` as well, after the live projector
+        weights have been restored by DeepSpeed.
+        """
+        checkpoint_dir = os.path.realpath(os.fspath(resume_from_checkpoint))
+        if self._adaptive_pcgrad_resume_checkpoint == checkpoint_dir:
+            return
+        metadata_path = os.path.join(checkpoint_dir, ADAPTIVE_PCGRAD_METADATA_FILE)
+        state_path = os.path.join(checkpoint_dir, ADAPTIVE_PCGRAD_STATE_FILE)
+        if not os.path.isfile(metadata_path) or not os.path.isfile(state_path):
+            raise RuntimeError(
+                "Adaptive projector PCGrad resume requires its metadata and controller state; "
+                f"missing files in {checkpoint_dir}."
+            )
+        metadata = load_json(metadata_path)
+        expected_stage = int(
+            getattr(self.model.config, "adaptive_projector_pcgrad_config", {}).get("stage", -1)
+        )
+        if int(metadata.get("stage", -1)) != expected_stage:
+            raise RuntimeError("Refusing to resume adaptive PCGrad from another stage.")
+        expected_base = str(
+            getattr(self.model.config, "adaptive_pcgrad_base_model_identifier", None)
+            or getattr(self.model.config, "_name_or_path", None)
+            or "unknown"
+        )
+        if metadata.get("base_model_identifier") != expected_base:
+            raise RuntimeError(
+                "Adaptive PCGrad checkpoint base model mismatch: "
+                f"{metadata.get('base_model_identifier')!r} != {expected_base!r}."
+            )
+        if metadata.get("projector_signature") != projector_signature(
+            self._adaptive_pcgrad_projector
+        ):
+            raise RuntimeError("Adaptive PCGrad checkpoint projector signature mismatch.")
+        if expected_stage == 2:
+            expected_parent = getattr(
+                self.model.config, "adaptive_pcgrad_stage1_projector_sha256", None
+            )
+            if not expected_parent or metadata.get("parent_projector_sha256") != expected_parent:
+                raise RuntimeError(
+                    "Adaptive PCGrad stage-2 checkpoint was created from a different "
+                    "stage-1 projector parent."
+                )
+        expected_hash = metadata.get("projector_sha256")
+        actual_hash = projector_sha256(self._adaptive_pcgrad_projector)
+        if expected_hash != actual_hash:
+            raise RuntimeError(
+                "Adaptive PCGrad checkpoint projector hash mismatch after loading: "
+                f"expected {expected_hash}, got {actual_hash}."
+            )
+        try:
+            resume_state = torch.load(state_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            resume_state = torch.load(state_path, map_location="cpu")
+        if metadata.get("resolved_config") != resume_state.get("config"):
+            raise RuntimeError(
+                "Adaptive PCGrad checkpoint metadata/controller config mismatch."
+            )
+        if int(metadata.get("successful_steps", -1)) != int(
+            resume_state.get("successful_steps", -2)
+        ):
+            raise RuntimeError(
+                "Adaptive PCGrad checkpoint metadata/controller step-count mismatch."
+            )
+
+        # During DeepSpeed resume, state.max_steps has already been resolved for
+        # the current run. Loading now therefore also rejects a changed planned
+        # horizon. The pending path covers non-DeepSpeed's earlier model hook.
+        if int(getattr(self.state, "max_steps", 0) or 0) > 0:
+            controller = self._get_adaptive_pcgrad_controller()
+            controller.load_state_dict(resume_state)
+        else:
+            self._adaptive_pcgrad_resume_state = resume_state
+        self._adaptive_pcgrad_resume_checkpoint = checkpoint_dir
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        super()._load_optimizer_and_scheduler(checkpoint)
+        if checkpoint is not None and adaptive_projector_pcgrad_enabled(self.model.config):
+            self._load_adaptive_pcgrad_resume_artifacts(checkpoint)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        if not adaptive_projector_pcgrad_enabled(self.model.config):
+            return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        checkpoint_dir = os.fspath(resume_from_checkpoint)
+        expected_stage = int(
+            getattr(self.model.config, "adaptive_projector_pcgrad_config", {}).get("stage", -1)
+        )
+
+        if expected_stage == 1 and getattr(self.args, 'tune_mm_mlp_adapter', False):
+            adapter_path = os.path.join(checkpoint_dir, 'mm_projector.bin')
+            if not os.path.isfile(adapter_path):
+                raise RuntimeError(f"Stage-1 resume is missing {adapter_path}.")
+            try:
+                adapter_state = torch.load(adapter_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                adapter_state = torch.load(adapter_path, map_location="cpu")
+            projector_state = {}
+            for key, value in adapter_state.items():
+                marker = "mm_projector."
+                if marker in key:
+                    projector_state[key.split(marker, 1)[1]] = value
+            if not projector_state:
+                raise RuntimeError("Stage-1 checkpoint contains no mm_projector parameters.")
+            self._adaptive_pcgrad_projector.load_state_dict(projector_state, strict=True)
+        else:
+            super()._load_from_checkpoint(checkpoint_dir, model=model)
+        self._load_adaptive_pcgrad_resume_artifacts(checkpoint_dir)
+
     def _save_checkpoint(self, model, trial, *args, **kwargs):
+        if adaptive_projector_pcgrad_enabled(self.model.config):
+            super(LLaVATrainer, self)._save_checkpoint(model, trial, *args, **kwargs)
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            output_dir = os.path.join(self._get_output_dir(trial=trial), checkpoint_folder)
+            if getattr(self.args, 'tune_mm_mlp_adapter', False):
+                self._save_adaptive_stage1_adapter(output_dir)
+            self._save_adaptive_pcgrad_artifacts(output_dir)
+            return
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
@@ -1703,6 +2530,11 @@ class LLaVATrainer(Trainer):
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, *args, **kwargs)
+
+    def save_state(self):
+        super().save_state()
+        if adaptive_projector_pcgrad_enabled(self.model.config):
+            self._save_adaptive_pcgrad_artifacts(self.args.output_dir)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

@@ -15,32 +15,20 @@ fi
 : "${PER_DEVICE_TRAIN_BATCH_SIZE:=32}"
 : "${GRADIENT_ACCUMULATION_STEPS:=4}"
 : "${CKA_FINAL_HIDDEN_WEIGHT:=0.1}"
-: "${CKA_LOSS_START_RATIO:=0.0}"
+: "${CKA_LOSS_START_RATIO:=0.5}"
 : "${MM_PROJECTOR_TYPE:=mlp2x_gelu}"
 : "${CKA_LOSS_ENABLED:=True}"
-: "${CKA_PROJECTOR_WEIGHT:=0.1}"
-: "${CKA_LAYERS:=all}"
+: "${CKA_PROJECTOR_WEIGHT:=0.0}"
+: "${CKA_LAYERS:=final}"
 : "${CKA_ANCHOR_LAYER:=}"
-: "${CKA_HEAD_FRACTION:=0.25}"
-: "${CKA_NUM_HEADS:=}"
-: "${CKA_HEAD_SEED:=42}"
-: "${CKA_RANDOM_HEADS:=False}"
-CKA_HEAD_IDS=${CKA_HEAD_IDS:-'{"1":[1],"2":[4],"3":[2],"4":[10],"5":[12],"6":[9],"7":[3],"8":[4],"9":[3],"10":[0],"11":[6],"12":[5],"13":[0],"14":[3],"15":[1],"16":[1],"17":[2],"18":[4],"19":[9],"20":[8],"21":[13],"22":[9],"23":[8],"24":[4]}'}
-# Example manual selection: CKA_HEAD_IDS='{"1":[0,3],"4":[2,5,7]}'
 : "${SAVE_STRATEGY:=no}"
 : "${STOP_AFTER_STEP_RATIO:=}"
 : "${RESUME_FROM_CHECKPOINT:=}"
-: "${WANDB_RUN_NAME:=${RUN_NAME}-top1-min-head-w0.1}"
+: "${WANDB_RUN_NAME:=${RUN_NAME}-cka-w${CKA_FINAL_HIDDEN_WEIGHT}}"
 
 PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/pretrain-diag/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-cka/${RUN_NAME}/top1-min-head-w0.1/llava-finetune}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-cka/${RUN_NAME}/cka-last-st0.5/llava-finetune}"
 OPTIONAL_TRAIN_ARGS=()
-if [[ -n "${CKA_HEAD_IDS}" ]]; then
-    OPTIONAL_TRAIN_ARGS+=(--cka_loss_head_ids "${CKA_HEAD_IDS}")
-fi
-if [[ -n "${CKA_NUM_HEADS}" ]]; then
-    OPTIONAL_TRAIN_ARGS+=(--cka_loss_num_heads "${CKA_NUM_HEADS}")
-fi
 if [[ -n "${STOP_AFTER_STEP_RATIO}" ]]; then
     OPTIONAL_TRAIN_ARGS+=(--stop_after_step_ratio "${STOP_AFTER_STEP_RATIO}")
 fi
@@ -50,8 +38,6 @@ fi
 if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
     OPTIONAL_TRAIN_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
 fi
-
-
 python - <<'PY_CHECK'
 from packaging import version
 import accelerate
@@ -108,9 +94,6 @@ PY_CHECK
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
-    --cka_loss_head_fraction "${CKA_HEAD_FRACTION}" \
-    --cka_loss_head_seed "${CKA_HEAD_SEED}" \
-    --cka_loss_random_heads "${CKA_RANDOM_HEADS}" \
     --cka_loss_subset_query_tokens text \
     --vsp_gradient_diagnostics False \
     --vsp_asymmetric_pcgrad False \
