@@ -46,6 +46,7 @@ PY_CHECK
     --group_by_modality_length True \
     --bf16 True \
     --output_dir ./checkpoints/lora-ft/qwen2.5-7b/llava-finetune \
+    --seed "${SEED:-42}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \

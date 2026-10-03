@@ -16,7 +16,7 @@
 import os
 import warnings
 import shutil
-from llava.model.backbones import backbone_type, get_llava_model_class
+from llava.model.backbones import backbone_type, configure_tokenizer_padding, get_llava_model_class
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
@@ -27,10 +27,8 @@ from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, D
 
 
 def _set_generation_pad_token(tokenizer, model, include_pad_as_eos=False):
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-    if tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
+    configure_tokenizer_padding(tokenizer, model.config)
+    model.get_input_embeddings().padding_idx = tokenizer.pad_token_id
 
     generation_config = getattr(model, "generation_config", None)
     if generation_config is None:
@@ -186,11 +184,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
             )
 
-    if family in ("qwen2", "qwen3", "gemma3_text", "phi3"):
-        _set_generation_pad_token(
-            tokenizer, model,
-            include_pad_as_eos=family in ("qwen2", "qwen3"),
-        )
+    _set_generation_pad_token(
+        tokenizer, model,
+        include_pad_as_eos=family in ("qwen2", "qwen3"),
+    )
 
     image_processor = None
 

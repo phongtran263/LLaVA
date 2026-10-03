@@ -12,22 +12,28 @@ fi
 : "${MODEL_NAME_OR_PATH:=Qwen/Qwen2.5-0.5B-Instruct}"
 : "${RUN_NAME:=qwen2.5-0.5b}"
 : "${GPU_INCLUDE:=localhost:3}"
-: "${PER_DEVICE_TRAIN_BATCH_SIZE:=32}"
-: "${GRADIENT_ACCUMULATION_STEPS:=4}"
+: "${PER_DEVICE_TRAIN_BATCH_SIZE:=16}"
+: "${GRADIENT_ACCUMULATION_STEPS:=8}"
 : "${CKA_FINAL_HIDDEN_WEIGHT:=0.1}"
-: "${CKA_LOSS_START_RATIO:=0.5}"
+: "${CKA_LOSS_START_RATIO:=0.0}"
 : "${MM_PROJECTOR_TYPE:=mlp2x_gelu}"
 : "${CKA_LOSS_ENABLED:=True}"
-: "${CKA_PROJECTOR_WEIGHT:=0.0}"
-: "${CKA_LAYERS:=final}"
+# Accept raw CKA loss <= tau; 0.0 preserves the original objective.
+: "${CKA_LOSS_TAU:=0.0}"
+: "${CKA_PROJECTOR_WEIGHT:=0.1}"
+: "${CKA_LAYERS:=}"
 : "${CKA_ANCHOR_LAYER:=}"
+# An explicitly empty value disables the corresponding anchor override.
+: "${CKA_VISION_ANCHOR_LAYER=}"
+: "${CKA_PROJECTOR_VISION_ANCHOR_LAYER=}"
+: "${CKA_FINAL_VISION_ANCHOR_LAYER=}"
 : "${SAVE_STRATEGY:=no}"
 : "${STOP_AFTER_STEP_RATIO:=}"
 : "${RESUME_FROM_CHECKPOINT:=}"
-: "${WANDB_RUN_NAME:=${RUN_NAME}-cka-w${CKA_FINAL_HIDDEN_WEIGHT}}"
+: "${WANDB_RUN_NAME:=${RUN_NAME}-cka-proj-v${CKA_PROJECTOR_VISION_ANCHOR_LAYER}-mid-v${CKA_VISION_ANCHOR_LAYER}-final-v${CKA_FINAL_VISION_ANCHOR_LAYER}}"
 
-PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/pretrain-diag/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-cka/${RUN_NAME}/cka-last-st0.5/llava-finetune}"
+PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/pretrain-pcgrad/${RUN_NAME}/llava-pretrain/mm_projector.bin}"
+OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-cka/${RUN_NAME}/cka-proj-grad/llava-finetune}"
 OPTIONAL_TRAIN_ARGS=()
 if [[ -n "${STOP_AFTER_STEP_RATIO}" ]]; then
     OPTIONAL_TRAIN_ARGS+=(--stop_after_step_ratio "${STOP_AFTER_STEP_RATIO}")
@@ -37,6 +43,15 @@ if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
 fi
 if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
     OPTIONAL_TRAIN_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_TRAIN_ARGS+=(--cka_loss_vision_anchor_layer "${CKA_VISION_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_PROJECTOR_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_TRAIN_ARGS+=(--cka_loss_projector_vision_anchor_layer "${CKA_PROJECTOR_VISION_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_FINAL_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_TRAIN_ARGS+=(--cka_loss_final_vision_anchor_layer "${CKA_FINAL_VISION_ANCHOR_LAYER}")
 fi
 python - <<'PY_CHECK'
 from packaging import version
@@ -71,6 +86,7 @@ PY_CHECK
     --group_by_modality_length True \
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
+    --seed "${SEED:-42}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
@@ -81,22 +97,23 @@ PY_CHECK
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
-    --logging_steps 1 \
+    --logging_steps 10 \
     --tf32 True \
     --model_max_length 2048 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
     --report_to wandb \
     --run_name "${WANDB_RUN_NAME}" \
     --cka_loss "${CKA_LOSS_ENABLED}" \
-    --cka_loss_tau 0.0 \
+    --cka_loss_tau "${CKA_LOSS_TAU}" \
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \
     --cka_loss_subset_query_tokens text \
     --vsp_gradient_diagnostics False \
     --vsp_asymmetric_pcgrad False \
+    --vsp_apply_to_projector_only False \
     --vsp_norm_cap False \
     --vsp_pcgrad_threshold 0.05 \
     --vsp_proj_max_grad_ratio 0.5 \

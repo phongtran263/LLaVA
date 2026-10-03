@@ -59,6 +59,21 @@ def use_fast_tokenizer(config):
     }
 
 
+def configure_tokenizer_padding(tokenizer, config):
+    """Keep Llama-3 turn boundaries distinct from padding, without adding tokens."""
+    if is_llama3(config) and tokenizer.pad_token_id in (
+        None, tokenizer.eos_token_id, tokenizer.bos_token_id,
+    ):
+        native_pad = "<|finetune_right_pad_id|>"
+        if native_pad in tokenizer.get_vocab():
+            tokenizer.pad_token = native_pad
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token or tokenizer.bos_token
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer has no padding token or usable fallback token.")
+    config.pad_token_id = tokenizer.pad_token_id
+
+
 def default_conversation(config):
     family = backbone_type(config)
     model_name = str(getattr(config, "_name_or_path", "") or "").lower()

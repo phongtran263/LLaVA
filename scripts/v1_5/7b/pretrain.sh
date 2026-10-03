@@ -31,6 +31,7 @@ deepspeed --include localhost:3 llava/train/train_mem.py \
     --mm_use_im_patch_token False \
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
+    --seed "${SEED:-42}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 4 \
@@ -60,7 +61,7 @@ deepspeed --include localhost:3 llava/train/train_mem.py \
     --cka_loss_layers "-1" \
     --log_gradient_norms False \
     --train_data_fraction ${TRAIN_DATA_FRACTION:-1.0} \
-    --train_data_seed ${TRAIN_DATA_SEED:-42} \
+    --train_data_seed "${TRAIN_DATA_SEED:-${SEED:-42}}" \
     "${OPTIONAL_CKA_ARGS[@]}"
     # --gradient_log_steps 50 \
     # --cka_loss_subset_select_layer 8 \

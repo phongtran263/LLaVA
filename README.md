@@ -113,8 +113,73 @@ bash scripts/v1_5/finetune_backbone.sh
 The same scripts accept any supported checkpoint through `MODEL_NAME_OR_PATH`.
 Use `CKA_LOSS=True` and the `CKA_*` / `VSP_*` environment variables to
 enable the optional CKA and gradient-controller settings; they are off by default.
-The separate two-stage adaptive projector-only PCGrad path is documented in
-[docs/Adaptive_Projector_PCGrad.md](docs/Adaptive_Projector_PCGrad.md).
+
+For a CKA anchor from a specific CLIP vision block, set
+`CKA_VISION_ANCHOR_LAYER=12` in the Qwen pretrain/finetune or generic backbone
+launchers (CLI: `--cka_loss_vision_anchor_layer 12`). Indices `1..L` select vision
+block outputs, `0` selects the embedding state supplied to the encoder, and
+negative indices follow the hidden-state tuple (`-1` is the last block, before
+CLIP's final normalization). Omit/leave this variable empty to use the usual
+projector-input feature as the anchor. `mm_vision_select_layer` still controls
+the projector input independently. Both enabled projector and decoder-layer
+CKA terms use the selected detached vision anchor, from the same image/crop
+forward. No extra vision forward is needed. Do not combine this option with
+`CKA_ANCHOR_LAYER`, which selects a decoder anchor. The option supports the
+standard CLIP tower, not S2/multi-encoder towers; hidden CKA still requires
+aligned image tokens (`mm_patch_merge_type=flat`). Use a distinct `OUTPUT_DIR`
+and `WANDB_RUN_NAME` for each anchor experiment. This option does not enable PCGrad.
+
+To use separate vision anchors for the two losses, additionally set
+`CKA_PROJECTOR_VISION_ANCHOR_LAYER` (CLI: `--cka_loss_projector_vision_anchor_layer`).
+For example, `CKA_PROJECTOR_VISION_ANCHOR_LAYER=20 CKA_VISION_ANCHOR_LAYER=24`
+uses `CKA(sg(V20), Z)` at the projector and `CKA(sg(V24), H_k)` at selected
+decoder layers. Set both CKA weights nonzero to enable both terms. Both anchors
+come from the same CLIP forward; the projector input and CE path are unchanged.
+Without the projector override, the previous shared-anchor behavior is preserved.
+The projector override can also coexist with a decoder `CKA_ANCHOR_LAYER`;
+the mutual exclusion above only applies to the hidden-CKA anchor.
+
+To give the final decoder block a different vision anchor from intermediate
+blocks, set `CKA_FINAL_VISION_ANCHOR_LAYER`
+(CLI: `--cka_loss_final_vision_anchor_layer`). For example:
+
+```bash
+CKA_LAYERS="12,final" \
+CKA_PROJECTOR_VISION_ANCHOR_LAYER=24 \
+CKA_VISION_ANCHOR_LAYER=20 \
+CKA_FINAL_VISION_ANCHOR_LAYER=24 \
+bash scripts/v1_5/7b/finetune_qwen2_5.sh
+```
+
+This uses `CKA(sg(V24), Z)`, `CKA(sg(V20), H_12)` and
+`CKA(sg(V24), H_final)`. Only the layers in `CKA_LAYERS` are supervised; an
+anchor flag does not add target layers. The final override also applies when
+the last decoder block is selected numerically or through `all`, and never
+adds a duplicate final loss. Without the final override, selected decoder
+layers keep the shared anchor. This override cannot be combined with the
+decoder `CKA_ANCHOR_LAYER`. Both hidden anchors are detached, aligned with the
+same image tokens, and split before each CKA computation; they are not combined
+into one CKA reference. All three losses share one CLIP forward. Existing loss
+weights and summation across selected decoder layers are unchanged.
+
+To accept a nonzero CKA dissimilarity, set `CKA_LOSS_TAU` in these launchers
+(CLI: `--cka_loss_tau`). The loss is `mean(relu(1 - CKA - tau))`, with the
+hinge applied per sample, independently for projector and each selected decoder
+layer, before multiplying by the existing loss weights. For example, `0.05`
+accepts CKA similarity at least `0.95`: the CKA loss and its gradient are zero
+at or below that raw-loss threshold. CE still trains normally, and if a sample's
+dissimilarity later exceeds the threshold its CKA penalty becomes active again.
+Valid values are finite numbers in `[0, 1]`; the default `0.0` preserves the old
+objective. Existing CKA logs show the post-tau, pre-weight losses, not the raw
+`1 - CKA`. This does not skip CKA computation or guarantee faster training.
+Use distinct output/run names when comparing tau values, for example:
+
+```bash
+CKA_LOSS_TAU=0.05 \
+OUTPUT_DIR=./checkpoints/finetune-cka/qwen2.5-1.5b/cka-tau-0p05/llava-finetune \
+WANDB_RUN_NAME=qwen2.5-1.5b-cka-tau-0p05 \
+bash scripts/v1_5/7b/finetune_qwen2_5.sh
+```
 
 CPU training, accumulation, checkpoint, CKA, and backbone compatibility checks:
 `python -m unittest -v tests.test_training_compatibility tests.test_backbone_registry`.

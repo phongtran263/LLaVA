@@ -162,20 +162,21 @@ def _accumulate_sequence_stats(
                 main_flat = main_gradient.detach().reshape(-1)
             if auxiliary_gradient is not None:
                 auxiliary_flat = auxiliary_gradient.detach().reshape(-1)
-            if auxiliary_flat is None:
+            if main_flat is None and auxiliary_flat is None:
                 continue
-            if main_flat is not None and main_flat.shape != auxiliary_flat.shape:
+            if main_flat is not None and auxiliary_flat is not None and main_flat.shape != auxiliary_flat.shape:
                 raise ValueError("Mismatched VSP gradient tensor shapes.")
 
-            numel = auxiliary_flat.numel()
+            numel = main_flat.numel() if main_flat is not None else auxiliary_flat.numel()
             for start in range(0, numel, int(chunk_size)):
                 stop = min(start + int(chunk_size), numel)
                 main_chunk = main_flat[start:stop].float() if main_flat is not None else None
                 auxiliary_chunk = auxiliary_flat[start:stop].float() if auxiliary_flat is not None else None
                 if main_chunk is not None:
                     stats[1].add_(torch.dot(main_chunk, main_chunk).double())
-                stats[2].add_(torch.dot(auxiliary_chunk, auxiliary_chunk).double())
-                if main_chunk is not None:
+                if auxiliary_chunk is not None:
+                    stats[2].add_(torch.dot(auxiliary_chunk, auxiliary_chunk).double())
+                if main_chunk is not None and auxiliary_chunk is not None:
                     stats[0].add_(torch.dot(main_chunk, auxiliary_chunk).double())
     return stats
 
@@ -205,14 +206,19 @@ def _sequence_norm(
     gradients: Sequence[Optional[torch.Tensor]],
     reference_tensor: torch.Tensor,
     process_group=None,
+    chunk_size: int = VSP_GRAD_STAT_CHUNK_SIZE,
 ) -> torch.Tensor:
+    if int(chunk_size) <= 0:
+        raise ValueError("chunk_size must be positive.")
     stats = torch.zeros((), device=reference_tensor.device, dtype=torch.float64)
     with torch.no_grad():
         for gradient in gradients:
             if gradient is None:
                 continue
-            flat = gradient.detach().reshape(-1).float()
-            stats.add_(torch.dot(flat, flat).double())
+            flat = gradient.detach().reshape(-1)
+            for start in range(0, flat.numel(), int(chunk_size)):
+                chunk = flat[start:start + int(chunk_size)].float()
+                stats.add_(torch.dot(chunk, chunk).double())
         _all_reduce_if_needed(stats, process_group)
     return stats.clamp_min(0.0).sqrt()
 
@@ -251,6 +257,7 @@ def _apply_auxiliary_transform(
     process_group=None,
     chunk_size: int = VSP_GRAD_STAT_CHUNK_SIZE,
     clone_auxiliary: bool = True,
+    log_stats: bool = True,
 ) -> Tuple[List[Optional[torch.Tensor]], Dict[str, float]]:
     stats_tensor = _accumulate_sequence_stats(
         main_gradients,
@@ -261,26 +268,25 @@ def _apply_auxiliary_transform(
     _all_reduce_if_needed(stats_tensor, process_group)
     values = _stats_to_values(stats_tensor, eps)
 
-    dot = values["dot"]
-    main_norm_sq = values["main_norm_sq"]
-    aux_norm = values["auxiliary_norm"]
-    main_norm = values["main_norm"]
-    cosine = values["cosine"]
-    finite_stats = torch.isfinite(dot) & torch.isfinite(main_norm_sq) & torch.isfinite(aux_norm)
-    has_main = main_norm_sq > float(eps)
-    conflict = (cosine < -float(pcgrad_threshold)) & has_main & finite_stats
-    coefficient = torch.where(
-        apply_pcgrad & conflict,
-        dot / (main_norm_sq + float(eps)),
-        torch.zeros_like(dot),
-    )
+    # One device-to-host transfer instead of a separate synchronization per statistic.
+    dot, main_norm_sq, aux_norm_float, main_norm_float, cosine = torch.stack([
+        values[key] for key in ("dot", "main_norm_sq", "auxiliary_norm", "main_norm", "cosine")
+    ]).detach().cpu().tolist()
+    if not all(math.isfinite(v) for v in (dot, main_norm_sq, aux_norm_float, main_norm_float, cosine)):
+        raise RuntimeError("VSP gradient statistic is NaN or Inf.")
+    conflict = cosine < -float(pcgrad_threshold) and main_norm_sq > float(eps)
+    coeff_float = dot / (main_norm_sq + float(eps)) if apply_pcgrad and conflict else 0.0
 
     safe_auxiliary: List[Optional[torch.Tensor]] = []
-    coeff_float = _safe_item(coefficient)
     with torch.no_grad():
         for main_gradient, auxiliary_gradient in zip(main_gradients, auxiliary_gradients):
             if auxiliary_gradient is None:
-                safe_auxiliary.append(None)
+                # None is a zero coordinate in the full group vector. Projection
+                # can introduce a gradient here; never modify the CE tensor.
+                safe_auxiliary.append(
+                    main_gradient.detach().mul(-coeff_float)
+                    if main_gradient is not None and coeff_float != 0.0 else None
+                )
                 continue
             if clone_auxiliary:
                 safe_gradient = auxiliary_gradient.detach().clone()
@@ -290,10 +296,11 @@ def _apply_auxiliary_transform(
                 safe_gradient.add_(main_gradient.detach(), alpha=-coeff_float)
             safe_auxiliary.append(safe_gradient)
 
-    safe_aux_norm = _sequence_norm(safe_auxiliary, reference_tensor, process_group=process_group)
-    safe_aux_norm_float = _safe_item(safe_aux_norm)
-    main_norm_float = _safe_item(main_norm)
-    aux_norm_float = _safe_item(aux_norm)
+    safe_aux_norm_float = 0.0
+    if apply_norm_cap or log_stats:
+        safe_aux_norm_float = _safe_item(_sequence_norm(
+            safe_auxiliary, reference_tensor, process_group=process_group, chunk_size=chunk_size,
+        ))
     cap_reference = main_norm_float if main_norm_reference is None else float(main_norm_reference)
     cap_scale = 1.0
     if apply_norm_cap:
@@ -313,14 +320,14 @@ def _apply_auxiliary_transform(
     removed_norm = abs(coeff_float) * main_norm_float
     removed_fraction = 0.0 if aux_norm_float <= float(eps) else min(1.0, removed_norm / (aux_norm_float + float(eps)))
     stats = {
-        "cos": _safe_item(cosine),
+        "cos": cosine,
         "main_norm": main_norm_float,
         "aux_norm": aux_norm_float,
         "safe_aux_norm": safe_aux_norm_float,
         "raw_aux_ratio": 0.0 if main_norm_float <= float(eps) else aux_norm_float / (main_norm_float + float(eps)),
         "safe_aux_ratio": 0.0 if main_norm_float <= float(eps) else safe_aux_norm_float / (main_norm_float + float(eps)),
-        "conflict": float(bool(conflict.item())),
-        "severe_conflict": float(bool((cosine < -0.5).item())),
+        "conflict": float(conflict),
+        "severe_conflict": float(cosine < -0.5),
         "projection_removed_fraction": removed_fraction if apply_pcgrad else 0.0,
         "cap_scale": cap_scale,
         "cap_active": float(cap_scale < 1.0),
@@ -486,11 +493,16 @@ class VSPGradientController:
         logs: MutableMapping[str, float],
         group_name: str,
         group_logs: Mapping[str, float],
+        log_stats: bool = True,
     ) -> None:
+        # This EMA controls norm cap: update every optimizer step, even with logging off.
+        main_ema = self._ema_update(f"grad/{group_name}/main_grad_norm_ema", group_logs["main_grad_norm"])
+        if not log_stats:
+            return
         for suffix, value in group_logs.items():
             logs[f"grad/{group_name}/{suffix}"] = value
+        logs[f"grad/{group_name}/main_grad_norm_ema"] = main_ema
         for suffix in (
-            "main_grad_norm",
             "proj_safe_aux_norm",
             "final_safe_aux_norm",
             "proj_vs_lm_cos",
@@ -510,23 +522,20 @@ class VSPGradientController:
         final_gradients: Sequence[Optional[torch.Tensor]],
         reference_tensor: torch.Tensor,
         clone_gradients: bool = True,
+        log_stats: bool = True,
     ) -> Tuple[List[Optional[torch.Tensor]], Dict[str, float]]:
         main_norm_reference = self._main_norm_reference(group_name)
         max_ratio = self.max_ratio(group_name)
 
-        raw_aux_norm = _summed_sequence_norm(
-            proj_gradients,
-            final_gradients,
-            reference_tensor,
-            process_group=self.process_group,
-        )
-        proj_final_stats = _accumulate_sequence_stats(
-            proj_gradients,
-            final_gradients,
-            reference_tensor=reference_tensor,
-        )
-        _all_reduce_if_needed(proj_final_stats, self.process_group)
-        proj_final_values = _stats_to_values(proj_final_stats, self.eps)
+        if log_stats:
+            raw_aux_norm = _summed_sequence_norm(
+                proj_gradients, final_gradients, reference_tensor, process_group=self.process_group,
+            )
+            proj_final_stats = _accumulate_sequence_stats(
+                proj_gradients, final_gradients, reference_tensor=reference_tensor,
+            )
+            _all_reduce_if_needed(proj_final_stats, self.process_group)
+            proj_final_values = _stats_to_values(proj_final_stats, self.eps)
 
         safe_proj, proj_stats = _apply_auxiliary_transform(
             main_gradients,
@@ -540,6 +549,7 @@ class VSPGradientController:
             eps=self.eps,
             process_group=self.process_group,
             clone_auxiliary=clone_gradients,
+            log_stats=log_stats,
         )
         safe_final, final_stats = _apply_auxiliary_transform(
             main_gradients,
@@ -553,9 +563,11 @@ class VSPGradientController:
             eps=self.eps,
             process_group=self.process_group,
             clone_auxiliary=clone_gradients,
+            log_stats=log_stats,
         )
 
-        safe_aux_norm = _summed_sequence_norm(safe_proj, safe_final, reference_tensor, process_group=self.process_group)
+        if self.apply_norm_cap or log_stats:
+            safe_aux_norm = _summed_sequence_norm(safe_proj, safe_final, reference_tensor, process_group=self.process_group)
         main_norm = max(proj_stats["main_norm"], final_stats["main_norm"])
         cap_reference = main_norm if main_norm_reference is None else float(main_norm_reference)
         total_cap_scale = 1.0
@@ -571,7 +583,13 @@ class VSPGradientController:
             if total_cap_scale < 1.0:
                 _scale_gradient_sequence(safe_proj, total_cap_scale)
                 _scale_gradient_sequence(safe_final, total_cap_scale)
-                safe_aux_norm = _summed_sequence_norm(safe_proj, safe_final, reference_tensor, process_group=self.process_group)
+                if log_stats:
+                    safe_aux_norm = _summed_sequence_norm(safe_proj, safe_final, reference_tensor, process_group=self.process_group)
+
+        if not log_stats:
+            return _combine_final_gradients(
+                main_gradients, safe_proj, safe_final, clone_outputs=clone_gradients,
+            ), {"main_grad_norm": main_norm}
 
         raw_aux_norm_float = _safe_item(raw_aux_norm)
         safe_aux_norm_float = _safe_item(safe_aux_norm)
@@ -628,8 +646,10 @@ class VSPGradientController:
         lm_loss: torch.Tensor,
         vsp_proj_loss: Optional[torch.Tensor] = None,
         vsp_final_loss: Optional[torch.Tensor] = None,
+        *,
+        log_stats: bool = True,
     ) -> Dict[str, float]:
-        return self._compute(lm_loss, vsp_proj_loss, vsp_final_loss, assign_gradients=True)
+        return self._compute(lm_loss, vsp_proj_loss, vsp_final_loss, assign_gradients=True, log_stats=log_stats)
 
     def _compute(
         self,
@@ -638,27 +658,38 @@ class VSPGradientController:
         vsp_final_loss: Optional[torch.Tensor],
         *,
         assign_gradients: bool,
+        log_stats: bool = True,
     ) -> Dict[str, float]:
         validate_vsp_losses(lm_loss, vsp_proj_loss, vsp_final_loss)
         groups = collect_vsp_parameter_groups(self.model)
         logs: Dict[str, float] = {}
+
+        # Traverse each loss graph once, then slice gradients into parameter groups.
+        all_params = [p for name in VSP_GROUP_NAMES for p in groups[name].params]
+        losses = (lm_loss, vsp_proj_loss, vsp_final_loss)
+        last_active = max((i for i, loss in enumerate(losses) if _is_usable_loss(loss)), default=-1)
+        gradients = [
+            _extract_gradients(loss, all_params, retain_graph=not assign_gradients or i != last_active)
+            for i, loss in enumerate(losses)
+        ]
+        offset = 0
 
         for group_name in VSP_GROUP_NAMES:
             group = groups[group_name]
             params = group.params
             if not params:
                 continue
-            main_gradients = _extract_gradients(lm_loss, params, retain_graph=True)
-            proj_gradients = _extract_gradients(vsp_proj_loss, params, retain_graph=True)
-            final_gradients = _extract_gradients(vsp_final_loss, params, retain_graph=True)
+            main_gradients, proj_gradients, final_gradients = [g[offset:offset + len(params)] for g in gradients]
+            offset += len(params)
             final_sequence, group_logs = self._process_group_gradients(
                 group_name,
                 main_gradients,
                 proj_gradients,
                 final_gradients,
                 reference_tensor=lm_loss,
+                log_stats=log_stats,
             )
-            self._record_group_logs(logs, group_name, group_logs)
+            self._record_group_logs(logs, group_name, group_logs, log_stats=log_stats)
             if assign_gradients:
                 with torch.no_grad():
                     for param, gradient in zip(params, final_sequence):
@@ -767,6 +798,8 @@ def combine_partitioned_vsp_gradients(
     final_parts: Mapping[int, Sequence[Optional[torch.Tensor]]],
     group_id_to_name: Mapping[int, str],
     reference_tensor: torch.Tensor,
+    *,
+    log_stats: bool = True,
 ) -> Tuple[Dict[int, List[torch.Tensor]], Dict[str, float]]:
     all_group_ids = sorted(set(main_parts) | set(proj_parts) | set(final_parts))
     logs: Dict[str, float] = {}
@@ -795,8 +828,9 @@ def combine_partitioned_vsp_gradients(
             flat_final,
             reference_tensor=reference_tensor,
             clone_gradients=False,
+            log_stats=log_stats,
         )
-        controller._record_group_logs(logs, group_name, group_logs)
+        controller._record_group_logs(logs, group_name, group_logs, log_stats=log_stats)
         for (group_id, _), gradient in zip(layout, final_sequence):
             if gradient is None:
                 continue

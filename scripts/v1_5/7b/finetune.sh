@@ -48,6 +48,7 @@ fi
     --group_by_modality_length True \
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
+    --seed "${SEED:-42}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \

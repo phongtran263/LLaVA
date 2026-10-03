@@ -101,6 +101,7 @@ class TrainingCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             model = make_model(pretrain=True)
             model.config.vsp_asymmetric_pcgrad = True
+            model.config.vsp_gradient_diagnostics = True
             model.config.vsp_apply_to_projector_only = True
             initial_projector = model.model.mm_projector.weight.detach().clone()
             trainer = self._train(model, tmp, 2, 1)

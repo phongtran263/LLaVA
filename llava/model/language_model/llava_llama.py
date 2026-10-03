@@ -349,6 +349,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         vision_feature_mask,
         output_device,
     ):
+        config = self.get_model().config
+        is_vision_reference = reference_name == "vision_encoder"
+        vision_anchor_layer = getattr(config, "cka_loss_vision_anchor_layer", None)
+        final_anchor_layer = getattr(config, "cka_loss_final_vision_anchor_layer", None)
+        if is_vision_reference and vision_anchor_layer is not None:
+            reference_name = f"vision_encoder_layer_{vision_anchor_layer}"
         ordered_hiddens = list(self._iter_cka_layer_hiddens(
             cka_layer_specs,
             captured_layer_hiddens,
@@ -361,14 +367,29 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return layer_losses, per_layer_losses
 
         reference = reference_features.detach()
+        final_reference = None
+        final_layer_names = set()
+        if is_vision_reference and final_anchor_layer is not None:
+            width = self.get_vision_tower().hidden_size
+            if reference.shape[-1] != 2 * width:
+                raise ValueError("Final vision CKA override requires aligned packed mid/final vision references.")
+            reference, final_reference = reference.split(width, dim=-1)
+            num_layers = len(self.get_model().layers)
+            # The numeric last block, 'final', 'last', and 'all' use the same anchor.
+            final_layer_names = {
+                spec["name"] for spec in cka_layer_specs if spec["layer_idx"] == num_layers
+            }
         for layer_name, layer_hidden in ordered_hiddens:
+            use_final_anchor = final_reference is not None and layer_name in final_layer_names
+            layer_reference = final_reference if use_final_anchor else reference
+            layer_reference_name = f"vision_encoder_layer_{final_anchor_layer}" if use_final_anchor else reference_name
             layer_loss = self._compute_masked_linear_cka_loss(
                 projected_features=layer_hidden,
-                layer_hidden_states=reference,
+                layer_hidden_states=layer_reference,
                 vision_feature_mask=vision_feature_mask,
             ).to(output_device)
             layer_losses.append(layer_loss)
-            per_layer_losses[f"{reference_name}_to_{layer_name}"] = layer_loss.detach()
+            per_layer_losses[f"{layer_reference_name}_to_{layer_name}"] = layer_loss.detach()
 
         return layer_losses, per_layer_losses
 

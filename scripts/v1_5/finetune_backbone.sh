@@ -18,17 +18,30 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-./checkpoints/${RUN_NAME}-${MM_PROJECTOR_TYP
 PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-${CHECKPOINT_ROOT}/llava-pretrain/mm_projector.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT_ROOT}/llava-finetune}"
 CKA_LOSS="${CKA_LOSS:-False}"
+CKA_LOSS_TAU="${CKA_LOSS_TAU:-0.0}"
 CKA_PROJECTOR_WEIGHT="${CKA_PROJECTOR_WEIGHT:-0.1}"
 CKA_FINAL_HIDDEN_WEIGHT="${CKA_FINAL_HIDDEN_WEIGHT:-0.1}"
 CKA_LOSS_START_RATIO="${CKA_LOSS_START_RATIO:-0.0}"
 CKA_LAYERS="${CKA_LAYERS:-final}"
 CKA_ANCHOR_LAYER="${CKA_ANCHOR_LAYER:-}"
+CKA_VISION_ANCHOR_LAYER="${CKA_VISION_ANCHOR_LAYER:-}"
+CKA_PROJECTOR_VISION_ANCHOR_LAYER="${CKA_PROJECTOR_VISION_ANCHOR_LAYER:-}"
+CKA_FINAL_VISION_ANCHOR_LAYER="${CKA_FINAL_VISION_ANCHOR_LAYER:-}"
 VSP_DIAGNOSTICS="${VSP_DIAGNOSTICS:-False}"
 VSP_PCGRAD="${VSP_PCGRAD:-False}"
 VSP_NORM_CAP="${VSP_NORM_CAP:-False}"
 OPTIONAL_CKA_ARGS=()
 if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
     OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_vision_anchor_layer "${CKA_VISION_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_PROJECTOR_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_projector_vision_anchor_layer "${CKA_PROJECTOR_VISION_ANCHOR_LAYER}")
+fi
+if [[ -n "${CKA_FINAL_VISION_ANCHOR_LAYER}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--cka_loss_final_vision_anchor_layer "${CKA_FINAL_VISION_ANCHOR_LAYER}")
 fi
 
 "${CONDA_PREFIX}/bin/deepspeed" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
@@ -47,6 +60,7 @@ fi
     --group_by_modality_length True \
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
+    --seed "${SEED:-42}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-4}" \
     --per_device_eval_batch_size 4 \
@@ -66,6 +80,7 @@ fi
     --report_to wandb \
     --run_name "${RUN_NAME}-finetune" \
     --cka_loss "${CKA_LOSS}" \
+    --cka_loss_tau "${CKA_LOSS_TAU}" \
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
     --cka_loss_final_hidden_weight "${CKA_FINAL_HIDDEN_WEIGHT}" \
     --cka_loss_start_ratio "${CKA_LOSS_START_RATIO}" \

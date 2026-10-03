@@ -32,6 +32,7 @@ deepspeed --include localhost:0,1 llava/train/train_mem.py \
     --group_by_modality_length True \
     --bf16 True \
     --output_dir ./checkpoints/lora-ft/cka-proj-last-attn-otsu-7b/llava-finetune \
+    --seed "${SEED:-42}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \

@@ -38,23 +38,15 @@ from llava.train.llava_trainer import (
     validate_save_at_step_ratio,
     validate_stop_after_step_ratio,
 )
-from llava.train.adaptive_projector_pcgrad import (
-    AdaptiveProjectorPCGradConfig,
-    METADATA_FILE as ADAPTIVE_PCGRAD_METADATA_FILE,
-    load_json as load_adaptive_pcgrad_json,
-    projector_sha256,
-    projector_signature,
-)
-from llava.train.projector_replay_reference import ordered_trainable_parameters, validate_replayable_projector
 from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
 
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.model.backbones import (
-    as_llava_config, backbone_type, default_conversation, get_llava_model_class,
+    as_llava_config, backbone_type, configure_tokenizer_padding, default_conversation, get_llava_model_class,
     is_llama3, use_fast_tokenizer,
 )
-from llava.model.llava_arch import validate_cka_loss_tau
+from llava.model.llava_arch import validate_cka_loss_tau, validate_cka_vision_anchor
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -85,222 +77,6 @@ def format_parameter_shape(param):
         return f"partitioned(numel={get_parameter_numel(param)})"
     return list(param.shape)
 
-_ADAPTIVE_PCGRAD_FIELDS = (
-    "max_aux_ratio",
-    "warmup_ratio",
-    "norm_ema_beta",
-    "lambda_max",
-    "ce_norm_floor",
-    "aux_norm_floor",
-    "residual_rtol",
-)
-
-
-def resolve_adaptive_projector_pcgrad_config(model_args, training_args):
-    """Resolve stage-local controller settings without guessing total steps.
-
-    The Trainer owns ``planned_optimizer_steps`` because only it knows the
-    resolved dataloader/accumulation horizon. Everything else is validated here
-    once, before model/backend initialization.
-    """
-    enabled = bool(model_args.adaptive_projector_pcgrad)
-    supplied_without_enable = (
-        model_args.adaptive_pcgrad_stage is not None
-        or model_args.adaptive_pcgrad_config is not None
-        or any(
-            getattr(model_args, f"adaptive_pcgrad_{name}") is not None
-            for name in _ADAPTIVE_PCGRAD_FIELDS
-        )
-    )
-    if not enabled:
-        if supplied_without_enable:
-            raise ValueError(
-                "Adaptive projector PCGrad settings were supplied, but "
-                "--adaptive_projector_pcgrad is False."
-            )
-        return None
-
-    try:
-        stage = int(model_args.adaptive_pcgrad_stage)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "--adaptive_pcgrad_stage must be explicitly set to 1 or 2 when "
-            "adaptive projector PCGrad is enabled."
-        ) from exc
-    if stage not in (1, 2):
-        raise ValueError(f"--adaptive_pcgrad_stage must be 1 or 2, got {stage}.")
-
-    legacy_flags = {
-        "cka_loss": model_args.cka_loss,
-        "use_pcgrad": model_args.use_pcgrad,
-        "vsp_gradient_diagnostics": model_args.vsp_gradient_diagnostics,
-        "vsp_asymmetric_pcgrad": model_args.vsp_asymmetric_pcgrad,
-        "vsp_apply_to_projector_only": model_args.vsp_apply_to_projector_only,
-        "vsp_norm_cap": model_args.vsp_norm_cap,
-        "debug_compare_cka": training_args.debug_compare_cka,
-        "log_gradient_norms": training_args.log_gradient_norms,
-    }
-    active_legacy = [name for name, value in legacy_flags.items() if bool(value)]
-    if active_legacy:
-        raise ValueError(
-            "Adaptive projector PCGrad is mutually exclusive with legacy CKA/VSP paths; "
-            f"disable: {', '.join(active_legacy)}."
-        )
-    if float(model_args.cka_loss_start_ratio) != 0.0:
-        raise ValueError(
-            "--cka_loss_start_ratio belongs to the legacy CKA path and must remain 0 "
-            "with adaptive projector PCGrad."
-        )
-    if model_args.vision_tower is None:
-        raise ValueError("Adaptive projector PCGrad requires --vision_tower.")
-    if training_args.freeze_mm_mlp_adapter:
-        raise ValueError("Adaptive projector PCGrad requires a trainable mm_projector.")
-    if int(training_args.bits) != 16:
-        raise ValueError(
-            "Adaptive projector PCGrad supports full-parameter BF16/FP32 ZeRO-2 only; "
-            f"quantized bits={training_args.bits} is unsupported."
-        )
-    if stage == 1 and not model_args.tune_mm_mlp_adapter:
-        raise ValueError("Stage 1 adaptive PCGrad requires --tune_mm_mlp_adapter True.")
-    if stage == 2 and model_args.tune_mm_mlp_adapter:
-        raise ValueError(
-            "Stage 2 adaptive PCGrad must preserve the finetuning recipe; "
-            "--tune_mm_mlp_adapter must be False."
-        )
-    if stage == 2 and not model_args.pretrain_mm_mlp_adapter:
-        raise ValueError(
-            "Stage 2 adaptive PCGrad requires --pretrain_mm_mlp_adapter from an "
-            "adaptive-PCGrad stage-1 checkpoint."
-        )
-    if int(model_args.adaptive_pcgrad_cka_chunk_size) <= 0:
-        raise ValueError("--adaptive_pcgrad_cka_chunk_size must be positive.")
-
-    payload = {}
-    if model_args.adaptive_pcgrad_config is not None:
-        config_path = pathlib.Path(model_args.adaptive_pcgrad_config).expanduser()
-        if not config_path.is_file():
-            raise FileNotFoundError(f"Adaptive PCGrad config does not exist: {config_path}")
-        payload = load_adaptive_pcgrad_json(str(config_path))
-
-    config_stage = payload.pop("stage", stage)
-    try:
-        config_stage = int(config_stage)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Adaptive PCGrad JSON field 'stage' must be 1 or 2.") from exc
-    if config_stage != stage:
-        raise ValueError(
-            f"Adaptive PCGrad JSON is for stage {config_stage}, but launcher requested stage {stage}."
-        )
-    forbidden = {"planned_optimizer_steps", "warmup_steps"}.intersection(payload)
-    if forbidden:
-        raise ValueError(
-            "Trainer resolves these adaptive PCGrad fields; remove them from JSON: "
-            + ", ".join(sorted(forbidden))
-        )
-    unknown = set(payload).difference(_ADAPTIVE_PCGRAD_FIELDS)
-    if unknown:
-        raise ValueError(
-            "Unknown adaptive PCGrad JSON fields: " + ", ".join(sorted(unknown))
-        )
-    for name in _ADAPTIVE_PCGRAD_FIELDS:
-        override = getattr(model_args, f"adaptive_pcgrad_{name}")
-        if override is not None:
-            payload[name] = override
-
-    validated = AdaptiveProjectorPCGradConfig(
-        stage=stage,
-        planned_optimizer_steps=1,
-        **payload,
-    ).validate()
-    resolved = {
-        name: getattr(validated, name)
-        for name in ("stage", *_ADAPTIVE_PCGRAD_FIELDS)
-    }
-    return resolved
-
-
-def validate_adaptive_projector_setup(model, model_args, resolved_config):
-    """Validate exact module identity/trainability before backend wrapping."""
-    if resolved_config is None:
-        return
-    inner_model = model.get_model()
-    projector = getattr(inner_model, "mm_projector", None)
-    if projector is None:
-        raise RuntimeError("Adaptive projector PCGrad could not resolve model.mm_projector.")
-    validate_replayable_projector(projector)
-
-    projector_names, projector_params = ordered_trainable_parameters(projector)
-    projector_ids = {id(parameter) for parameter in projector_params}
-    if not projector_params:
-        raise RuntimeError("Adaptive projector PCGrad requires trainable projector parameters.")
-
-    vision_tower = model.get_vision_tower()
-    trainable_vision = [name for name, parameter in vision_tower.named_parameters() if parameter.requires_grad]
-    if trainable_vision:
-        preview = ", ".join(trainable_vision[:5])
-        raise RuntimeError(
-            "Adaptive projector PCGrad requires a frozen vision encoder; trainable parameters: "
-            f"{preview}"
-        )
-
-    if int(resolved_config["stage"]) == 1:
-        frozen_projector = [name for name, parameter in projector.named_parameters() if not parameter.requires_grad]
-        if frozen_projector:
-            raise RuntimeError(
-                "Stage 1 requires the complete projector to be trainable; frozen parameters: "
-                + ", ".join(frozen_projector[:5])
-            )
-        outside_projector = [
-            name
-            for name, parameter in model.named_parameters()
-            if parameter.requires_grad and id(parameter) not in projector_ids
-        ]
-        if outside_projector:
-            raise RuntimeError(
-                "Stage 1 adaptive PCGrad must train only the projector; extra trainable parameters: "
-                + ", ".join(outside_projector[:5])
-            )
-
-    model.config.adaptive_pcgrad_projector_parameter_names = projector_names
-
-
-def validate_adaptive_stage2_handoff(model, model_args, resolved_config):
-    """Prove stage 2 loaded the intended adaptive-PCGrad stage-1 projector."""
-    if resolved_config is None or int(resolved_config["stage"]) != 2:
-        return None
-    adapter_path = pathlib.Path(model_args.pretrain_mm_mlp_adapter).expanduser()
-    metadata_path = adapter_path.parent / ADAPTIVE_PCGRAD_METADATA_FILE
-    if not metadata_path.is_file():
-        raise FileNotFoundError(
-            "Stage 2 adaptive PCGrad requires stage-1 provenance metadata next to the adapter: "
-            f"{metadata_path}"
-        )
-    metadata = load_adaptive_pcgrad_json(str(metadata_path))
-    if int(metadata.get("stage", -1)) != 1:
-        raise RuntimeError(f"Stage-2 handoff metadata must declare stage=1: {metadata_path}")
-    expected_base = str(model_args.model_name_or_path)
-    if metadata.get("base_model_identifier") != expected_base:
-        raise RuntimeError(
-            "Stage-1 projector base model does not match stage 2: "
-            f"{metadata.get('base_model_identifier')!r} != {expected_base!r}."
-        )
-    expected_signature = metadata.get("projector_signature")
-    expected_hash = metadata.get("projector_sha256")
-    if not expected_signature or not isinstance(expected_hash, str) or not expected_hash:
-        raise RuntimeError(f"Incomplete stage-1 projector provenance metadata: {metadata_path}")
-
-    projector = model.get_model().mm_projector
-    actual_signature = projector_signature(projector)
-    actual_hash = projector_sha256(projector)
-    if actual_signature != expected_signature:
-        raise RuntimeError("Loaded stage-1 projector signature does not match its metadata.")
-    if actual_hash != expected_hash:
-        raise RuntimeError("Loaded stage-1 projector hash does not match its metadata.")
-    model.config.adaptive_pcgrad_stage1_metadata = str(metadata_path)
-    model.config.adaptive_pcgrad_stage1_projector_sha256 = actual_hash
-    return metadata
-
-
 from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
@@ -326,33 +102,6 @@ class ModelArguments:
     router_dropout: Optional[float] = field(default=None)
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
-    adaptive_projector_pcgrad: bool = field(
-        default=False,
-        metadata={"help": "Enable stage-local adaptive one-sided PCGrad for unweighted projector CKA."},
-    )
-    adaptive_pcgrad_stage: Optional[int] = field(
-        default=None,
-        metadata={"help": "Required adaptive projector PCGrad stage: 1 (projector pretrain) or 2 (finetune)."},
-    )
-    adaptive_pcgrad_config: Optional[str] = field(
-        default=None,
-        metadata={"help": "Optional stage-specific adaptive projector PCGrad JSON config."},
-    )
-    adaptive_pcgrad_max_aux_ratio: Optional[float] = field(default=None)
-    adaptive_pcgrad_warmup_ratio: Optional[float] = field(default=None)
-    adaptive_pcgrad_norm_ema_beta: Optional[float] = field(default=None)
-    adaptive_pcgrad_lambda_max: Optional[float] = field(default=None)
-    adaptive_pcgrad_ce_norm_floor: Optional[float] = field(default=None)
-    adaptive_pcgrad_aux_norm_floor: Optional[float] = field(default=None)
-    adaptive_pcgrad_residual_rtol: Optional[float] = field(default=None)
-    adaptive_pcgrad_cka_chunk_size: int = field(
-        default=4,
-        metadata={"help": "Number of image observations per projector-sidecar CKA replay chunk."},
-    )
-    adaptive_pcgrad_profile: bool = field(
-        default=False,
-        metadata={"help": "Log measured optimizer-step wall time and peak allocated memory."},
-    )
     cka_loss: bool = field(default=False)
     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
@@ -370,9 +119,27 @@ class ModelArguments:
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
     cka_loss_anchor_layer: Optional[int] = field(default=None, metadata={"help": "Optional 1-based decoder layer used as the detached hidden-CKA anchor. Omit it to keep the raw vision-encoder feature V as the anchor."})
+    cka_loss_vision_anchor_layer: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional CLIP hidden-state index for the detached projector/hidden CKA anchor. "
+                  "0 is the embedding state, 1..L are vision block outputs, -1 is the last block. "
+                  "Does not change mm_vision_select_layer. Mutually exclusive with cka_loss_anchor_layer."},
+    )
+    cka_loss_projector_vision_anchor_layer: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional CLIP hidden-state index overriding only the projector CKA anchor. "
+                  "Same indexing as cka_loss_vision_anchor_layer; when omitted, projector CKA "
+                  "keeps that shared vision anchor (or the usual projector input)."},
+    )
+    cka_loss_final_vision_anchor_layer: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional CLIP hidden-state index overriding only the last decoder block's CKA anchor. "
+                  "Applies to 'final', its numeric layer index, and 'all'. Other selected blocks keep "
+                  "cka_loss_vision_anchor_layer. Mutually exclusive with cka_loss_anchor_layer."},
+    )
     cka_loss_start_ratio: float = field(default=0.0, metadata={"help": "Fraction of total optimizer steps to complete before enabling all CKA losses. Use 0.8 for CKA only during the final fifth; 0.0 preserves immediate CKA."})
-    # Every selected decoder-layer CKA term uses the same detached anchor:
-    # Raw vision V by default, or H_N when cka_loss_anchor_layer=N.
+    # Selected decoder layers use vision V (with an optional last-block override),
+    # or H_N when cka_loss_anchor_layer=N.
     cka_loss_layers: Optional[str] = field(default="final", metadata={"help": "Comma-separated 1-based LLM layer indices and/or 'final' for CKA(sg(A), H_k), e.g. '8,16,24,final'. A is raw vision V by default or H_N when --cka_loss_anchor_layer N is set. 'final' aliases the last decoder block. Use 'all' for every block, 'every4' or 'interval:4' for every k-th block, and '-1' to disable this term. Layer CKA is supported by LLaMA, Qwen2/3, Gemma3, Phi3 and Mistral; MPT uses projector CKA only."})
     cka_loss_layer_decay: float = field(default=1.0, metadata={"help": "Deprecated; retained for compatibility with older consecutive-layer CKA runs."})
     # 1-based layer used only to rank/select important image tokens by
@@ -395,7 +162,7 @@ class DataArguments:
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
     train_data_fraction: float = field(default=1.0, metadata={"help": "Fraction of the training JSON to use. Set below 1.0 for quick debug runs."})
-    train_data_seed: int = field(default=42, metadata={"help": "Seed used when sampling train_data_fraction."})
+    train_data_seed: Optional[int] = field(default=None, metadata={"help": "Seed used when sampling train_data_fraction. Defaults to --seed; an explicit value overrides it."})
 
 
 @dataclass
@@ -607,7 +374,7 @@ def _tokenize_fn(strings: Sequence[str],
         tokenized.input_ids[0] for tokenized in tokenized_list
     ]
     input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()
+        tokenized.attention_mask.sum().item()
         for tokenized in tokenized_list
     ]
     return dict(
@@ -700,14 +467,17 @@ def preprocess_llama_2(
 
     if has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        input_lengths = [len(ids) for ids in input_ids]
     else:
-        input_ids = tokenizer(
+        tokenized = tokenizer(
             conversations,
             return_tensors="pt",
             padding="longest",
             max_length=tokenizer.model_max_length,
             truncation=True,
-        ).input_ids
+        )
+        input_ids = tokenized.input_ids
+        input_lengths = tokenized.attention_mask.sum(dim=1).tolist()
 
     targets = input_ids.clone()
 
@@ -715,8 +485,7 @@ def preprocess_llama_2(
 
     # Mask targets
     sep = "[/INST] "
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+    for conversation, target, total_len in zip(conversations, targets, input_lengths):
 
         rounds = conversation.split(conv.sep2)
         cur_len = 1
@@ -789,14 +558,17 @@ def preprocess_v1(
 
     if has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        input_lengths = [len(ids) for ids in input_ids]
     else:
-        input_ids = tokenizer(
+        tokenized = tokenizer(
             conversations,
             return_tensors="pt",
             padding="longest",
             max_length=tokenizer.model_max_length,
             truncation=True,
-        ).input_ids
+        )
+        input_ids = tokenized.input_ids
+        input_lengths = tokenized.attention_mask.sum(dim=1).tolist()
 
     targets = input_ids.clone()
 
@@ -804,8 +576,7 @@ def preprocess_v1(
 
     # Mask targets
     sep = conv.sep + conv.roles[1] + ": "
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+    for conversation, target, total_len in zip(conversations, targets, input_lengths):
 
         rounds = conversation.split(conv.sep2)
         cur_len = 1
@@ -875,22 +646,24 @@ def preprocess_mpt(
 
     if has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        input_lengths = [len(ids) for ids in input_ids]
     else:
-        input_ids = tokenizer(
+        tokenized = tokenizer(
             conversations,
             return_tensors="pt",
             padding="longest",
             max_length=tokenizer.model_max_length,
             truncation=True,
-        ).input_ids
+        )
+        input_ids = tokenized.input_ids
+        input_lengths = tokenized.attention_mask.sum(dim=1).tolist()
 
     targets = input_ids.clone()
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
     # Mask targets
     sep = conv.sep + conv.roles[1]
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+    for conversation, target, total_len in zip(conversations, targets, input_lengths):
 
         rounds = conversation.split(conv.sep)
         re_rounds = [conv.sep.join(rounds[:3])] # system + user + gpt
@@ -1109,7 +882,8 @@ class LazySupervisedDataset(Dataset):
             raise ValueError(f"train_data_fraction must be in (0, 1], got {train_data_fraction}")
         if original_size > 0 and train_data_fraction < 1.0:
             subset_size = max(1, int(original_size * train_data_fraction))
-            train_data_seed = int(getattr(data_args, 'train_data_seed', 42))
+            train_data_seed = getattr(data_args, 'train_data_seed', None)
+            train_data_seed = 42 if train_data_seed is None else int(train_data_seed)
             generator = torch.Generator()
             generator.manual_seed(train_data_seed)
             selected_indices = torch.randperm(original_size, generator=generator)[:subset_size].tolist()
@@ -1204,6 +978,7 @@ class DataCollatorForSupervisedDataset(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+        input_lengths = [len(ids) for ids in input_ids]
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -1216,7 +991,10 @@ class DataCollatorForSupervisedDataset(object):
         batch = dict(
             input_ids=input_ids,
             labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            # A real EOS/UNK token may equal PAD. Only newly padded positions
+            # are padding; never discard turn boundaries from inputs or labels.
+            attention_mask=(torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
+                            < torch.tensor(input_lengths, device=input_ids.device)[:, None]),
         )
 
         if 'image' in instances[0]:
@@ -1268,14 +1046,26 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Trainer seeds too late for model/projector/LoRA initialization. Seed every
+    # rank here (Python, NumPy, PyTorch CPU/CUDA), before constructing any model.
+    transformers.set_seed(training_args.seed)
+    if data_args.train_data_seed is None:
+        data_args.train_data_seed = training_args.seed
+    if model_args.cka_loss_vision_anchor_layer is not None:
+        if model_args.cka_loss_anchor_layer is not None:
+            raise ValueError("--cka_loss_anchor_layer and --cka_loss_vision_anchor_layer are mutually exclusive.")
+    if model_args.cka_loss_final_vision_anchor_layer is not None and model_args.cka_loss_anchor_layer is not None:
+        raise ValueError("--cka_loss_anchor_layer and --cka_loss_final_vision_anchor_layer are mutually exclusive.")
+    if (model_args.cka_loss_vision_anchor_layer is not None
+            or model_args.cka_loss_projector_vision_anchor_layer is not None
+            or model_args.cka_loss_final_vision_anchor_layer is not None):
+        if model_args.vision_tower is None:
+            raise ValueError("CKA vision-layer anchors require --vision_tower.")
     training_args.stop_after_step_ratio = validate_stop_after_step_ratio(
         training_args.stop_after_step_ratio
     )
     training_args.save_at_step_ratio = validate_save_at_step_ratio(
         training_args.save_at_step_ratio
-    )
-    adaptive_pcgrad_config = resolve_adaptive_projector_pcgrad_config(
-        model_args, training_args
     )
     local_rank = training_args.local_rank
     if model_args.use_pcgrad:
@@ -1367,15 +1157,6 @@ def train(attn_implementation=None):
         model.to(training_args.device)
 
     model.config.use_cache = False
-    model.config.adaptive_projector_pcgrad = bool(model_args.adaptive_projector_pcgrad)
-    model.config.adaptive_pcgrad_stage = (
-        None if adaptive_pcgrad_config is None else int(adaptive_pcgrad_config["stage"])
-    )
-    model.config.adaptive_projector_pcgrad_config = adaptive_pcgrad_config
-    model.config.adaptive_pcgrad_base_model_identifier = str(model_args.model_name_or_path)
-    model.config.adaptive_pcgrad_cka_chunk_size = int(model_args.adaptive_pcgrad_cka_chunk_size)
-    model.config.adaptive_pcgrad_profile = bool(model_args.adaptive_pcgrad_profile)
-
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
@@ -1407,6 +1188,9 @@ def train(attn_implementation=None):
         model_args.cka_loss_start_ratio
     )
     cka_anchor_layer = model_args.cka_loss_anchor_layer
+    model.config.cka_loss_vision_anchor_layer = model_args.cka_loss_vision_anchor_layer
+    model.config.cka_loss_projector_vision_anchor_layer = model_args.cka_loss_projector_vision_anchor_layer
+    model.config.cka_loss_final_vision_anchor_layer = model_args.cka_loss_final_vision_anchor_layer
     if cka_anchor_layer is not None:
         cka_anchor_layer = int(cka_anchor_layer)
         decoder_model = model.get_model() if hasattr(model, "get_model") else None
@@ -1430,7 +1214,10 @@ def train(attn_implementation=None):
         model.config.cka_loss_reference = f"layer_{cka_anchor_layer}"
     else:
         model.config.cka_loss_anchor_layer = None
-        model.config.cka_loss_reference = "vision_encoder"
+        model.config.cka_loss_reference = (
+            "vision_encoder" if model_args.cka_loss_vision_anchor_layer is None
+            else f"vision_encoder_layer_{model_args.cka_loss_vision_anchor_layer}"
+        )
     model.config.cka_loss_layer_decay = max(0.0, min(1.0, float(model_args.cka_loss_layer_decay)))
     model.config.cka_loss_subset_select_layer = model_args.cka_loss_subset_select_layer
     cka_subset_query_tokens = str(model_args.cka_loss_subset_query_tokens or "text").lower().replace("_", "-")
@@ -1587,22 +1374,17 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        if family in ("qwen2", "qwen3", "gemma3_text", "phi3"):
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-            if tokenizer.pad_token_id is not None:
-                model.config.pad_token_id = tokenizer.pad_token_id
-        elif is_llama3_model:
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token
-            if tokenizer.pad_token_id is not None:
-                model.config.pad_token_id = tokenizer.pad_token_id
-        else:
+        if family not in ("qwen2", "qwen3", "gemma3_text", "phi3") and not is_llama3_model:
             tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+
+    configure_tokenizer_padding(tokenizer, model.config)
+    model.get_input_embeddings().padding_idx = tokenizer.pad_token_id
+    if model.generation_config is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
@@ -1611,6 +1393,7 @@ def train(attn_implementation=None):
         )
         
         vision_tower = model.get_vision_tower()
+        validate_cka_vision_anchor(model.config, vision_tower)
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
@@ -1653,10 +1436,6 @@ def train(attn_implementation=None):
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-    validate_adaptive_projector_setup(model, model_args, adaptive_pcgrad_config)
-    validate_adaptive_stage2_handoff(model, model_args, adaptive_pcgrad_config)
-
-
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(f"✅ TRAINABLE: {name} | Shape: {format_parameter_shape(param)}")
