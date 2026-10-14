@@ -82,13 +82,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         vision_feature_mask: torch.BoolTensor,
         eps: float = 1e-8,
         tau: Optional[float] = None,
+        target_head: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """
         Hinge CKA term between aligned image-token features.
 
         The caller passes two aligned feature tensors and only positions marked
         by `vision_feature_mask` participate. Feature dimensions may differ; CKA
-        compares token-token Gram structure.
+        compares token-token Gram structure. When supplied, target_head acts on
+        the first tensor, after gathering visual tokens and before centering.
         """
         if projected_features.ndim != 3 or layer_hidden_states.ndim != 3:
             raise ValueError(
@@ -132,19 +134,30 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         compact_mask_expanded = compact_mask.unsqueeze(-1)
 
+        # Gather before casting/head evaluation: do not allocate or transform
+        # full-sequence hidden states for an image-token-only regularizer.
+        x = projected_features.gather(
+            1,
+            gather_indices.unsqueeze(-1).expand(-1, -1, projected_features.shape[-1]),
+        )
+        y = layer_hidden_states.gather(
+            1,
+            gather_indices.unsqueeze(-1).expand(-1, -1, layer_hidden_states.shape[-1]),
+        )
+        if target_head is not None:
+            # Padding in the compact batch can contain gathered text positions;
+            # exclude it from the MLP, not merely from the subsequent CKA loss.
+            head_parameter = next(target_head.parameters())
+            transformed = target_head(x[compact_mask].to(
+                device=head_parameter.device, dtype=head_parameter.dtype,
+            )).to(target_device)
+            x = transformed.new_zeros((*x.shape[:2], transformed.shape[-1]))
+            x[compact_mask] = transformed
+
         # As in projector CKA, explicitly disable autocast for Gram/HSIC math.
         with torch.autocast(device_type=target_device.type, enabled=False):
-            projected_features = projected_features.float()
-            layer_hidden_states = layer_hidden_states.float()
-
-            x = projected_features.gather(
-                1,
-                gather_indices.unsqueeze(-1).expand(-1, -1, projected_features.shape[-1]),
-            )
-            y = layer_hidden_states.gather(
-                1,
-                gather_indices.unsqueeze(-1).expand(-1, -1, layer_hidden_states.shape[-1]),
-            )
+            x = x.float()
+            y = y.float()
 
             x = x.masked_fill(~compact_mask_expanded, 0.0)
             y = y.masked_fill(~compact_mask_expanded, 0.0)
@@ -368,25 +381,35 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         reference = reference_features.detach()
         final_reference = None
-        final_layer_names = set()
+        # Resolve by actual block index, so numeric L, final/last and all agree.
+        num_layers = len(self.get_model().layers)
+        final_layer_names = {
+            spec["name"] for spec in cka_layer_specs if spec["layer_idx"] == num_layers
+        }
+        final_head = None
+        if getattr(config, "cka_loss_final_mlp_head", False):
+            final_head = getattr(self.get_model(), "cka_final_mlp_head", None)
+            if final_head is None:
+                raise RuntimeError(
+                    "Final CKA MLP head must be initialized before creating the optimizer."
+                )
         if is_vision_reference and final_anchor_layer is not None:
             width = self.get_vision_tower().hidden_size
             if reference.shape[-1] != 2 * width:
                 raise ValueError("Final vision CKA override requires aligned packed mid/final vision references.")
             reference, final_reference = reference.split(width, dim=-1)
-            num_layers = len(self.get_model().layers)
-            # The numeric last block, 'final', 'last', and 'all' use the same anchor.
-            final_layer_names = {
-                spec["name"] for spec in cka_layer_specs if spec["layer_idx"] == num_layers
-            }
         for layer_name, layer_hidden in ordered_hiddens:
             use_final_anchor = final_reference is not None and layer_name in final_layer_names
             layer_reference = final_reference if use_final_anchor else reference
             layer_reference_name = f"vision_encoder_layer_{final_anchor_layer}" if use_final_anchor else reference_name
+            head_kwargs = {}
+            if final_head is not None and layer_name in final_layer_names:
+                head_kwargs["target_head"] = final_head
             layer_loss = self._compute_masked_linear_cka_loss(
                 projected_features=layer_hidden,
                 layer_hidden_states=layer_reference,
                 vision_feature_mask=vision_feature_mask,
+                **head_kwargs,
             ).to(output_device)
             layer_losses.append(layer_loss)
             per_layer_losses[f"{layer_reference_name}_to_{layer_name}"] = layer_loss.detach()

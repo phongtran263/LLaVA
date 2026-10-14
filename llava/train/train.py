@@ -39,6 +39,16 @@ from llava.train.llava_trainer import (
     validate_stop_after_step_ratio,
 )
 from llava.train.vsp_gradient_controller import validate_vsp_gradient_config
+from llava.train.protected_cka_config import (
+    prepare_protected_cka_datasets,
+    protected_cka_config_dict,
+    validate_protected_cka_config,
+)
+from llava.train.protected_cka_stage2_config import (
+    prepare_protected_cka_stage2_datasets,
+    protected_cka_stage2_config_dict,
+    validate_protected_cka_stage2_config,
+)
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -118,6 +128,7 @@ class ModelArguments:
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
+    cka_loss_final_mlp_head: bool = field(default=False, metadata={"help": "Apply a trainable hidden-size Linear-GELU-Linear head only to the final decoder CKA target. Requires CKA and a final-layer selection; does not affect logits, projector CKA, or intermediate-layer CKA."})
     cka_loss_anchor_layer: Optional[int] = field(default=None, metadata={"help": "Optional 1-based decoder layer used as the detached hidden-CKA anchor. Omit it to keep the raw vision-encoder feature V as the anchor."})
     cka_loss_vision_anchor_layer: Optional[int] = field(
         default=None,
@@ -163,6 +174,10 @@ class DataArguments:
     image_aspect_ratio: str = 'square'
     train_data_fraction: float = field(default=1.0, metadata={"help": "Fraction of the training JSON to use. Set below 1.0 for quick debug runs."})
     train_data_seed: Optional[int] = field(default=None, metadata={"help": "Seed used when sampling train_data_fraction. Defaults to --seed; an explicit value overrides it."})
+    protected_cka_validation_data_path: Optional[str] = field(default=None)
+    protected_cka_validation_image_folder: Optional[str] = field(default=None)
+    protected_stage2_validation_data_path: Optional[str] = field(default=None)
+    protected_stage2_validation_image_folder: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -199,6 +214,69 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    protected_cka_refinement: bool = field(default=False, metadata={"help": "Opt-in Stage 1 CE followed by protected CKA at plateau or the reserved refinement budget; single-process CPU/CUDA FP32/BF16 only."})
+    protected_cka_start_phase_b: bool = field(default=False, metadata={"help": "Start a new Phase B continuation from a verified CE-only source; this is not full-state resume."})
+    protected_cka_source_stage1_checkpoint: Optional[str] = field(default=None, metadata={"help": "Verified Stage 1 Phase-A checkpoint directory for a new continuation with its original held-out split."})
+    protected_cka_continuation: str = field(default="protected", metadata={"help": "Phase B training objective: protected, ce_kl, or ce_only."})
+    protected_cka_margin: float = field(default=0.02)
+    protected_cka_kl_weight: float = field(default=0.10)
+    protected_cka_ema_decay: float = field(default=0.99)
+    protected_cka_aux_ratio: float = field(default=0.10)
+    protected_cka_lambda_max: float = field(default=1.0)
+    protected_cka_ce_tolerance: float = field(default=0.005)
+    protected_cka_text_kl_budget: float = field(default=0.01)
+    protected_cka_drift_budget: float = field(default=0.01)
+    protected_cka_refine_lr: Optional[float] = field(default=None)
+    protected_cka_warmup_steps: int = field(default=100)
+    protected_cka_ce_gradient_calibration_batches: int = field(default=8)
+    protected_cka_eval_interval: int = field(default=50)
+    protected_cka_max_retries: int = field(default=3)
+    protected_cka_kl_chunk_size: int = field(default=128)
+    protected_cka_aux_backoff: float = field(default=0.5)
+    protected_cka_eps: float = field(default=1e-8)
+    protected_cka_min_phase_a_steps: int = field(default=1500)
+    protected_cka_min_phase_b_steps: int = field(default=350, metadata={"help": "Reserve this many total-budget steps for Phase B after min_phase_a_steps; zero keeps plateau-only switching."})
+    protected_cka_plateau_patience: int = field(default=3)
+    protected_cka_plateau_min_delta: float = field(default=0.001)
+    protected_cka_max_phase_a_steps: Optional[int] = field(default=None, metadata={"help": "Optional Phase A hard cap. Switching requires min_phase_a_steps and either CE plateau or the Phase B reserve boundary."})
+    protected_cka_plateau_window: int = field(default=3)
+    protected_cka_validation_fraction: float = field(default=0.005)
+    protected_cka_validation_max_samples: int = field(default=2048)
+    protected_cka_validation_seed: int = field(default=42)
+    # Stage 2 has its own lifecycle and gate settings; Stage 1 is unchanged.
+    protected_stage2: bool = field(default=False)
+    cka_grad_scope: str = field(default="existing")
+    protected_stage2_start_phase_b: bool = field(default=False)
+    protected_stage2_source_stage2_checkpoint: Optional[str] = field(default=None)
+    protected_stage2_continuation: str = field(default="protected")
+    protected_stage2_reference_device: str = field(default="same")
+    protected_stage2_margin: float = field(default=0.02)
+    protected_stage2_kl_weight: float = field(default=0.10)
+    protected_stage2_ema_decay: float = field(default=0.99)
+    protected_stage2_proj_aux_ratio: float = field(default=0.10)
+    protected_stage2_llm_aux_ratio: float = field(default=0.10)
+    protected_stage2_lambda_max: float = field(default=1.0)
+    protected_stage2_ce_tolerance: Optional[float] = field(default=None)
+    protected_stage2_text_kl_budget: Optional[float] = field(default=None)
+    protected_stage2_drift_budget: Optional[float] = field(default=None)
+    protected_stage2_refine_lr: Optional[float] = field(default=None)
+    protected_stage2_warmup_steps: int = field(default=100)
+    protected_stage2_ce_gradient_calibration_batches: int = field(default=8)
+    protected_stage2_eval_interval: int = field(default=100)
+    protected_stage2_max_retries: int = field(default=3)
+    protected_stage2_kl_chunk_size: int = field(default=128)
+    protected_stage2_aux_backoff: float = field(default=0.5)
+    protected_stage2_eps: float = field(default=1e-8)
+    protected_stage2_min_phase_a_steps: int = field(default=1500)
+    protected_stage2_min_phase_b_steps: int = field(default=350, metadata={"help": "Reserve this many total-budget steps for Stage 2 refinement; zero keeps plateau-only switching."})
+    protected_stage2_plateau_patience: int = field(default=3)
+    protected_stage2_plateau_min_delta: float = field(default=0.001)
+    protected_stage2_max_phase_a_steps: Optional[int] = field(default=None)
+    protected_stage2_max_phase_b_steps: Optional[int] = field(default=None)
+    protected_stage2_plateau_window: int = field(default=3)
+    protected_stage2_validation_fraction: float = field(default=0.005)
+    protected_stage2_validation_max_samples: int = field(default=2048)
+    protected_stage2_validation_seed: int = field(default=42)
     debug_compare_cka: bool = field(default=False, metadata={"help": "Run a single-batch cka_loss off/on comparison and exit."})
     debug_compare_batch_size: int = field(default=1, metadata={"help": "Number of dataset items to collate for the CKA debug comparison."})
     debug_compare_batch_start: int = field(default=0, metadata={"help": "Starting dataset index for the CKA debug comparison batch."})
@@ -281,7 +359,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'cka_final_mlp_head']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -300,7 +378,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
+        keys_to_match = ['mm_projector', 'cka_final_mlp_head']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -1008,14 +1086,21 @@ class DataCollatorForSupervisedDataset(object):
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
+                                data_args, training_args=None) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
+    eval_dataset = None
+    if training_args is not None and getattr(training_args, "protected_cka_refinement", False):
+        train_dataset, eval_dataset = prepare_protected_cka_datasets(
+            train_dataset, tokenizer, data_args, training_args, LazySupervisedDataset)
+    elif training_args is not None and getattr(training_args, "protected_stage2", False):
+        train_dataset, eval_dataset = prepare_protected_cka_stage2_datasets(
+            train_dataset, tokenizer, data_args, training_args, LazySupervisedDataset)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
-                eval_dataset=None,
+                eval_dataset=eval_dataset,
                 data_collator=data_collator)
 
 
@@ -1040,12 +1125,85 @@ def run_cka_debug_compare(trainer: LLaVATrainer, training_args: TrainingArgument
     return results
 
 
+def validate_cka_final_mlp_head_args(model_args, training_args, *, family=None):
+    """Reject modes that cannot use the optional standard final-CKA head."""
+    if not getattr(model_args, "cka_loss_final_mlp_head", False):
+        return
+    if (getattr(training_args, "protected_cka_refinement", False)
+            or getattr(training_args, "protected_stage2", False)):
+        raise ValueError("--cka_loss_final_mlp_head is not supported with Protected CKA modes.")
+    if not getattr(model_args, "cka_loss", False):
+        raise ValueError("--cka_loss_final_mlp_head requires --cka_loss True.")
+    if getattr(model_args, "vision_tower", None) is None:
+        raise ValueError("--cka_loss_final_mlp_head requires --vision_tower.")
+    if family == "mpt":
+        raise ValueError("--cka_loss_final_mlp_head is not supported by MPT, which only implements projector CKA.")
+    final_weight = getattr(model_args, "cka_loss_final_hidden_weight", None)
+    if final_weight is None:
+        final_weight = getattr(model_args, "cka_loss_weight", 1.0)
+    if float(final_weight) == 0.0:
+        raise ValueError("--cka_loss_final_mlp_head requires a nonzero --cka_loss_final_hidden_weight.")
+    if (getattr(training_args, "lora_enable", False)
+            and getattr(training_args, "load_best_model_at_end", False)):
+        raise ValueError(
+            "--cka_loss_final_mlp_head with LoRA does not support --load_best_model_at_end: "
+            "the PEFT best-model loader does not restore auxiliary head weights."
+        )
+    head_only_llm_gradients = bool(
+        getattr(model_args, "tune_mm_mlp_adapter", False)
+        or (getattr(training_args, "bits", 16) in (4, 8)
+            and not getattr(training_args, "lora_enable", False))
+    )
+    if getattr(model_args, "vsp_norm_cap", False) and head_only_llm_gradients:
+        raise ValueError(
+            "--cka_loss_final_mlp_head with projector-only or quantized non-LoRA training "
+            "requires --vsp_norm_cap False: a CE-relative LLM norm cap can suppress "
+            "the auxiliary-only head gradients."
+        )
+
+
+def validate_cka_final_mlp_head_layers(config, num_layers):
+    """Require the final decoder block among the already parsed CKA targets."""
+    if not getattr(config, "cka_loss_final_mlp_head", False):
+        return
+    layers = getattr(config, "cka_loss_layers", "final")
+    tokens = layers.split(",") if isinstance(layers, str) else layers
+    if not isinstance(tokens, (list, tuple)):
+        tokens = [tokens]
+    if num_layers > 0 and any(
+        str(token).strip().lower() in ("final", "last", "all", str(num_layers))
+        for token in tokens
+    ):
+        return
+    raise ValueError(
+        "--cka_loss_final_mlp_head requires --cka_loss_layers to include the final "
+        f"decoder block ('final', 'all', or its 1-based index {num_layers}); "
+        f"got {layers!r}. Projector-only '-1' is incompatible."
+    )
+
+
+def set_cka_final_mlp_head_config(config, enabled):
+    # Legacy Protected CKA resume signatures include every cka_loss* key.
+    # Do not add a new False key to checkpoints/configs that never had a head.
+    if enabled or hasattr(config, "cka_loss_final_mlp_head"):
+        config.cka_loss_final_mlp_head = bool(enabled)
+
+
 def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    validate_cka_final_mlp_head_args(model_args, training_args)
+    validate_protected_cka_config(model_args, data_args, training_args)
+    validate_protected_cka_stage2_config(model_args, data_args, training_args)
+    if ((getattr(training_args, "protected_cka_refinement", False) or getattr(training_args, "protected_stage2", False))
+            and attn_implementation == "flash_attention_2"
+            and (not training_args.bf16 or training_args.device.type == "cpu")):
+        # train_mem requests FlashAttention unconditionally; it cannot execute
+        # the supported CPU/FP32 path. Keep this fallback strictly opt-in.
+        attn_implementation = "sdpa"
     # Trainer seeds too late for model/projector/LoRA initialization. Seed every
     # rank here (Python, NumPy, PyTorch CPU/CUDA), before constructing any model.
     transformers.set_seed(training_args.seed)
@@ -1078,7 +1236,7 @@ def train(attn_implementation=None):
     validate_vsp_gradient_config(model_args)
     if vsp_gradient_requested and not model_args.cka_loss:
         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
-    if (vsp_gradient_requested or model_args.cka_loss) and training_args.gradient_checkpointing:
+    if (vsp_gradient_requested or model_args.cka_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
             raise ValueError(
                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
@@ -1097,6 +1255,7 @@ def train(attn_implementation=None):
         force_download=model_args.force_download,
     )
     family = backbone_type(backbone_config)
+    validate_cka_final_mlp_head_args(model_args, training_args, family=family)
     is_llama3_model = is_llama3(backbone_config)
     if model_args.version == "auto":
         model_args.version = default_conversation(backbone_config)
@@ -1112,7 +1271,7 @@ def train(attn_implementation=None):
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector"],
+                llm_int8_skip_modules=["mm_projector", "cka_final_mlp_head"],
                 llm_int8_threshold=6.0,
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1129,6 +1288,9 @@ def train(attn_implementation=None):
     if model_args.vision_tower is not None:
         model_cls = get_llava_model_class(backbone_config)
         config = as_llava_config(backbone_config)
+        # Construct the optional head before loading its checkpoint weights.
+        # Explicitly disabling it keeps the legacy model architecture unchanged.
+        set_cka_final_mlp_head_config(config, model_args.cka_loss_final_mlp_head)
         if family == "mpt":
             config.attn_config["attn_impl"] = training_args.mpt_attn_impl
         else:
@@ -1160,6 +1322,13 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    set_cka_final_mlp_head_config(model.config, model_args.cka_loss_final_mlp_head)
+    if getattr(training_args, "protected_cka_refinement", False):
+        model.config.protected_cka_config = protected_cka_config_dict(training_args, data_args)
+        for key, value in model.config.protected_cka_config.items():
+            setattr(model.config, key, value)
+    if getattr(training_args, "protected_stage2", False):
+        model.config.protected_cka_stage2_config = protected_cka_stage2_config_dict(training_args, data_args)
     model.config.use_pcgrad = bool(model_args.use_pcgrad)
     model.config.vsp_gradient_diagnostics = bool(model_args.vsp_gradient_diagnostics)
     model.config.vsp_asymmetric_pcgrad = bool(model_args.vsp_asymmetric_pcgrad)
@@ -1310,6 +1479,11 @@ def train(attn_implementation=None):
             if parsed_cka_layers == [-1]:
                 model.config.cka_loss_layers = [-1]
             elif invalid_cka_layer is not None or not parsed_cka_layers:
+                if model_args.cka_loss_final_mlp_head:
+                    raise ValueError(
+                        "--cka_loss_final_mlp_head requires a valid --cka_loss_layers "
+                        f"selection including the final decoder block, got {model_args.cka_loss_layers!r}."
+                    )
                 rank0_print(
                     f"Warning: Invalid cka_loss_layers format '{model_args.cka_loss_layers}', "
                     "defaulting to final"
@@ -1319,6 +1493,15 @@ def train(attn_implementation=None):
                 model.config.cka_loss_layers = parsed_cka_layers
     else:
         model.config.cka_loss_layers = "final"
+
+    if model_args.cka_loss_final_mlp_head:
+        validate_cka_final_mlp_head_layers(model.config, len(model.get_model().layers))
+        if not training_args.deepspeed and not training_args.fsdp:
+            # The auxiliary head is unused during delayed-CKA/CE-only steps.
+            # DDP must discover that dynamically, including with checkpointing.
+            if training_args.ddp_find_unused_parameters is not True:
+                rank0_print("Final CKA MLP head: setting ddp_find_unused_parameters=True.")
+                training_args.ddp_find_unused_parameters = True
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -1394,7 +1577,10 @@ def train(attn_implementation=None):
         
         vision_tower = model.get_vision_tower()
         validate_cka_vision_anchor(model.config, vision_tower)
-        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        vision_dtype = (compute_dtype if (getattr(training_args, "protected_cka_refinement", False)
+                                         or getattr(training_args, "protected_stage2", False))
+                        else torch.bfloat16 if training_args.bf16 else torch.float16)
+        vision_tower.to(dtype=vision_dtype, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
@@ -1417,6 +1603,12 @@ def train(attn_implementation=None):
         mm_projector = getattr(model.get_model(), "mm_projector", None)
         if mm_projector is not None:
             mm_projector.to(dtype=compute_dtype, device=training_args.device)
+        cka_final_mlp_head = model.get_model().initialize_cka_final_mlp_head()
+        # This head is an auxiliary full-rank module, not part of the frozen
+        # backbone or LoRA adapters. Stage 1 trains it alongside the projector.
+        if cka_final_mlp_head is not None:
+            cka_final_mlp_head.requires_grad_(model_args.cka_loss_final_mlp_head)
+            cka_final_mlp_head.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -1444,7 +1636,8 @@ def train(attn_implementation=None):
     trainable_pct = trainable_params / total_params if total_params > 0 else 0.0
     print(f"Trainable params: {trainable_params:,} | Total params: {total_params:,} | Trainable%: {trainable_pct:.2%}")
     data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args)
+                                              data_args=data_args,
+                                              training_args=training_args)
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,

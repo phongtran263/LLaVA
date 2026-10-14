@@ -59,8 +59,8 @@ fi
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-16}" \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-8}" \
-    --evaluation_strategy no \
-    --save_strategy steps \
+    --eval_strategy no \
+    --save_strategy "${SAVE_STRATEGY:-steps}" \
     --save_steps "${SAVE_STEPS:-24000}" \
     --save_total_limit 1 \
     --learning_rate "${LEARNING_RATE:-1e-3}" \
@@ -74,7 +74,7 @@ fi
     --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-8}" \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name "${RUN_NAME}-pretrain" \
+    --run_name "${WANDB_RUN_NAME:-${RUN_NAME}-pretrain}" \
     --cka_loss "${CKA_LOSS}" \
     --cka_loss_tau "${CKA_LOSS_TAU}" \
     --cka_loss_projector_weight "${CKA_PROJECTOR_WEIGHT}" \
@@ -83,6 +83,7 @@ fi
     --cka_loss_layers "${CKA_LAYERS}" \
     --vsp_gradient_diagnostics "${VSP_DIAGNOSTICS}" \
     --vsp_asymmetric_pcgrad "${VSP_PCGRAD}" \
+    --vsp_apply_to_projector_only "${VSP_APPLY_TO_PROJECTOR_ONLY:-False}" \
     --vsp_norm_cap "${VSP_NORM_CAP}" \
     --vsp_pcgrad_threshold "${VSP_PCGRAD_THRESHOLD:-0.05}" \
     --vsp_proj_max_grad_ratio "${VSP_PROJ_MAX_GRAD_RATIO:-0.5}" \

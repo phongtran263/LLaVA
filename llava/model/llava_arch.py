@@ -185,6 +185,26 @@ class LlavaMetaModel:
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
 
+        self.initialize_cka_final_mlp_head()
+
+    def initialize_cka_final_mlp_head(self):
+        """Register the optional auxiliary head before optimizer/checkpoint setup.
+
+        This head is never part of the decoder's CE or generation path.
+        Keeping it on the model makes standard save_pretrained/load work too.
+        """
+        if not getattr(self.config, 'cka_loss_final_mlp_head', False):
+            return None
+        if getattr(self, 'cka_final_mlp_head', None) is None:
+            width = self.config.hidden_size
+            reference = next(self.parameters())
+            self.cka_final_mlp_head = nn.Sequential(
+                nn.Linear(width, width),
+                nn.GELU(),
+                nn.Linear(width, width),
+            ).to(device=reference.device, dtype=reference.dtype)
+        return self.cka_final_mlp_head
+
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
         if type(vision_tower) is list:
@@ -240,6 +260,10 @@ class LlavaMetaModel:
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            head = self.initialize_cka_final_mlp_head()
+            head_weights = get_w(mm_projector_weights, 'cka_final_mlp_head')
+            if head is not None and head_weights:
+                head.load_state_dict(head_weights)
 
 
 def unpad_image(tensor, original_size):

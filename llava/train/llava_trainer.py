@@ -31,6 +31,7 @@ from llava.train.vsp_gradient_controller import (
 PCGRAD_EPS = 1e-12
 PCGRAD_STAT_CHUNK_SIZE = 1_048_576
 VSP_STATE_NAME = "vsp_gradient_state.json"
+CKA_FINAL_MLP_HEAD_NAME = "cka_final_mlp_head.bin"
 
 
 def validate_cka_loss_start_ratio(value):
@@ -557,6 +558,52 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+
+    def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
+        if getattr(self.args, 'protected_stage2', False):
+            if getattr(self.args, 'protected_cka_refinement', False):
+                raise ValueError('Protected CKA Stage 1 and Stage 2 are separate, mutually exclusive modes.')
+            from llava.train.protected_cka_stage2 import ProtectedCKAStage2
+            runtime = getattr(self, '_protected_cka_runtime', None)
+            if runtime is None:
+                runtime = self._protected_cka_runtime = ProtectedCKAStage2(self)
+            return runtime.run(super().train, resume_from_checkpoint=resume_from_checkpoint,
+                               trial=trial, ignore_keys_for_eval=ignore_keys_for_eval, **kwargs)
+        if not getattr(self.args, 'protected_cka_refinement', False):
+            return super().train(resume_from_checkpoint=resume_from_checkpoint, trial=trial,
+                                 ignore_keys_for_eval=ignore_keys_for_eval, **kwargs)
+        from llava.train.protected_cka_refinement import ProtectedCKARefinement
+        runtime = getattr(self, '_protected_cka_runtime', None)
+        if runtime is None:
+            runtime = self._protected_cka_runtime = ProtectedCKARefinement(self)
+        return runtime.run(super().train, resume_from_checkpoint=resume_from_checkpoint,
+                           trial=trial, ignore_keys_for_eval=ignore_keys_for_eval, **kwargs)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        runtime = getattr(self, '_protected_cka_runtime', None)
+        if runtime is not None:
+            runtime.load_checkpoint(resume_from_checkpoint)
+            return
+        result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        target = self.model if model is None else model
+        if getattr(self.args, 'lora_enable', False) and getattr(target.config, 'cka_loss_final_mlp_head', False):
+            path = os.path.join(resume_from_checkpoint, CKA_FINAL_MLP_HEAD_NAME)
+            if not os.path.isfile(path):
+                path = os.path.join(resume_from_checkpoint, 'non_lora_trainables.bin')
+            if not os.path.isfile(path):
+                raise ValueError("LoRA checkpoint has no final CKA MLP head weights; use model-only initialization for an older checkpoint instead of resuming.")
+            saved = torch.load(path, map_location='cpu', weights_only=True)
+            # PEFT exports can carry different base_model.model prefixes.
+            suffix = 'cka_final_mlp_head.'
+            saved = {name.split(suffix, 1)[1]: value for name, value in saved.items() if suffix in name}
+            head_state = {name: saved[name.split(suffix, 1)[1]]
+                          for name, _ in target.named_parameters()
+                          if suffix in name and name.split(suffix, 1)[1] in saved}
+            expected = {name for name, _ in target.named_parameters() if suffix in name}
+            if not expected or set(head_state) != expected:
+                raise ValueError(f"LoRA checkpoint is missing final CKA MLP head parameters: {sorted(expected - set(head_state))}")
+            target.load_state_dict(head_state, strict=False)
+        return result
 
     @contextmanager
     def _cka_loss_runtime_context(self, model):
@@ -1448,6 +1495,9 @@ class LLaVATrainer(Trainer):
             self._last_gradient_norm_logs = logs
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        runtime = getattr(self, '_protected_cka_runtime', None)
+        if runtime is not None:
+            return runtime.training_step(model, inputs)
         model.train()
         inputs = self._prepare_inputs(inputs)
 
@@ -1584,6 +1634,10 @@ class LLaVATrainer(Trainer):
 
     def log(self, logs, *args, **kwargs):
         logs = dict(logs)
+        if getattr(self.args, 'protected_stage2', False):
+            # Protected Stage 2 captures the legacy CKA calls and replaces their
+            # scalar objective. Their placeholder last_* values are not metrics.
+            return super().log(logs, *args, **kwargs)
         model = self.model.module if hasattr(self.model, 'module') else self.model
 
         if hasattr(self, '_last_cka_schedule_active'):
@@ -1638,6 +1692,16 @@ class LLaVATrainer(Trainer):
 
         if self.args.group_by_modality_length:
             lengths = self.train_dataset.modality_lengths
+            if getattr(self.args, 'protected_stage2', False):
+                # Make the existing modality grouping epoch-addressable so a
+                # protected rollback can replay it without consuming model RNG.
+                from llava.train.protected_cka_stage2 import ProtectedModalitySampler
+                return ProtectedModalitySampler(
+                    self.args.train_batch_size,
+                    world_size=self.args.world_size * self.args.gradient_accumulation_steps,
+                    lengths=lengths, group_by_modality=True,
+                    seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+                )
             return LengthGroupedSampler(
                 self.args.train_batch_size,
                 world_size=self.args.world_size * self.args.gradient_accumulation_steps,
@@ -1736,6 +1800,11 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def _load_optimizer_and_scheduler(self, checkpoint):
+        runtime = getattr(self, '_protected_cka_runtime', None)
+        if runtime is not None and checkpoint and runtime.phase == 'B':
+            # LambdaLR's function is not serialized: rebuild the original
+            # refinement horizon before loading its saved step/state.
+            runtime.reset_refinement_optimizer()
         super()._load_optimizer_and_scheduler(checkpoint)
         if not self._vsp_controller_requested():
             return
@@ -1753,6 +1822,10 @@ class LLaVATrainer(Trainer):
             logger.warning("Checkpoint has no VSP EMA state; norm-cap EMA will restart from the current gradient.")
 
     def _save_checkpoint(self, model, trial, *args, **kwargs):
+        runtime = getattr(self, '_protected_cka_runtime', None)
+        if runtime is not None:
+            # Only the held-out gate owns accepted snapshots in protected mode.
+            return
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
@@ -1761,7 +1834,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ['mm_projector', 'vision_resampler']
+            keys_to_match = ['mm_projector', 'vision_resampler', 'cka_final_mlp_head']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -1787,3 +1860,17 @@ class LLaVATrainer(Trainer):
         else:
             sanitize_generation_config_for_save(self.model)
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+            if (getattr(self.args, 'lora_enable', False)
+                    and getattr(self.model.config, 'cka_loss_final_mlp_head', False)
+                    and self.args.should_save):
+                # PEFT saves only LoRA weights. Use a supplied gathered state on
+                # sharded backends; never start rank-collective gathers in _save.
+                if state_dict is None and any(hasattr(p, 'ds_id') for n, p in self.model.named_parameters() if 'cka_final_mlp_head.' in n):
+                    raise ValueError("Saving the final CKA MLP head under ZeRO-3 requires a gathered model state_dict.")
+                source = self.model.state_dict() if state_dict is None else state_dict
+                head_state = {name: value.detach().cpu().clone() for name, value in source.items() if 'cka_final_mlp_head.' in name}
+                if not head_state:
+                    raise ValueError("The gathered checkpoint state is missing final CKA MLP head weights.")
+                output_dir = output_dir or self.args.output_dir
+                self.model.config.save_pretrained(output_dir)
+                torch.save(head_state, os.path.join(output_dir, CKA_FINAL_MLP_HEAD_NAME))
