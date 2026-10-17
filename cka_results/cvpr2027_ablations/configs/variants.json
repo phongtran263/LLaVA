@@ -1,0 +1,13 @@
+{
+  "note": "Coefficients derived from audited original stage-2 values 0.1/0.1. run.py resolves the shared recipe plus these relative factors; proj_strong must be calibrated, never defaults to doubling.",
+  "baseline": {"lambda_proj": 0.0, "lambda_final": 0.0, "geometry": "linear"},
+  "proj": {"lambda_proj": 0.1, "lambda_final": 0.0, "geometry": "linear"},
+  "final": {"lambda_proj": 0.0, "lambda_final": 0.1, "geometry": "linear"},
+  "full": {"lambda_proj": 0.1, "lambda_final": 0.1, "geometry": "linear"},
+  "proj_strong": {"lambda_proj": "from strength_match.json", "lambda_final": 0.0, "geometry": "linear"},
+  "full_row_normalized": {"lambda_proj": 0.1, "lambda_final": 0.1, "geometry": "row_normalized"},
+  "full_proj_low": {"lambda_proj": 0.05, "lambda_final": 0.1, "geometry": "linear"},
+  "full_proj_high": {"lambda_proj": 0.2, "lambda_final": 0.1, "geometry": "linear"},
+  "full_final_low": {"lambda_proj": 0.1, "lambda_final": 0.05, "geometry": "linear"},
+  "full_final_high": {"lambda_proj": 0.1, "lambda_final": 0.2, "geometry": "linear"}
+}

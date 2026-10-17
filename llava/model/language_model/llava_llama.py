@@ -34,7 +34,9 @@ from ..llava_arch import (
     LlavaMetaForCausalLM,
     cka_similarity_to_loss,
     normalize_centered_cka_features,
+    normalize_cka_token_rows,
     validate_cka_eps,
+    validate_cka_loss_geometry,
     validate_cka_loss_tau,
 )
 
@@ -83,6 +85,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         eps: float = 1e-8,
         tau: Optional[float] = None,
         target_head: Optional[nn.Module] = None,
+        geometry: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Hinge CKA term between aligned image-token features.
@@ -112,6 +115,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             tau = getattr(self.get_model().config, 'cka_loss_tau', 0.0)
         tau = validate_cka_loss_tau(tau)
         eps = validate_cka_eps(eps)
+        if geometry is None:
+            geometry = getattr(self.get_model().config, 'cka_loss_geometry', 'linear')
+        geometry = validate_cka_loss_geometry(geometry)
 
         target_device = projected_features.device
         layer_hidden_states = layer_hidden_states.to(target_device)
@@ -161,6 +167,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
             x = x.masked_fill(~compact_mask_expanded, 0.0)
             y = y.masked_fill(~compact_mask_expanded, 0.0)
+            if geometry == "row_normalized":
+                x = normalize_cka_token_rows(x)
+                y = normalize_cka_token_rows(y)
 
             counts = token_counts.clamp_min(1).to(dtype=x.dtype).view(-1, 1, 1)
             x = x - x.sum(dim=1, keepdim=True) / counts

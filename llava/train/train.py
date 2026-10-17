@@ -56,7 +56,7 @@ from llava.model.backbones import (
     as_llava_config, backbone_type, configure_tokenizer_padding, default_conversation, get_llava_model_class,
     is_llama3, use_fast_tokenizer,
 )
-from llava.model.llava_arch import validate_cka_loss_tau, validate_cka_vision_anchor
+from llava.model.llava_arch import validate_cka_loss_geometry, validate_cka_loss_tau, validate_cka_vision_anchor
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -125,6 +125,7 @@ class ModelArguments:
     vsp_grad_log_interval: int = field(default=10)
     vsp_grad_eps: float = field(default=1e-12)
     cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
+    cka_loss_geometry: str = field(default="linear", metadata={"choices": ["linear", "row_normalized"], "help": "Centered linear CKA on original features, or per-token L2 normalization before centered linear CKA. Defaults to the unchanged legacy geometry."})
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
@@ -1189,12 +1190,34 @@ def set_cka_final_mlp_head_config(config, enabled):
         config.cka_loss_final_mlp_head = bool(enabled)
 
 
+def set_cka_loss_geometry_config(config, geometry):
+    geometry = validate_cka_loss_geometry(geometry)
+    # Protected CKA resume signatures include every cka_loss* key. Preserve
+    # configs written before this opt-in ablation when using the legacy default.
+    if geometry != "linear" or hasattr(config, "cka_loss_geometry"):
+        config.cka_loss_geometry = geometry
+
+
+def validate_cka_loss_geometry_args(model_args, training_args):
+    geometry = validate_cka_loss_geometry(getattr(model_args, "cka_loss_geometry", "linear"))
+    if geometry != "linear" and (
+        getattr(training_args, "protected_cka_refinement", False)
+        or getattr(training_args, "protected_stage2", False)
+    ):
+        raise ValueError(
+            "--cka_loss_geometry row_normalized is supported by standard VSP training only; "
+            "Protected CKA modes use their own CKA objective."
+        )
+    return geometry
+
+
 def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args.cka_loss_geometry = validate_cka_loss_geometry_args(model_args, training_args)
     validate_cka_final_mlp_head_args(model_args, training_args)
     validate_protected_cka_config(model_args, data_args, training_args)
     validate_protected_cka_stage2_config(model_args, data_args, training_args)
@@ -1204,9 +1227,6 @@ def train(attn_implementation=None):
         # train_mem requests FlashAttention unconditionally; it cannot execute
         # the supported CPU/FP32 path. Keep this fallback strictly opt-in.
         attn_implementation = "sdpa"
-    # Trainer seeds too late for model/projector/LoRA initialization. Seed every
-    # rank here (Python, NumPy, PyTorch CPU/CUDA), before constructing any model.
-    transformers.set_seed(training_args.seed)
     if data_args.train_data_seed is None:
         data_args.train_data_seed = training_args.seed
     if model_args.cka_loss_vision_anchor_layer is not None:
@@ -1322,6 +1342,7 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    set_cka_loss_geometry_config(model.config, model_args.cka_loss_geometry)
     set_cka_final_mlp_head_config(model.config, model_args.cka_loss_final_mlp_head)
     if getattr(training_args, "protected_cka_refinement", False):
         model.config.protected_cka_config = protected_cka_config_dict(training_args, data_args)

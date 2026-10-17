@@ -50,6 +50,11 @@ scripts
 !/scripts/v1_5/7b/finetune_qwen2_5_3b_protected_cka.sh
 !/scripts/v1_5/7b/finetune_qwen2_5_3b_protected_ablation.sh
 !/scripts/v1_5/7b/finetune_qwen2_5_3b_protected_pipeline_pair.sh
+!/scripts/v1_5/7b/train_cka_ablations.sh
+!/scripts/v1_5/7b/train_cka_two_stage.sh
+!/scripts/v1_5/7b/CKA_ABLATIONS.md
+!/scripts/v1_5/7b/pretrain_qwen2_5.sh
+!/scripts/v1_5/7b/finetune_qwen2_5.sh
 eval_results
 cka_results
 analysis
@@ -58,6 +63,22 @@ llava/eval/motivation_analysis.py
 
 .ipynb_checkpoints
 *.ipynb
+
+# Reproducible CVPR VSP package; keep run artifacts and checkpoints ignored.
+!/scripts/cvpr2027/
+!/scripts/cvpr2027/*.py
+!/scripts/cvpr2027/*.sh
+!/cka_results/
+/cka_results/*
+!/cka_results/cvpr2027_ablations/
+/cka_results/cvpr2027_ablations/*
+!/cka_results/cvpr2027_ablations/README.md
+!/cka_results/cvpr2027_ablations/audit.md
+!/cka_results/cvpr2027_ablations/configs/
+!/cka_results/cvpr2027_ablations/configs/*.json
+!/cka_results/cvpr2027_ablations/configs/*.md
+!/cka_results/cvpr2027_ablations/scripts/
+!/cka_results/cvpr2027_ablations/scripts/*.sh
 
 # DevContainer
 !.devcontainer/*

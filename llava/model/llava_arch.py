@@ -83,6 +83,26 @@ def normalize_centered_cka_features(features):
     return features / norms.clamp_min(torch.finfo(features.dtype).tiny)
 
 
+def validate_cka_loss_geometry(geometry):
+    """Keep the original CKA geometry as the backward-compatible default."""
+    if geometry not in ("linear", "row_normalized"):
+        raise ValueError(
+            "cka_loss_geometry must be 'linear' or 'row_normalized', "
+            f"got {geometry!r}"
+        )
+    return geometry
+
+
+def normalize_cka_token_rows(features):
+    """L2-normalize tokens in FP32 *before* token-wise centering.
+
+    The 1e-12 row-norm floor keeps zero tokens finite. This helper is used only
+    by the explicit row-normalized ablation; legacy linear CKA is unchanged.
+    """
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        return torch.nn.functional.normalize(features.float(), p=2, dim=-1, eps=1e-12)
+
+
 def cka_similarity_to_loss(cka, tau=0.0):
     """Apply a per-sample hinge to CKA dissimilarity.
 
@@ -94,7 +114,7 @@ def cka_similarity_to_loss(cka, tau=0.0):
     return torch.relu((1.0 - tau) - cka)
 
 
-def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0):
+def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0, geometry="linear"):
     """
     Compute per-sample Linear CKA loss.
     For each batch element, treats tokens/patches as samples and features as dimensions.
@@ -105,12 +125,15 @@ def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0):
         eps: numerical stability constant
         tau: tolerated raw CKA loss in [0, 1]. The returned loss is
              ``mean(max(0, 1 - CKA - tau))``.
+        geometry: ``linear`` preserves the existing definition;
+                  ``row_normalized`` normalizes each token before centering.
 
     Returns:
         Scalar loss (mean of per-sample CKA losses)
     """
     tau = validate_cka_loss_tau(tau)
     eps = validate_cka_eps(eps)
+    geometry = validate_cka_loss_geometry(geometry)
 
     if x.ndim != y.ndim or x.ndim not in (2, 3):
         raise ValueError(
@@ -118,6 +141,8 @@ def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0):
         )
     if x.device != y.device:
         raise ValueError(f"CKA inputs must be on the same device, got {x.device} and {y.device}")
+    if geometry == "row_normalized" and x.ndim != 3:
+        raise ValueError("Row-normalized CKA requires rank-3 (batch, token, feature) inputs.")
     if x.shape[0] != y.shape[0]:
         raise ValueError(f"Batch size mismatch: {x.shape[0]} vs {y.shape[0]}")
     if x.shape[0] == 0:
@@ -133,6 +158,9 @@ def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0):
     with torch.autocast(device_type=x.device.type, enabled=False):
         x = x.float()
         y = y.float()
+        if geometry == "row_normalized":
+            x = normalize_cka_token_rows(x)
+            y = normalize_cka_token_rows(y)
 
         # Compute per-sample CKA.
         if x.ndim == 3:
@@ -383,6 +411,7 @@ class LlavaMetaForCausalLM(ABC):
                     projector_anchor_features.detach(),
                     projected_image_features,
                     tau=getattr(config, 'cka_loss_tau', 0.0),
+                    geometry=getattr(config, 'cka_loss_geometry', 'linear'),
                 )
             final_hidden_weight = getattr(config, "cka_loss_final_hidden_weight", None)
             if final_hidden_weight is None:
