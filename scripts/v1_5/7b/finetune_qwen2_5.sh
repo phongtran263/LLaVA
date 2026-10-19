@@ -42,6 +42,9 @@ fi
 PRETRAIN_ADAPTER="${PRETRAIN_ADAPTER:-./checkpoints/pretrain-baseline/${RUN_NAME}-1/llava-pretrain/mm_projector.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/finetune-baseline/${RUN_NAME}-1/llava-finetune}"
 OPTIONAL_TRAIN_ARGS=()
+if [[ -n "${MM_PROJECTOR_INIT_SEED:-}" ]]; then
+    OPTIONAL_TRAIN_ARGS+=(--mm_projector_init_seed "${MM_PROJECTOR_INIT_SEED}")
+fi
 if [[ -n "${STOP_AFTER_STEP_RATIO}" ]]; then
     OPTIONAL_TRAIN_ARGS+=(--stop_after_step_ratio "${STOP_AFTER_STEP_RATIO}")
 fi

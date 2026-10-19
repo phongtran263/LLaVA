@@ -28,6 +28,17 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 
 
+def validate_mm_projector_init_seed(seed):
+    """Validate an optional seed for fresh CPU projector construction only."""
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)
+                             or not 0 <= seed < 2 ** 63):
+        raise ValueError(
+            "mm_projector_init_seed must be an integer in [0, 2**63 - 1] "
+            f"or None, got {seed!r}"
+        )
+    return seed
+
+
 def validate_cka_vision_anchor(config, vision_tower):
     """Validate optional vision anchors at setup and direct forward."""
     layer = getattr(config, "cka_loss_vision_anchor_layer", None)
@@ -245,6 +256,12 @@ class LlavaMetaModel:
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
         mm_patch_merge_type = model_args.mm_patch_merge_type
+        projector_init_seed = validate_mm_projector_init_seed(
+            getattr(model_args, "mm_projector_init_seed", None))
+        if projector_init_seed is not None:
+            # Record the requested seed; existing or subsequently loaded weights
+            # take precedence and are never reset by this option.
+            self.config.mm_projector_init_seed = projector_init_seed
 
         self.config.mm_vision_tower = vision_tower
         if self.get_vision_tower() is None:
@@ -270,7 +287,15 @@ class LlavaMetaModel:
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
         if getattr(self, 'mm_projector', None) is None:
-            self.mm_projector = build_vision_projector(self.config)
+            if projector_init_seed is None:
+                self.mm_projector = build_vision_projector(self.config)
+            else:
+                # The new projector is built on CPU after backbone post_init.
+                # Seed only its CPU generator: torch.manual_seed would also
+                # reseed CUDA generators outside this CPU-only RNG fork.
+                with torch.random.fork_rng(devices=[]):
+                    torch.random.default_generator.manual_seed(projector_init_seed)
+                    self.mm_projector = build_vision_projector(self.config)
 
             if 'unpad' in mm_patch_merge_type:
                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))

@@ -56,7 +56,10 @@ from llava.model.backbones import (
     as_llava_config, backbone_type, configure_tokenizer_padding, default_conversation, get_llava_model_class,
     is_llama3, use_fast_tokenizer,
 )
-from llava.model.llava_arch import validate_cka_loss_geometry, validate_cka_loss_tau, validate_cka_vision_anchor
+from llava.model.llava_arch import (
+    validate_cka_loss_geometry, validate_cka_loss_tau, validate_cka_vision_anchor,
+    validate_mm_projector_init_seed,
+)
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
@@ -102,6 +105,10 @@ class ModelArguments:
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
+    mm_projector_init_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional nonnegative 63-bit seed used only when constructing a fresh CPU projector. Does not seed the backbone or training RNG, reinitialize an existing projector, or override pretrain_mm_mlp_adapter weights."},
+    )
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
@@ -1217,6 +1224,8 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args.mm_projector_init_seed = validate_mm_projector_init_seed(
+        getattr(model_args, "mm_projector_init_seed", None))
     model_args.cka_loss_geometry = validate_cka_loss_geometry_args(model_args, training_args)
     validate_cka_final_mlp_head_args(model_args, training_args)
     validate_protected_cka_config(model_args, data_args, training_args)

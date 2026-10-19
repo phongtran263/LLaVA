@@ -1,34 +1,47 @@
 # Ablation vị trí CKA: projector và final state
 
-## Runner mới: ba setting, hai lượt pretrain + finetune độc lập
+## Runner mới: ba setting, hai repeat với adapter chung cho hai setting CKA
 
 Dùng [train_cka_two_stage.sh](train_cka_two_stage.sh) từ repository root.
-Mặc định chạy **2 repeat × 3 setting = 6 pretrain + 6 finetune**, tuần tự theo
-`repeat → setting → pretrain → finetune`. Mỗi setting ở mỗi repeat có adapter
-Stage 1 riêng; finetune chỉ nạp adapter của chính run đó, không chia sẻ adapter.
+Mỗi repeat có hai adapter Stage 1 (`baseline`, `cka_proj`) và ba model
+finetune. Mặc định **2 repeat = 4 pretrain + 6 finetune, tổng 10 job**.
+`cka_proj_final` dùng checkpoint pretrain của **`cka_proj` trong cùng repeat**;
+không có job pretrain riêng cho `cka_proj_final`.
 
-Bảng loss này áp dụng cho **cả Stage 1 và Stage 2**:
+Bảng mapping và loss mặc định:
 
-| `SETTINGS` | Projector CKA | Final-state CKA | Decoder layers |
-| --- | ---: | ---: | --- |
-| `baseline` | 0 | 0 | tắt |
-| `cka_proj` | 0.1 | 0 | tắt |
-| `cka_proj_final` | 0.1 | 0.1 | `final` |
+| `SETTINGS` | Adapter Stage 1 | Projector CKA Stage 2 | Final CKA Stage 2 |
+| --- | --- | ---: | ---: |
+| `baseline` | `baseline`: CE-only | 0 | 0 |
+| `cka_proj` | `cka_proj`: CE + projector CKA 0.1 | 0.1 | 0 |
+| `cka_proj_final` | Cùng adapter `cka_proj` ở trên | 0.1 | 0.1 |
 
 Loss là CE cộng trực tiếp các term được bật, dùng centered linear CKA, tau 0,
 không gradient controller, token selection hay auxiliary head. Stage 1 chỉ
-train projector; final CKA vẫn backpropagate qua decoder frozen tới projector.
-Stage 2 train projector và LLM. `final` là output block cuối trước final norm.
+train projector, không dùng final CKA. Stage 2 train projector và LLM;
+`cka_proj_final` bật `CKA_LAYERS=final`, lấy output block cuối trước final norm
+và giữ gradient qua decoder tới projector. Hai setting CKA cùng repeat có
+cùng adapter initialization ở Stage 2.
 
-Mặc định dùng `lmsys/vicuna-7b-v1.5`, `mlp2x_gelu`, GPU
-`localhost:1,2`. Stage 1 microbatch **32**, accumulation **4** → global batch
-**256**; Stage 2 microbatch **8**, accumulation **8** → global batch **128**
-trên hai GPU. Cả hai stage truyền `--seed 42` cho HF Trainer; không seed riêng
-trước khởi tạo projector. `repeat-1/2` là hai lượt chạy với cùng Trainer seed
-42; projector khởi tạo độc lập, không được bảo đảm giống nhau hay tái lập hoàn
-toàn chỉ nhờ seed này.
+Mặc định dùng `Qwen/Qwen2.5-7B-Instruct`, `mlp2x_gelu`, GPU
+`localhost:2,3`. Stage 1 microbatch **32**, accumulation **4** → global batch
+**256**; Stage 2 microbatch **4**, accumulation **16** → global batch **128**
+trên hai GPU. Cả hai stage vẫn truyền `--seed 42` cho HF Trainer. Seed khởi tạo
+projector được tách riêng: `PROJECTOR_INIT_SEED_BASE=1000` mặc định, cộng với
+**chỉ số repeat thực tế**. Repeat 1 dùng **1001**, repeat 2 dùng **1002**;
+`REPEAT_START=2 REPEATS=1` vẫn dùng 1002.
 
-Xem đủ 12 lệnh mà không chạy train:
+Trong cùng repeat, hai job pretrain `baseline` và `cka_proj` dùng cùng seed
+này nên bắt đầu từ cùng trọng số MLP; các repeat khác dùng trọng số khởi tạo
+khác nhau. Hai script con nhận `MM_PROJECTOR_INIT_SEED` qua
+`--mm_projector_init_seed`, được ghi trong config. Core chỉ seed CPU khi tạo
+projector mới trong khối `torch.random.fork_rng`, rồi khôi phục RNG; không seed
+toàn bộ model trước khi load và không đổi Trainer seed 42. Stage 2 nạp adapter
+sau khi tạo projector, nên checkpoint Stage 1 quyết định trọng số bắt đầu;
+`cka_proj` và `cka_proj_final` vẫn cùng nạp adapter `cka_proj` trong repeat đó.
+Ngoài runner mới, argument này mặc định `None`, giữ hành vi cũ khi không bật.
+
+Xem đủ 10 lệnh mà không chạy train:
 
 ```bash
 DRY_RUN=1 bash scripts/v1_5/7b/train_cka_two_stage.sh
@@ -38,31 +51,79 @@ Chạy trong environment `llava1`:
 
 ```bash
 conda activate llava1
-GPU_INCLUDE=localhost:1,2 bash scripts/v1_5/7b/train_cka_two_stage.sh
+GPU_INCLUDE=localhost:2,3 bash scripts/v1_5/7b/train_cka_two_stage.sh
 ```
 
 `STAGE=all` là mặc định; `STAGE=pretrain` hoặc `STAGE=finetune` chỉ chạy stage
-tương ứng. `REPEATS` (mặc định 2) đổi số lượt chạy; `SETTINGS="baseline cka_proj"` chọn
+tương ứng. `REPEATS` (mặc định 2) là số lượt chạy, bắt đầu từ `REPEAT_START`
+(mặc định 1). `REPEAT_START=2 REPEATS=1` chỉ chọn repeat 2; `SETTINGS="baseline cka_proj"` chọn
 subset cách nhau bằng dấu cách. `CKA_WEIGHT=0.1` là weight chung cho mọi term
-được bật ở cả hai stage; override phải hữu hạn và dương. Override resource bằng
+được bật ở cả hai stage; override phải hữu hạn và dương.
+`PROJECTOR_INIT_SEED_BASE` đổi dải seed khởi tạo projector, độc lập với Trainer
+seed 42 cố định. Override resource bằng
 `PRETRAIN_PER_DEVICE_TRAIN_BATCH_SIZE`,
 `PRETRAIN_GRADIENT_ACCUMULATION_STEPS`, `PER_DEVICE_TRAIN_BATCH_SIZE` và
 `GRADIENT_ACCUMULATION_STEPS`; giữ cùng recipe giữa các setting so sánh.
 
+Trong mỗi repeat, runner tạo adapter cần thiết trước finetune phụ thuộc vào nó
+và chỉ pretrain mỗi adapter một lần, kể cả khi chọn
+`SETTINGS="cka_proj_final cka_proj"` theo thứ tự ngược:
+
+- `STAGE=pretrain SETTINGS=cka_proj_final` chỉ train `cka_proj` Stage 1 với
+  projector weight 0.1, final weight 0, layers `-1`.
+- `STAGE=all SETTINGS=cka_proj_final` train `cka_proj` Stage 1 rồi chỉ finetune
+  `cka_proj_final`; không thêm `cka_proj` finetune.
+- `STAGE=finetune SETTINGS=cka_proj_final` nạp
+  `repeat-N/cka_proj/llava-pretrain/mm_projector.bin` đã có. `baseline` vẫn nạp
+  adapter `baseline` cùng repeat.
+
+`all/pretrain` luôn yêu cầu output pretrain mới và không tự bỏ qua hoặc tái sử
+dụng pretrain đã có. Dùng `STAGE=finetune` khi muốn nạp adapter có sẵn. Mọi
+output finetune được chọn cũng phải mới.
+
 Output mặc định (có thể đổi `EXPERIMENT_ROOT`):
 
 ```text
-checkpoints/cka-two-stage/vicuna-mlp2x_gelu-lambda0.1-seed42/
-  repeat-1/{baseline,cka_proj,cka_proj_final}/
-    llava-pretrain/mm_projector.bin
-    llava-finetune/
-  repeat-2/{baseline,cka_proj,cka_proj_final}/
-    llava-pretrain/mm_projector.bin
-    llava-finetune/
+checkpoints/cka-two-stage/qwen2.5-7b-mlp2x_gelu-lambda0.1-seed42/
+  repeat-{1,2}/
+    baseline/llava-pretrain/mm_projector.bin
+    baseline/llava-finetune/
+    cka_proj/llava-pretrain/mm_projector.bin
+    cka_proj/llava-finetune/
+    cka_proj_final/llava-finetune/
 ```
 
 Stage 1 export adapter và config; Stage 2 export model cuối. Không ghi đè run
-cũ. `STAGE=finetune` yêu cầu adapter Stage 1 tương ứng đã tồn tại.
+cũ. Các thư mục `cka_proj_final/llava-pretrain` cũ được giữ nguyên và bỏ qua.
+Checkpoint finetune cũ vẫn có provenance initialization ban đầu; sửa mapping
+runner không chuyển kết quả đã train sang shared initialization.
+Checkpoint tạo trước cơ chế projector seed này không tự có matched
+initialization. Muốn so sánh với cùng khởi tạo MLP, cần train lại Stage 1 của
+`baseline` và `cka_proj` trong `EXPERIMENT_ROOT` mới, rồi finetune từ các adapter
+mới; ví dụ `EXPERIMENT_ROOT=./checkpoints/cka-two-stage/qwen2.5-7b-matched-init`.
+
+Nếu repeat 1 đã hoàn tất và repeat 2 chỉ có pretrain của baseline, chạy tiếp
+baseline finetune rồi hai setting còn lại như sau. Lệnh thứ hai chạy **3 job**:
+một `cka_proj` pretrain và hai finetune cùng dùng adapter đó.
+Ví dụ này tiếp tục kết quả cũ; adapter baseline cũ không được tạo lại theo seed
+policy mới.
+
+```bash
+REPEAT_START=2 REPEATS=1 STAGE=finetune SETTINGS=baseline \
+bash scripts/v1_5/7b/train_cka_two_stage.sh
+
+REPEAT_START=2 REPEATS=1 STAGE=all SETTINGS="cka_proj cka_proj_final" \
+bash scripts/v1_5/7b/train_cka_two_stage.sh
+```
+
+Khi Hub không phân giải được shard nhưng cache đã đầy đủ, đặt
+`MODEL_NAME_OR_PATH=/absolute/path/to/cached/snapshot` cho cả hai lệnh. Có thể
+lấy đường dẫn snapshot bằng `huggingface_hub.snapshot_download` với
+`local_files_only=True`, sau đó kiểm tra mọi shard được liệt kê trong
+`model.safetensors.index.json` đều tồn tại; chỉ sự tồn tại của thư mục snapshot
+chưa chứng minh đã tải đủ model. Không cần xóa cache hoặc tải lại các shard
+đã có. Cảnh báo Flash Attention khi model đang ở CPU lúc load sẽ được xử lý
+bởi bước `model.to(training_args.device)` hiện có sau khi load thành công.
 
 ## Runner cũ: ablation Stage 2 với shared/paired initialization
 

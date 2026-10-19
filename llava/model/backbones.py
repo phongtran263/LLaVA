@@ -46,6 +46,8 @@ def as_llava_config(config):
     values.pop("model_type", None)
     converted = model_cls.config_class.from_dict(values)
     converted.model_type = model_cls.config_class.model_type
+    # to_dict() omits the Hub commit needed for cached checkpoint shard lookup.
+    converted._commit_hash = getattr(config, "_commit_hash", None)
     return converted
 
 

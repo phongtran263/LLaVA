@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Independent end-to-end ablations: each repeat/setting trains its own adapter
-# and then finetunes from that adapter. The child launchers retain the recipe.
+# Each repeat trains a CE adapter and a projector-CKA adapter. cka_proj and
+# cka_proj_final finetune from the same projector-CKA adapter in that repeat.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/../../.."
 PRETRAIN_SCRIPT="${SCRIPT_DIR}/pretrain_qwen2_5.sh"
@@ -17,11 +17,24 @@ fresh_output() {
 require_adapter() {
     [[ -f "$1" && -s "$1" ]] || fail "Missing, empty, or non-file Stage-1 adapter: $1. Run STAGE=pretrain first."
 }
+pretrain_setting_for() {
+    if [[ "$1" == baseline ]]; then
+        printf '%s\n' baseline
+    else
+        printf '%s\n' cka_proj
+    fi
+}
+adapter_for() {
+    printf '%s/repeat-%s/%s/llava-pretrain/mm_projector.bin\n' \
+        "${EXPERIMENT_ROOT}" "$1" "$(pretrain_setting_for "$2")"
+}
 
 (( $# == 0 )) || fail "Use environment variables; CLI overrides are not accepted."
 STAGE="${STAGE:-all}"
 DRY_RUN="${DRY_RUN:-0}"
 REPEATS="${REPEATS:-2}"
+REPEAT_START="${REPEAT_START-1}"
+PROJECTOR_INIT_SEED_BASE="${PROJECTOR_INIT_SEED_BASE-1000}"
 SETTINGS="${SETTINGS-baseline cka_proj cka_proj_final}"
 CKA_WEIGHT="${CKA_WEIGHT-0.1}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-7B-Instruct}"
@@ -33,11 +46,13 @@ FINETUNE_GPU_INCLUDE="${FINETUNE_GPU_INCLUDE:-${GPU_INCLUDE:-localhost:2,3}}"
 case "${STAGE}" in all|pretrain|finetune) ;; *) fail "STAGE must be all, pretrain, or finetune." ;; esac
 [[ "${DRY_RUN}" == 0 || "${DRY_RUN}" == 1 ]] || fail "DRY_RUN must be 0 or 1."
 [[ "${REPEATS}" =~ ^[1-9][0-9]*$ ]] || fail "REPEATS must be a positive integer without leading zeroes."
+[[ "${REPEAT_START}" =~ ^[1-9][0-9]*$ ]] || fail "REPEAT_START must be a positive integer without leading zeroes."
+[[ "${PROJECTOR_INIT_SEED_BASE}" =~ ^(0|[1-9][0-9]*)$ ]] || fail "PROJECTOR_INIT_SEED_BASE must be a nonnegative integer without leading zeroes."
 [[ "${SEED-42}" == 42 && "${SEEDS-42}" == 42 && "${STAGE1_SEED-42}" == 42 ]] || \
     fail "This suite uses seed 42 in both stages and every repeat; unset other seed overrides."
 # Validate without importing the training stack; one coefficient controls every
 # active CKA term in both stages. Disabled terms remain exactly zero.
-CKA_WEIGHT="$(python3 - "${CKA_WEIGHT}" <<'PY_WEIGHT'
+CKA_WEIGHT="$(python3 - "${CKA_WEIGHT}" "${PROJECTOR_INIT_SEED_BASE}" "${REPEAT_START}" "${REPEATS}" <<'PY_WEIGHT'
 import math
 import sys
 
@@ -47,6 +62,9 @@ except ValueError:
     raise SystemExit("CKA_WEIGHT must be a finite positive number.")
 if not math.isfinite(value) or value <= 0:
     raise SystemExit("CKA_WEIGHT must be a finite positive number.")
+base, start, count = map(int, sys.argv[2:])
+if start + count > 2**63 - 1 or base + start + count - 1 > 2**63 - 1:
+    raise SystemExit("Repeat range and projector initialization seeds must fit a signed 64-bit integer.")
 print(str(value))
 PY_WEIGHT
 )"
@@ -61,21 +79,37 @@ for setting in "${settings[@]}"; do
 done
 [[ -f "${PRETRAIN_SCRIPT}" && -f "${FINETUNE_SCRIPT}" ]] || fail "Both training scripts must exist beside this launcher."
 
-# Check the complete plan before starting any long-running job. Existing
-# outputs are never silently reused or resumed; each arm owns its checkpoint.
-for (( repeat=1; repeat<=REPEATS; repeat++ )); do
+# Plan each required Stage-1 producer once, before its first consumer. This
+# also handles final-only selections and reversed CKA setting order.
+job_repeats=() job_settings=() job_stages=()
+declare -A planned_pretrains=()
+for (( repeat=REPEAT_START; repeat<REPEAT_START+REPEATS; repeat++ )); do
     for setting in "${settings[@]}"; do
-        run_dir="${EXPERIMENT_ROOT}/repeat-${repeat}/${setting}"
-        if [[ "${STAGE}" != finetune ]]; then
-            fresh_output "${run_dir}/llava-pretrain"
+        producer="$(pretrain_setting_for "${setting}")"
+        producer_key="${repeat}/${producer}"
+        if [[ "${STAGE}" != finetune && -z "${planned_pretrains[${producer_key}]:-}" ]]; then
+            job_repeats+=("${repeat}")
+            job_settings+=("${producer}")
+            job_stages+=(pretrain)
+            planned_pretrains["${producer_key}"]=1
         fi
         if [[ "${STAGE}" != pretrain ]]; then
-            fresh_output "${run_dir}/llava-finetune"
-        fi
-        if [[ "${STAGE}" == finetune && "${DRY_RUN}" == 0 ]]; then
-            require_adapter "${run_dir}/llava-pretrain/mm_projector.bin"
+            job_repeats+=("${repeat}")
+            job_settings+=("${setting}")
+            job_stages+=(finetune)
         fi
     done
+done
+# Check every planned output before starting any long-running job. Existing
+# outputs are never silently reused or resumed. Only finetune reuses adapters.
+for index in "${!job_stages[@]}"; do
+    repeat="${job_repeats[${index}]}"
+    setting="${job_settings[${index}]}"
+    job_stage="${job_stages[${index}]}"
+    fresh_output "${EXPERIMENT_ROOT}/repeat-${repeat}/${setting}/llava-${job_stage}"
+    if [[ "${STAGE}" == finetune && "${DRY_RUN}" == 0 ]]; then
+        require_adapter "$(adapter_for "${repeat}" "${setting}")"
+    fi
 done
 if [[ "${DRY_RUN}" == 0 ]]; then
     [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/deepspeed" ]] || \
@@ -110,7 +144,7 @@ COMMON_ENV=(
 )
 
 launch() {
-    local stage="$1" output="$2" adapter="$3" label="$4" child gpu batch accumulation data images logging
+    local stage="$1" output="$2" adapter="$3" label="$4" projector_init_seed="$5" child gpu batch accumulation data images logging
     if [[ "${stage}" == pretrain ]]; then
         child="${PRETRAIN_SCRIPT}"
         gpu="${PRETRAIN_GPU_INCLUDE}"
@@ -142,6 +176,7 @@ launch() {
         "WANDB_RUN_GROUP=${WANDB_RUN_GROUP:-${RUN_NAME}-cka-two-stage}" \
         "OUTPUT_DIR=${output}" \
         "PRETRAIN_ADAPTER=${adapter}" \
+        "MM_PROJECTOR_INIT_SEED=${projector_init_seed}" \
         "DATA_PATH=${data}" \
         "IMAGE_FOLDER=${images}" \
         "PER_DEVICE_TRAIN_BATCH_SIZE=${batch}" \
@@ -154,30 +189,31 @@ launch() {
         bash "${child}"
 }
 
-echo "Plan: ${REPEATS} independent repeats; settings=${SETTINGS}; stage=${STAGE}; seed=42; CKA lambda=${CKA_WEIGHT}"
-echo "Seed is set by Trainer after model/projector construction; projector initialization is not seeded."
-for (( repeat=1; repeat<=REPEATS; repeat++ )); do
-    for setting in "${settings[@]}"; do
-        enabled=True
-        projector_weight="${CKA_WEIGHT}"
-        final_weight=0.0
-        layers=-1
-        case "${setting}" in
-            baseline) enabled=False; projector_weight=0.0 ;;
-            cka_proj) ;;
-            cka_proj_final) final_weight="${CKA_WEIGHT}"; layers=final ;;
-        esac
-        run_dir="${EXPERIMENT_ROOT}/repeat-${repeat}/${setting}"
-        adapter="${run_dir}/llava-pretrain/mm_projector.bin"
-        label="${RUN_NAME}-${setting}-repeat${repeat}-seed42"
-        if [[ "${STAGE}" != finetune ]]; then
-            launch pretrain "${run_dir}/llava-pretrain" "" "${label}-pretrain"
-            if [[ "${DRY_RUN}" == 0 ]]; then
-                require_adapter "${adapter}"
-            fi
+echo "Plan: ${REPEATS} independent repeats starting at ${REPEAT_START}; settings=${SETTINGS}; stage=${STAGE}; seed=42; CKA lambda=${CKA_WEIGHT}"
+echo "Trainer seed=42; projector initialization seed=${PROJECTOR_INIT_SEED_BASE}+repeat (isolated from training RNG)."
+for index in "${!job_stages[@]}"; do
+    repeat="${job_repeats[${index}]}"
+    setting="${job_settings[${index}]}"
+    job_stage="${job_stages[${index}]}"
+    enabled=True
+    projector_weight="${CKA_WEIGHT}"
+    final_weight=0.0
+    layers=-1
+    case "${setting}" in
+        baseline) enabled=False; projector_weight=0.0 ;;
+        cka_proj) ;;
+        cka_proj_final) final_weight="${CKA_WEIGHT}"; layers=final ;;
+    esac
+    run_dir="${EXPERIMENT_ROOT}/repeat-${repeat}/${setting}"
+    adapter="$(adapter_for "${repeat}" "${setting}")"
+    label="${RUN_NAME}-${setting}-repeat${repeat}-seed42-${job_stage}"
+    projector_init_seed=$(( PROJECTOR_INIT_SEED_BASE + repeat ))
+    if [[ "${job_stage}" == pretrain ]]; then
+        launch pretrain "${run_dir}/llava-pretrain" "" "${label}" "${projector_init_seed}"
+        if [[ "${DRY_RUN}" == 0 ]]; then
+            require_adapter "${adapter}"
         fi
-        if [[ "${STAGE}" != pretrain ]]; then
-            launch finetune "${run_dir}/llava-finetune" "${adapter}" "${label}-finetune"
-        fi
-    done
+    else
+        launch finetune "${run_dir}/llava-finetune" "${adapter}" "${label}" "${projector_init_seed}"
+    fi
 done

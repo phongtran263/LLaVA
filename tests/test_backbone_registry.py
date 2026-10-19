@@ -13,6 +13,30 @@ from llava.model.backbones import (
 
 
 class BackboneRegistryTests(unittest.TestCase):
+    def test_config_conversion_preserves_checkpoint_commit(self):
+        config = transformers.Qwen2Config(hidden_size=32, num_hidden_layers=2)
+        config._name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+        config._commit_hash = "a" * 40
+        self.assertNotIn("_commit_hash", config.to_dict())
+
+        converted = as_llava_config(config)
+
+        self.assertEqual(converted._commit_hash, config._commit_hash)
+        self.assertEqual(converted.model_type, "llava_qwen")
+        self.assertEqual(converted.hidden_size, config.hidden_size)
+        self.assertEqual(converted._name_or_path, config._name_or_path)
+        self.assertEqual(config.model_type, "qwen2")
+        self.assertNotIn("_commit_hash", converted.to_dict())
+        self.assertNotIn("_commit_hash", converted.to_json_string())
+        self.assertIs(as_llava_config(converted), converted)
+
+    def test_config_conversion_without_commit_does_not_invent_one(self):
+        config = transformers.Qwen2Config.from_dict({"hidden_size": 32})
+
+        converted = as_llava_config(config)
+
+        self.assertIsNone(converted._commit_hash)
+
     def test_existing_family_dispatch(self):
         cases = [
             (transformers.LlamaConfig(vocab_size=32000), "llama", "v1"),

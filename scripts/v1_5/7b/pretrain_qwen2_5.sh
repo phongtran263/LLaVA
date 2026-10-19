@@ -36,6 +36,9 @@ fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-baseline/${RUN_NAME}-1/llava-pretrain}"
 OPTIONAL_CKA_ARGS=()
+if [[ -n "${MM_PROJECTOR_INIT_SEED:-}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--mm_projector_init_seed "${MM_PROJECTOR_INIT_SEED}")
+fi
 if [[ -n "${CKA_ANCHOR_LAYER}" ]]; then
     OPTIONAL_CKA_ARGS+=(--cka_loss_anchor_layer "${CKA_ANCHOR_LAYER}")
 fi
