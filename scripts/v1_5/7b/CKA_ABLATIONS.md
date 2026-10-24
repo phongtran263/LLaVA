@@ -1,6 +1,160 @@
 # Ablation vị trí CKA: projector và final state
 
-## Runner mới: ba setting, hai repeat với adapter chung cho hai setting CKA
+## Sweep finetune: projector CKA 0.1, bốn final-state weight
+
+Dùng [finetune_cka_final_weight_sweep.sh](finetune_cka_final_weight_sweep.sh)
+để chạy **bốn finetune tuần tự** từ cùng adapter:
+`./checkpoints/cka-proj-7b-0.1/llava-pretrain/mm_projector.bin`.
+Sweep này không chạy Stage 1 và không có repeat.
+
+| Projector CKA | Final-state CKA | Output con |
+| ---: | ---: | --- |
+| 0.1 | 0.05 | `final-0.05/llava-finetune` |
+| 0.1 | 0.1 | `final-0.1/llava-finetune` |
+| 0.1 | 0.25 | `final-0.25/llava-finetune` |
+| 0.1 | 0.5 | `final-0.5/llava-finetune` |
+
+Checkpoint nguồn là **Vicuna-7B**. Runner cố định
+`lmsys/vicuna-7b-v1.5`, projector `mlp2x_gelu`, CLIP ViT-L/14-336 layer -2,
+patch features và flat merge; không lấy backbone Qwen từ environment cũ.
+Cả bốn run dùng Trainer seed **42**, `CKA_LAYERS=final`, centered linear CKA,
+tau/start ratio 0, cùng adapter và recipe. Không bật gradient controller,
+token selection hay auxiliary head; `MM_PROJECTOR_INIT_SEED` được để trống,
+trọng số projector bắt đầu từ adapter đã có.
+
+GPU mặc định `localhost:2,3`, microbatch **4**, accumulation **16** → global
+batch **128** trên hai GPU. Mỗi run có tên
+`vicuna-7b-cka-proj0.1-finalX-seed42`, với `X` là final weight tương ứng.
+
+Xem bốn lệnh mà không train:
+
+```bash
+DRY_RUN=1 bash scripts/v1_5/7b/finetune_cka_final_weight_sweep.sh
+```
+
+Chạy trong environment `llava1`:
+
+```bash
+conda run --no-capture-output -n llava1 env GPU_INCLUDE=localhost:2,3 \
+bash scripts/v1_5/7b/finetune_cka_final_weight_sweep.sh
+```
+
+`FINAL_CKA_WEIGHTS="0.05 0.1 0.25 0.5"` là danh sách mặc định; các giá trị phải
+hữu hạn, dương và được kiểm tra trùng sau chuẩn hoá. Projector weight luôn
+**0.1**. `PRETRAIN_CHECKPOINT_DIR` có thể trỏ tới thư mục pretrain khác có
+`config.json` và `mm_projector.bin` tương thích Vicuna với cùng projector và
+vision recipe. Runner kiểm tra config/adapter nguồn và tất cả output trước
+khi chạy; không ghi đè hay tự resume output cũ và không nhận CLI passthrough.
+
+Output mặc định nằm dưới
+`./checkpoints/cka-final-weight-sweep/vicuna-7b-proj0.1-seed42/`, gồm bốn thư
+mục con trong bảng. Đổi `EXPERIMENT_ROOT` để lưu một sweep mới;
+`PER_DEVICE_TRAIN_BATCH_SIZE` và `GRADIENT_ACCUMULATION_STEPS` đổi resource
+đồng nhất cho các run.
+
+## Qwen2.5-3B baseline: ba repeat, Trainer seed 42, projector khởi tạo tự do
+
+Dùng [train_qwen2_5_3b_baseline.sh](train_qwen2_5_3b_baseline.sh).
+Wrapper cố định `Qwen/Qwen2.5-3B-Instruct`, `RUN_NAME=qwen2.5-3b`,
+`mlp2x_gelu`, `SETTINGS=baseline` và `PROJECTOR_INIT_SEED_MODE=random`;
+recipe và mapping adapter được điều phối bởi runner chung bên dưới.
+
+Chỉ chạy baseline CE-only ở cả hai stage, mặc định **3 repeat**: tổng
+**3 pretrain + 3 finetune = 6 job**, chạy tuần tự. CKA tắt, cả hai weight bằng
+0 và layers `-1`; không bật anchor hay gradient controller từ environment cũ.
+Mỗi repeat train adapter baseline riêng rồi finetune từ chính adapter đó.
+
+Cả hai stage ở mọi repeat dùng **`TrainingArguments.seed=42`**. Wrapper xóa
+`MM_PROJECTOR_INIT_SEED`, không truyền `--mm_projector_init_seed` và không đặt
+global seed trước khi tạo model/projector. Projector dùng nhánh mặc định
+`None`, với khởi tạo tự do ở mỗi repeat.
+Ba repeat vẫn cùng Trainer seed 42, không phải ba training seed khác nhau.
+
+GPU mặc định `localhost:2,3`. Stage 1 microbatch **32**, accumulation **4**
+cho global batch **256**; Stage 2 microbatch **4**, accumulation **16** cho
+global batch **128** trên hai GPU.
+
+```bash
+DRY_RUN=1 bash scripts/v1_5/7b/train_qwen2_5_3b_baseline.sh
+```
+
+```bash
+conda run --no-capture-output -n llava1 env GPU_INCLUDE=localhost:2,3 \
+bash scripts/v1_5/7b/train_qwen2_5_3b_baseline.sh
+```
+
+`STAGE`, `REPEATS`, `REPEAT_START` và các override GPU/resource được truyền
+tới runner chung. `SETTINGS` luôn cố định là `baseline`.
+Output mặc định nằm dưới
+`./checkpoints/baseline-two-stage/qwen2.5-3b-mlp2x_gelu-random-projector-seed42/`:
+
+```text
+repeat-{1,2,3}/baseline/
+  llava-pretrain/mm_projector.bin
+  llava-finetune/
+```
+
+Đổi `EXPERIMENT_ROOT` để lưu một nhóm mới; runner giữ kiểm tra output mới,
+không ghi đè hoặc tự resume kết quả đã có.
+
+## Qwen2.5-3B CKA: ba repeat, projector CKA và projector + final CKA
+
+Dùng [train_qwen2_5_3b_cka_ablations.sh](train_qwen2_5_3b_cka_ablations.sh).
+Wrapper cố định `Qwen/Qwen2.5-3B-Instruct`, `RUN_NAME=qwen2.5-3b`,
+`mlp2x_gelu`, `SETTINGS="cka_proj cka_proj_final"` và `CKA_WEIGHT=0.1`.
+Chỉ chạy hai setting CKA, không thêm baseline.
+
+Mặc định **3 repeat = 3 pretrain + 6 finetune, tổng 9 job**, tuần tự theo
+`repeat → cka_proj pretrain → cka_proj finetune → cka_proj_final finetune`.
+Trong mỗi repeat, hai finetune nạp **cùng adapter `cka_proj` Stage 1**.
+Không có pretrain riêng cho `cka_proj_final`.
+
+| Job trong mỗi repeat | Projector CKA | Final CKA | Decoder layers |
+| --- | ---: | ---: | --- |
+| `cka_proj` pretrain | 0.1 | 0 | `-1` |
+| `cka_proj` finetune | 0.1 | 0 | `-1` |
+| `cka_proj_final` finetune | 0.1 | 0.1 | `final` |
+
+Cả hai stage ở mọi repeat dùng **Trainer seed 42**. Projector khởi tạo tự do:
+wrapper cố định `PROJECTOR_INIT_SEED_MODE=random`, xóa
+`MM_PROJECTOR_INIT_SEED` và không truyền `--mm_projector_init_seed`; không đặt
+global seed trước khi tạo model/projector. Các repeat dùng nhánh khởi tạo
+projector mặc định `None`, còn hai finetune trong cùng repeat dùng checkpoint
+pretrain chung. Đây là ba lượt chạy với cùng Trainer seed, không đổi thành ba
+training seed khác nhau. CKA dùng centered linear geometry, tau/start ratio
+0; không bật anchor override, token selection, gradient controller hay
+auxiliary head.
+
+GPU mặc định `localhost:2,3`. Stage 1 microbatch **32**, accumulation **4** →
+global batch **256**; Stage 2 microbatch **4**, accumulation **16** → global
+batch **128** trên hai GPU.
+
+```bash
+DRY_RUN=1 bash scripts/v1_5/7b/train_qwen2_5_3b_cka_ablations.sh
+```
+
+```bash
+conda run --no-capture-output -n llava1 env GPU_INCLUDE=localhost:2,3 \
+bash scripts/v1_5/7b/train_qwen2_5_3b_cka_ablations.sh
+```
+
+`STAGE`, `REPEATS`, `REPEAT_START` và các override GPU/resource vẫn dùng được;
+hai setting và CKA weight được cố định như trên. `STAGE=pretrain` chỉ chạy
+`cka_proj` pretrain của các repeat đã chọn; `STAGE=finetune` yêu cầu adapter
+của từng repeat đã có.
+Output mặc định (đổi bằng `EXPERIMENT_ROOT`):
+
+```text
+checkpoints/cka-two-stage/qwen2.5-3b-mlp2x_gelu-random-projector-cka-seed42/
+  repeat-{1,2,3}/
+    cka_proj/llava-pretrain/mm_projector.bin
+    cka_proj/llava-finetune/
+    cka_proj_final/llava-finetune/
+```
+
+Runner kiểm tra output mới trước khi chạy, không ghi đè hoặc tự resume run cũ.
+
+## Runner chung: ba setting, hai repeat với adapter chung cho hai setting CKA
 
 Dùng [train_cka_two_stage.sh](train_cka_two_stage.sh) từ repository root.
 Mỗi repeat có hai adapter Stage 1 (`baseline`, `cka_proj`) và ba model
@@ -26,8 +180,9 @@ cùng adapter initialization ở Stage 2.
 Mặc định dùng `Qwen/Qwen2.5-7B-Instruct`, `mlp2x_gelu`, GPU
 `localhost:2,3`. Stage 1 microbatch **32**, accumulation **4** → global batch
 **256**; Stage 2 microbatch **4**, accumulation **16** → global batch **128**
-trên hai GPU. Cả hai stage vẫn truyền `--seed 42` cho HF Trainer. Seed khởi tạo
-projector được tách riêng: `PROJECTOR_INIT_SEED_BASE=1000` mặc định, cộng với
+trên hai GPU. Cả hai stage vẫn truyền `--seed 42` cho HF Trainer. Mặc định
+`PROJECTOR_INIT_SEED_MODE=seeded`: seed khởi tạo projector được tách riêng,
+`PROJECTOR_INIT_SEED_BASE=1000` mặc định, cộng với
 **chỉ số repeat thực tế**. Repeat 1 dùng **1001**, repeat 2 dùng **1002**;
 `REPEAT_START=2 REPEATS=1` vẫn dùng 1002.
 
@@ -39,7 +194,13 @@ projector mới trong khối `torch.random.fork_rng`, rồi khôi phục RNG; kh
 toàn bộ model trước khi load và không đổi Trainer seed 42. Stage 2 nạp adapter
 sau khi tạo projector, nên checkpoint Stage 1 quyết định trọng số bắt đầu;
 `cka_proj` và `cka_proj_final` vẫn cùng nạp adapter `cka_proj` trong repeat đó.
-Ngoài runner mới, argument này mặc định `None`, giữ hành vi cũ khi không bật.
+Argument core này mặc định `None`, giữ hành vi cũ khi không bật.
+
+Runner chung cũng nhận `PROJECTOR_INIT_SEED_MODE=random`: bỏ qua hoàn toàn
+`PROJECTOR_INIT_SEED_BASE`, xóa `MM_PROJECTOR_INIT_SEED` và không truyền CLI
+seed projector ở cả hai stage. Chế độ này không bảo đảm cùng khởi tạo MLP giữa
+baseline và `cka_proj`; Trainer seed vẫn là 42. Wrapper Qwen3B ở trên luôn
+chọn chế độ `random`; mặc định `seeded` của runner chung không đổi.
 
 Xem đủ 10 lệnh mà không chạy train:
 

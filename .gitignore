@@ -52,6 +52,9 @@ scripts
 !/scripts/v1_5/7b/finetune_qwen2_5_3b_protected_pipeline_pair.sh
 !/scripts/v1_5/7b/train_cka_ablations.sh
 !/scripts/v1_5/7b/train_cka_two_stage.sh
+!/scripts/v1_5/7b/train_qwen2_5_3b_baseline.sh
+!/scripts/v1_5/7b/train_qwen2_5_3b_cka_ablations.sh
+!/scripts/v1_5/7b/finetune_cka_final_weight_sweep.sh
 !/scripts/v1_5/7b/CKA_ABLATIONS.md
 !/scripts/v1_5/7b/pretrain_qwen2_5.sh
 !/scripts/v1_5/7b/finetune_qwen2_5.sh

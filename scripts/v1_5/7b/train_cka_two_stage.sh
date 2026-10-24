@@ -35,6 +35,7 @@ DRY_RUN="${DRY_RUN:-0}"
 REPEATS="${REPEATS:-2}"
 REPEAT_START="${REPEAT_START-1}"
 PROJECTOR_INIT_SEED_BASE="${PROJECTOR_INIT_SEED_BASE-1000}"
+PROJECTOR_INIT_SEED_MODE="${PROJECTOR_INIT_SEED_MODE-seeded}"
 SETTINGS="${SETTINGS-baseline cka_proj cka_proj_final}"
 CKA_WEIGHT="${CKA_WEIGHT-0.1}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-7B-Instruct}"
@@ -47,12 +48,15 @@ case "${STAGE}" in all|pretrain|finetune) ;; *) fail "STAGE must be all, pretrai
 [[ "${DRY_RUN}" == 0 || "${DRY_RUN}" == 1 ]] || fail "DRY_RUN must be 0 or 1."
 [[ "${REPEATS}" =~ ^[1-9][0-9]*$ ]] || fail "REPEATS must be a positive integer without leading zeroes."
 [[ "${REPEAT_START}" =~ ^[1-9][0-9]*$ ]] || fail "REPEAT_START must be a positive integer without leading zeroes."
-[[ "${PROJECTOR_INIT_SEED_BASE}" =~ ^(0|[1-9][0-9]*)$ ]] || fail "PROJECTOR_INIT_SEED_BASE must be a nonnegative integer without leading zeroes."
+case "${PROJECTOR_INIT_SEED_MODE}" in seeded|random) ;; *) fail "PROJECTOR_INIT_SEED_MODE must be seeded or random." ;; esac
+if [[ "${PROJECTOR_INIT_SEED_MODE}" == seeded ]]; then
+    [[ "${PROJECTOR_INIT_SEED_BASE}" =~ ^(0|[1-9][0-9]*)$ ]] || fail "PROJECTOR_INIT_SEED_BASE must be a nonnegative integer without leading zeroes."
+fi
 [[ "${SEED-42}" == 42 && "${SEEDS-42}" == 42 && "${STAGE1_SEED-42}" == 42 ]] || \
     fail "This suite uses seed 42 in both stages and every repeat; unset other seed overrides."
 # Validate without importing the training stack; one coefficient controls every
 # active CKA term in both stages. Disabled terms remain exactly zero.
-CKA_WEIGHT="$(python3 - "${CKA_WEIGHT}" "${PROJECTOR_INIT_SEED_BASE}" "${REPEAT_START}" "${REPEATS}" <<'PY_WEIGHT'
+CKA_WEIGHT="$(python3 - "${CKA_WEIGHT}" "${PROJECTOR_INIT_SEED_BASE}" "${REPEAT_START}" "${REPEATS}" "${PROJECTOR_INIT_SEED_MODE}" <<'PY_WEIGHT'
 import math
 import sys
 
@@ -62,8 +66,10 @@ except ValueError:
     raise SystemExit("CKA_WEIGHT must be a finite positive number.")
 if not math.isfinite(value) or value <= 0:
     raise SystemExit("CKA_WEIGHT must be a finite positive number.")
-base, start, count = map(int, sys.argv[2:])
-if start + count > 2**63 - 1 or base + start + count - 1 > 2**63 - 1:
+start, count = map(int, sys.argv[3:5])
+if start + count > 2**63 - 1:
+    raise SystemExit("Repeat range must fit a signed 64-bit integer.")
+if sys.argv[5] == "seeded" and int(sys.argv[2]) + start + count - 1 > 2**63 - 1:
     raise SystemExit("Repeat range and projector initialization seeds must fit a signed 64-bit integer.")
 print(str(value))
 PY_WEIGHT
@@ -156,8 +162,8 @@ launch() {
     else
         child="${FINETUNE_SCRIPT}"
         gpu="${FINETUNE_GPU_INCLUDE}"
-        batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
-        accumulation="${GRADIENT_ACCUMULATION_STEPS:-16}"
+        batch="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
+        accumulation="${GRADIENT_ACCUMULATION_STEPS:-8}"
         data="${FINETUNE_DATA_PATH:-./playground/data/llava_v1_5_mix665k.json}"
         images="${FINETUNE_IMAGE_FOLDER:-./playground/data}"
         logging=10
@@ -189,8 +195,17 @@ launch() {
         bash "${child}"
 }
 
-echo "Plan: ${REPEATS} independent repeats starting at ${REPEAT_START}; settings=${SETTINGS}; stage=${STAGE}; seed=42; CKA lambda=${CKA_WEIGHT}"
-echo "Trainer seed=42; projector initialization seed=${PROJECTOR_INIT_SEED_BASE}+repeat (isolated from training RNG)."
+if [[ "${#settings[@]}" == 1 && "${settings[0]}" == baseline ]]; then
+    objective="CE-only baseline"
+else
+    objective="CKA lambda=${CKA_WEIGHT} for enabled terms"
+fi
+echo "Plan: ${REPEATS} independent repeats starting at ${REPEAT_START}; settings=${SETTINGS}; stage=${STAGE}; seed=42; ${objective}"
+if [[ "${PROJECTOR_INIT_SEED_MODE}" == seeded ]]; then
+    echo "Trainer seed=42; projector initialization seed=${PROJECTOR_INIT_SEED_BASE}+repeat (isolated from training RNG)."
+else
+    echo "Trainer seed=42; projector initialization uses ambient RNG with no explicit seed."
+fi
 for index in "${!job_stages[@]}"; do
     repeat="${job_repeats[${index}]}"
     setting="${job_settings[${index}]}"
@@ -207,7 +222,10 @@ for index in "${!job_stages[@]}"; do
     run_dir="${EXPERIMENT_ROOT}/repeat-${repeat}/${setting}"
     adapter="$(adapter_for "${repeat}" "${setting}")"
     label="${RUN_NAME}-${setting}-repeat${repeat}-seed42-${job_stage}"
-    projector_init_seed=$(( PROJECTOR_INIT_SEED_BASE + repeat ))
+    projector_init_seed=""
+    if [[ "${PROJECTOR_INIT_SEED_MODE}" == seeded ]]; then
+        projector_init_seed=$(( PROJECTOR_INIT_SEED_BASE + repeat ))
+    fi
     if [[ "${job_stage}" == pretrain ]]; then
         launch pretrain "${run_dir}/llava-pretrain" "" "${label}" "${projector_init_seed}"
         if [[ "${DRY_RUN}" == 0 ]]; then

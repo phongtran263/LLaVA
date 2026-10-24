@@ -20,7 +20,7 @@ class CkaTwoStageScriptTests(unittest.TestCase):
         # DeepSpeed without inheriting or rerunning the older placement tests.
         launch_fixtures.CkaLocationAblationScriptTests.setUp(self)
         for key in ("INIT_MODE", "SETTINGS", "REPEATS", "REPEAT_START", "CKA_WEIGHT",
-                    "PROJECTOR_INIT_SEED_BASE", "MM_PROJECTOR_INIT_SEED"):
+                    "PROJECTOR_INIT_SEED_BASE", "MM_PROJECTOR_INIT_SEED", "PROJECTOR_INIT_SEED_MODE"):
             self.env.pop(key, None)
 
     commands = staticmethod(launch_fixtures.CkaLocationAblationScriptTests.commands)
@@ -116,6 +116,37 @@ class CkaTwoStageScriptTests(unittest.TestCase):
                 command, = self.commands(result.stdout)
                 self.assertNotIn("--mm_projector_init_seed", self.flags(command))
         self.assertFalse(self.log.exists())
+
+    def test_random_projector_mode_ignores_seed_base_but_keeps_training_seed_fixed(self):
+        for base in ("not-a-seed", "", "-1", str(2**80)):
+            with self.subTest(base=base):
+                result = self.run_script(PROJECTOR_INIT_SEED_MODE="random", PROJECTOR_INIT_SEED_BASE=base,
+                                         MM_PROJECTOR_INIT_SEED="1234")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = self.commands(result.stdout)
+                self.assertEqual(len(commands), 10)
+                for command, (repeat, setting, stage) in zip(commands, self.jobs()):
+                    flags = self.flags(command)
+                    self.assertEqual(flags["--seed"], "42")
+                    self.assertNotIn("--mm_projector_init_seed", flags)
+                    self.assert_objective(flags, setting)
+                    self.assertEqual(flags["--output_dir"], str(self.output_for(repeat, setting, stage)))
+                    if stage == "finetune":
+                        producer = "baseline" if setting == "baseline" else "cka_proj"
+                        self.assertEqual(flags["--pretrain_mm_mlp_adapter"],
+                                         str(self.output_for(repeat, producer, "pretrain") / "mm_projector.bin"))
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.log.exists())
+
+    def test_random_projector_mode_still_validates_repeat_ranges_and_mode(self):
+        for values in ({"REPEAT_START": "0"}, {"REPEATS": "0"}, {"REPEAT_START": "01"},
+                       {"REPEAT_START": str(2**63 - 1)}, {"REPEATS": str(2**63)}):
+            with self.subTest(values=values):
+                result = self.run_script(PROJECTOR_INIT_SEED_MODE="random", **values)
+                self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(self.run_script(PROJECTOR_INIT_SEED_MODE="unknown").returncode, 0)
+        self.assertFalse(self.log.exists())
+        self.assertFalse(self.output.exists())
 
     def test_actual_children_share_four_generated_adapters_within_their_own_repeat(self):
         result = self.run_script(DRY_RUN=0)
