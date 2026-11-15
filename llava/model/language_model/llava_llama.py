@@ -29,6 +29,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from llava.constants import IGNORE_INDEX
+from ..predictive_regularization import compute_predictive_regularization_loss, validate_pre_config
 from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
@@ -841,6 +842,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
+        pre_enabled = self.get_model().training and getattr(self.config, 'pre_loss', False)
+        if pre_enabled:
+            validate_pre_config(self.config)
+        self.last_pre_loss = None
+        self.last_pre_text_loss = None
+        self.last_pre_num_patches = None
         vision_feature_mask = None
         subset_vision_feature_mask = None
         pre_post_cka_loss = None
@@ -856,7 +863,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.last_cka_projector_output = None
 
         if inputs_embeds is None:
-            if cka_enabled:
+            if cka_enabled or pre_enabled:
                 # CKA-enabled multimodal prep also returns the image-token mask and
                 # projector CKA metadata aligned to the final input sequence.
                 (
@@ -976,6 +983,22 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     with_kwargs=True,
                 )
 
+        pre_hidden = None
+        pre_hook_handle = None
+        if pre_enabled and labels is not None:
+            if self.get_model().gradient_checkpointing and torch.is_grad_enabled():
+                checkpoint_fn = getattr(self.get_model(), '_gradient_checkpointing_func', None)
+                if getattr(checkpoint_fn, 'keywords', {}).get('use_reentrant', True):
+                    raise ValueError("PRe requires gradient_checkpointing_kwargs={'use_reentrant': False}.")
+
+            def capture_pre_hidden(_module, _inputs, block_output):
+                nonlocal pre_hidden
+                pre_hidden = block_output[0] if isinstance(block_output, (tuple, list)) else block_output
+
+            pre_hook_handle = self.get_model().layers[self.config.pre_loss_layer - 1].register_forward_hook(
+                capture_pre_hidden
+            )
+
         forward_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -986,7 +1009,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=should_output_attentions,
             output_hidden_states=should_output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True if pre_enabled else return_dict,
         )
         if cache_position is not None and _LLAMA_FORWARD_SUPPORTS_CACHE_POSITION:
             forward_kwargs["cache_position"] = cache_position
@@ -994,12 +1017,34 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         try:
             output = super().forward(**forward_kwargs)
         finally:
+            if pre_hook_handle is not None:
+                pre_hook_handle.remove()
             if norm_pre_hook_handle is not None:
                 norm_pre_hook_handle.remove()
             if attention_subset_hook_handle is not None:
                 attention_subset_hook_handle.remove()
             for hook_handle in cka_layer_hook_handles:
                 hook_handle.remove()
+
+        if pre_enabled and output.loss is not None:
+            if pre_hidden is None:
+                raise RuntimeError("Missing PRe decoder-block activation.")
+            if vision_feature_mask is None:
+                # Pure text batches have no visual anchors. Retain a zero
+                # predictor graph so ZeRO/DDP sees the same parameter set.
+                vision_feature_mask = torch.zeros(pre_hidden.shape[:2], device=pre_hidden.device, dtype=torch.bool)
+                pre_anchor = pre_hidden.detach()
+            else:
+                pre_anchor = inputs_embeds.detach()
+            pre_loss = compute_predictive_regularization_loss(
+                self.get_model().pre_predictor, pre_hidden, pre_anchor, vision_feature_mask,
+            )
+            self.last_pre_text_loss = output.loss.detach()
+            self.last_pre_loss = pre_loss.detach()
+            self.last_pre_num_patches = vision_feature_mask.sum().detach()
+            output.loss = output.loss + float(self.config.pre_loss_weight) * pre_loss
+        if pre_enabled and not (return_dict if return_dict is not None else self.config.use_return_dict):
+            return output.to_tuple()
 
         if (
             llm_cka_enabled

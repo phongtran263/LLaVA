@@ -1,0 +1,56 @@
+% Include after the paper's existing \appendix command.
+% Required packages: booktabs, tabularx, array, amsmath.
+% Assumes both files remain in docs/ relative to the main LaTeX source.
+\section{Training and Implementation Details}
+\label{app:training_details}
+
+Table~\ref{tab:training_configuration} summarizes the two-stage configuration
+for Baseline, VSP-Proj, and VSP. Baseline uses only the autoregressive
+language-modeling objective. VSP-Proj adds projector-level alignment in both
+stages, whereas VSP additionally aligns the final decoder-block image-token
+states during instruction tuning. Both structural objectives use the same
+frozen visual reference supplied to the projector, extracted from the current
+preprocessed image. There is no direct CKA supervision at intermediate decoder
+blocks.
+
+\input{docs/training_configuration_vsp}
+
+\paragraph{CKA implementation.}
+Corresponding visual-token rows are selected before centering. Each feature
+channel is centered over the selected tokens of that image; images are never
+pooled into a shared Gram matrix. The centered feature matrices are
+Frobenius-normalized before forming their token--token Gram matrices, with no
+per-token L2 normalization. Both diagonal and off-diagonal entries are retained.
+Gram products and reductions are evaluated in FP32 with autocast disabled;
+the TF32 setting remains enabled for eligible matrix multiplications.
+For Gram matrices $K_X$ and $K_Y$, numerical stabilization uses
+\begin{equation}
+    d=\sqrt{\max\!\left(
+        \lVert K_X\rVert_F^2\lVert K_Y\rVert_F^2,\,10^{-8}
+    \right)}.
+\end{equation}
+The normalized inner product is clamped to $[0,1]$, and the per-image loss is
+$1-\operatorname{CKA}$, without a nonzero tolerance margin. Feature normalization
+floors its denominator at the smallest positive normal FP32 value. A zero Gram
+matrix therefore produces CKA $=0$, not an excluded sample; the implementation
+does not explicitly filter non-finite samples.
+
+\paragraph{Token masks and reduction.}
+Projector alignment uses all encoder patch features. Final-state alignment uses
+the corresponding image-token positions retained after sequence truncation;
+samples with fewer than two such positions do not contribute. The final-state
+loss is the arithmetic mean over eligible samples in each micro-batch, and is
+zero when there are none. Image-preprocessing padding is included in training
+CKA, unlike the valid-region masks used in the diagnostic analyses.
+The instruction-tuning data contain 40,688 text-only samples. These retain
+language-modeling supervision and are excluded from final-state CKA. In the
+current implementation, their dummy-image tensors still pass through the vision
+encoder and contribute to projector CKA; the two CKA terms therefore do not use
+identical sample populations in mixed batches.
+
+\paragraph{Gradient paths.}
+The visual reference $V$ is detached. Projector outputs $Z$ and final-block
+outputs $H_{\mathrm{img}}^{(L)}$ remain differentiable. Thus,
+$\mathcal L_{\mathrm{proj}}$ updates the projector, while
+$\mathcal L_{\mathrm{final}}$ can update both the decoder and the projector.
+No additional feature-matching module is introduced.

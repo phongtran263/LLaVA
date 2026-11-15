@@ -120,6 +120,9 @@ class ModelArguments:
     guided_text_select_layer: Optional[int] = field(default=None)
     mtd_topk: Optional[int] = field(default=None)
     cka_loss: bool = field(default=False)
+    pre_loss: bool = field(default=False, metadata={"help": "Stage-2-only patch-level Predictive Regularization (arXiv:2603.20808), independent of CKA."})
+    pre_loss_layer: int = field(default=16, metadata={"help": "1-based decoder block whose visual tokens predict the detached post-projector anchor."})
+    pre_loss_weight: float = field(default=0.5)
     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
     vsp_asymmetric_pcgrad: bool = field(default=False, metadata={"help": "Protect the LM gradient and project only conflicting weighted VSP/CKA auxiliary gradients."})
@@ -1224,6 +1227,21 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.pre_loss:
+        incompatible = (
+            model_args.cka_loss or model_args.use_pcgrad
+            or model_args.vsp_gradient_diagnostics or model_args.vsp_asymmetric_pcgrad
+            or model_args.vsp_norm_cap or model_args.freeze_backbone
+            or model_args.tune_mm_mlp_adapter or training_args.freeze_mm_mlp_adapter
+            or training_args.lora_enable or training_args.bits != 16
+            or getattr(training_args, "protected_cka_refinement", False)
+            or getattr(training_args, "protected_stage2", False)
+        )
+        if incompatible or model_args.vision_tower is None:
+            raise ValueError("PRe requires stage-2 full finetuning with a vision tower, trainable LLM/projector, 16-bit weights, and CKA/PCGrad/LoRA/Protected modes disabled.")
+        # Trainer seeds after model construction. Seed this new predictor before
+        # from_pretrained initializes its missing weights as well.
+        transformers.set_seed(training_args.seed)
     model_args.mm_projector_init_seed = validate_mm_projector_init_seed(
         getattr(model_args, "mm_projector_init_seed", None))
     model_args.cka_loss_geometry = validate_cka_loss_geometry_args(model_args, training_args)
@@ -1265,7 +1283,7 @@ def train(attn_implementation=None):
     validate_vsp_gradient_config(model_args)
     if vsp_gradient_requested and not model_args.cka_loss:
         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
-    if (vsp_gradient_requested or model_args.cka_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
+    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
             raise ValueError(
                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
@@ -1273,7 +1291,7 @@ def train(attn_implementation=None):
             )
         checkpointing_kwargs = dict(training_args.gradient_checkpointing_kwargs or {})
         if checkpointing_kwargs.get("use_reentrant", True):
-            rank0_print("CKA/VSP: setting gradient checkpointing to use_reentrant=False.")
+            rank0_print("Auxiliary loss: setting gradient checkpointing to use_reentrant=False.")
         checkpointing_kwargs["use_reentrant"] = False
         training_args.gradient_checkpointing_kwargs = checkpointing_kwargs
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
@@ -1284,6 +1302,8 @@ def train(attn_implementation=None):
         force_download=model_args.force_download,
     )
     family = backbone_type(backbone_config)
+    if model_args.pre_loss and family != "llama":
+        raise ValueError("PRe reproduction currently supports the LLaVA-1.5 LLaMA/Vicuna backbone only.")
     validate_cka_final_mlp_head_args(model_args, training_args, family=family)
     is_llama3_model = is_llama3(backbone_config)
     if model_args.version == "auto":
@@ -1320,6 +1340,11 @@ def train(attn_implementation=None):
         # Construct the optional head before loading its checkpoint weights.
         # Explicitly disabling it keeps the legacy model architecture unchanged.
         set_cka_final_mlp_head_config(config, model_args.cka_loss_final_mlp_head)
+        if model_args.pre_loss or hasattr(config, "pre_loss"):
+            config.pre_loss = model_args.pre_loss
+            config.pre_loss_layer = model_args.pre_loss_layer
+            config.pre_loss_weight = model_args.pre_loss_weight
+            config.cka_loss = model_args.cka_loss
         if family == "mpt":
             config.attn_config["attn_impl"] = training_args.mpt_attn_impl
         else:
@@ -1639,6 +1664,11 @@ def train(attn_implementation=None):
         if cka_final_mlp_head is not None:
             cka_final_mlp_head.requires_grad_(model_args.cka_loss_final_mlp_head)
             cka_final_mlp_head.to(dtype=compute_dtype, device=training_args.device)
+
+        pre_predictor = model.get_model().initialize_pre_predictor()
+        if pre_predictor is not None:
+            pre_predictor.requires_grad_(True)
+            pre_predictor.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr

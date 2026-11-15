@@ -34,6 +34,22 @@ VSP_STATE_NAME = "vsp_gradient_state.json"
 CKA_FINAL_MLP_HEAD_NAME = "cka_final_mlp_head.bin"
 
 
+def backward_pre_deepspeed_loss(accelerator, loss, gradient_accumulation_steps):
+    """Normalize the complete PRe objective once, bypassing output GAS hooks.
+
+    DeepSpeed 0.18.9 registers GAS division hooks on every returned tensor.
+    CausalLMOutput exposes both loss and logits, so automatic scaling can divide
+    the CE path twice while dividing the PRe path once. Explicit loss scaling
+    with scale_wrt_gas=False avoids that asymmetry and also works with older
+    DeepSpeed versions that normalized loss directly in engine.backward().
+    """
+    if (isinstance(gradient_accumulation_steps, bool)
+            or not isinstance(gradient_accumulation_steps, int)
+            or gradient_accumulation_steps < 1):
+        raise ValueError("PRe gradient_accumulation_steps must be a positive integer.")
+    accelerator.backward(loss / gradient_accumulation_steps, scale_wrt_gas=False)
+
+
 def validate_cka_loss_start_ratio(value):
     """Return a finite CKA start ratio in the closed interval [0, 1]."""
     try:
@@ -1597,7 +1613,12 @@ class LLaVATrainer(Trainer):
                         engine = self._get_deepspeed_engine(model)
                         if engine is not None:
                             engine.set_gradient_accumulation_boundary(bool(self.accelerator.sync_gradients))
-                    self.accelerator.backward(backward_loss)
+                    if self.is_deepspeed_enabled and getattr(self.model.config, 'pre_loss', False):
+                        backward_pre_deepspeed_loss(
+                            self.accelerator, backward_loss, self.args.gradient_accumulation_steps,
+                        )
+                    else:
+                        self.accelerator.backward(backward_loss)
         finally:
             self._clear_gradient_log_tensors(model)
 
@@ -1639,6 +1660,27 @@ class LLaVATrainer(Trainer):
             # scalar objective. Their placeholder last_* values are not metrics.
             return super().log(logs, *args, **kwargs)
         model = self.model.module if hasattr(self.model, 'module') else self.model
+
+        if getattr(getattr(model, 'config', None), 'pre_loss', False) and torch.cuda.is_available():
+            parameter = next(model.parameters(), None)
+            if parameter is not None and parameter.device.type == 'cuda':
+                memory = torch.cuda.memory_stats(parameter.device)
+                for key, metric in (
+                    ('allocated_bytes.all.current', 'gpu/allocated_gib'),
+                    ('reserved_bytes.all.current', 'gpu/reserved_gib'),
+                    ('allocated_bytes.all.peak', 'gpu/peak_allocated_gib'),
+                    ('inactive_split_bytes.all.current', 'gpu/inactive_split_gib'),
+                ):
+                    logs[metric] = memory.get(key, 0) / 2**30
+
+        for attribute, metric in (
+            ('last_pre_loss', 'loss/pre_loss'),
+            ('last_pre_text_loss', 'loss/pre_text_loss'),
+            ('last_pre_num_patches', 'pre/num_patches'),
+        ):
+            value = getattr(model, attribute, None)
+            if value is not None:
+                logs[metric] = value.item() if torch.is_tensor(value) else float(value)
 
         if hasattr(self, '_last_cka_schedule_active'):
             logs['cka/schedule_active'] = float(self._last_cka_schedule_active)

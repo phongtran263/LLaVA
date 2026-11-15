@@ -1,5 +1,44 @@
 # Ablation vị trí CKA: projector và final state
 
+## Qwen2.5-7B trên một B200: ba repeat baseline / projector / projector + final
+
+Dùng [train_qwen2_5_7b_cka_ablations.sh](train_qwen2_5_7b_cka_ablations.sh).
+Mặc định GPU `localhost:3`, model `Qwen/Qwen2.5-7B-Instruct`, projector
+`mlp2x_gelu`, Trainer seed **42** cho mọi job. Không đặt seed trước khi tạo
+projector: wrapper chọn `PROJECTOR_INIT_SEED_MODE=random` và bỏ
+`--mm_projector_init_seed`, kể cả khi biến seed đó có trong environment cũ.
+Vì vậy baseline và CKA **không được bảo đảm cùng trọng số projector ban đầu**;
+đây là ba repeat khởi tạo tự do, không phải ba Trainer seed khác nhau.
+
+Mỗi repeat chạy tuần tự:
+
+1. Baseline Stage 1 (CE-only), rồi Stage 2 từ adapter baseline đó.
+2. Stage 1 projector CKA **0.1**, rồi Stage 2 projector CKA **0.1**.
+3. Stage 2 projector CKA **0.1** + final CKA **0.1**, từ cùng adapter CKA ở bước 2.
+
+Tổng **6 pretrain + 9 finetune = 15 job**. PCGrad, norm cap, auxiliary MLP,
+CKA tau và delayed start đều tắt. Stage 1 microbatch **16**, accumulation
+**16** (batch 256); Stage 2 microbatch **1**, accumulation **128** (batch 128),
+bật gradient checkpointing để giảm activation memory. Đây là cấu hình thận
+trọng cho một B200, chưa phải cam kết peak VRAM hay benchmark tốc độ.
+
+```bash
+DRY_RUN=1 bash scripts/v1_5/7b/train_qwen2_5_7b_cka_ablations.sh
+```
+
+```bash
+conda run --no-capture-output -n llava1 \
+  bash scripts/v1_5/7b/train_qwen2_5_7b_cka_ablations.sh
+```
+
+Output mặc định:
+`checkpoints/cka-two-stage/qwen2.5-7b-mlp2x_gelu-random-projector-lambda0.1-seed42/repeat-{1,2,3}/{baseline,cka_proj,cka_proj_final}/`.
+Không ghi đè hay tự resume output cũ. `STAGE`, `REPEAT_START`, `REPEATS`,
+`EXPERIMENT_ROOT` và các biến GPU/batch được hỗ trợ như runner chung.
+`PRETRAIN_GRADIENT_CHECKPOINTING` và `FINETUNE_GRADIENT_CHECKPOINTING` cho
+phép điều chỉnh riêng từng stage. Các script con vẫn mặc định tắt
+checkpointing khi chạy độc lập mà không truyền tùy chọn này.
+
 ## Sweep finetune: projector CKA 0.1, bốn final-state weight
 
 Dùng [finetune_cka_final_weight_sweep.sh](finetune_cka_final_weight_sweep.sh)

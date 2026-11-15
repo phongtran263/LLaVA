@@ -225,6 +225,22 @@ class LlavaMetaModel:
                 )
 
         self.initialize_cka_final_mlp_head()
+        self.initialize_pre_predictor()
+
+    def initialize_pre_predictor(self):
+        if not getattr(self.config, 'pre_loss', False):
+            return None
+        from .predictive_regularization import validate_pre_config
+        validate_pre_config(self.config)
+        if getattr(self, 'pre_predictor', None) is None:
+            # The paper specifies two MLP layers, but does not publish its
+            # width/activation. H -> H -> H with GELU is an explicit assumption.
+            width = self.config.hidden_size
+            reference = next(self.parameters())
+            self.pre_predictor = nn.Sequential(
+                nn.Linear(width, width), nn.GELU(), nn.Linear(width, width),
+            ).to(device=reference.device, dtype=reference.dtype)
+        return self.pre_predictor
 
     def initialize_cka_final_mlp_head(self):
         """Register the optional auxiliary head before optimizer/checkpoint setup.
@@ -500,8 +516,12 @@ class LlavaMetaForCausalLM(ABC):
         images, image_sizes=None
     ):
         vision_tower = self.get_vision_tower()
+        needs_image_mask = self.get_model().training and (
+            getattr(self.get_model().config, 'cka_loss', False)
+            or getattr(self.get_model().config, 'pre_loss', False)
+        )
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+            if needs_image_mask:
                 return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
@@ -611,7 +631,7 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
-        new_vision_feature_masks = [] if (self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)) else None
+        new_vision_feature_masks = [] if needs_image_mask else None
         # These raw vision features follow the same insertion, truncation, and padding
         # path as projected image embeddings so later CKA can align token positions.
         new_pre_projector_features = [] if pre_projector_image_features is not None else None
@@ -783,7 +803,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
+        if needs_image_mask:
             return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, vision_feature_mask_padded, pre_post_cka_loss, pre_projector_features_padded
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 

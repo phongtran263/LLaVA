@@ -1,0 +1,166 @@
+% Required packages: booktabs, tabularx, array, amsmath.
+% Shared two-stage MLP recipe; coefficients follow the main-paper terminology.
+% Source: scripts/v1_5/7b/train_cka_two_stage.sh and its child launchers.
+% Environment-specific overrides and historical run provenance are not implied.
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{4pt}
+    \renewcommand{\arraystretch}{1.08}
+    \caption{
+        Training configuration for Baseline, VSP-Proj, and VSP.
+        The three recipes share the architecture and optimization settings;
+        their structural-loss coefficients are listed in the order
+        Baseline / VSP-Proj / VSP.
+        Backbone-dependent dimensions are listed in the order
+        Vicuna-7B-v1.5 / Qwen2.5-3B-Instruct / Qwen2.5-7B-Instruct.
+    }
+    \label{tab:training_configuration}
+
+    \begin{tabularx}{\textwidth}{
+        @{}
+        >{\raggedright\arraybackslash}p{0.27\textwidth}
+        >{\raggedright\arraybackslash}X
+        >{\raggedright\arraybackslash}X
+        @{}
+    }
+        \toprule
+        \textbf{Setting}
+        & \textbf{Stage 1: projector pretraining}
+        & \textbf{Stage 2: instruction tuning} \\
+        \midrule
+        \multicolumn{3}{@{}l}{\textbf{Architecture and visual inputs}} \\
+        \addlinespace[2pt]
+
+        Language backbone
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{Vicuna-7B-v1.5 or Qwen2.5-3B/7B-Instruct, with the corresponding tokenizer} \\
+
+        Vision encoder
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{CLIP ViT-L/14 at $336\times336$ resolution; frozen in both stages} \\
+
+        Multimodal projector
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{Two-layer MLP:
+          $\mathrm{Linear}(1024,d_l)\rightarrow\mathrm{GELU}\rightarrow\mathrm{Linear}(d_l,d_l)$,
+          with biases; $d_l=4096/2048/3584$} \\
+
+        Frozen visual reference $V$
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{Penultimate vision-block patch features (block 23 of 24), before the projector;
+          CLS token excluded; $d_v=1024$} \\
+
+        Image preprocessing
+        & Short-edge resize and center crop to $336\times336$; CLIP normalization
+        & Mean-color square padding, resize to $336\times336$; CLIP normalization \\
+
+        Number of image tokens
+        & $N=576$ ($24\times24$ patches)
+        & $N=576$ before sequence truncation \\
+
+        \midrule
+        \multicolumn{3}{@{}l}{\textbf{Data and supervision}} \\
+        \addlinespace[2pt]
+
+        Training data
+        & LLaVA-558K (558,128 samples)
+        & LLaVA-665K (665,298 samples) \\
+
+        Initialization
+        & Pretrained LLM; randomly initialized projector
+        & Pretrained LLM; corresponding stage-1 projector \\
+
+        Trainable components
+        & Projector only
+        & Projector and full LLM; no LoRA \\
+
+        Prompt format
+        & Plain image--caption sequence
+        & Vicuna v1 / Qwen ChatML-style conversation \\
+
+        Language-modeling supervision
+        & Caption and terminating separator
+        & Assistant responses and their terminating separators \\
+
+        Maximum sequence length
+        & 2,048 tokens
+        & 2,048 tokens \\
+
+        \midrule
+        \multicolumn{3}{@{}l}{\textbf{Optimization}} \\
+        \addlinespace[2pt]
+
+        Optimizer
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{AdamW; $(\beta_1,\beta_2)=(0.9,0.999)$; $\epsilon=10^{-8}$; weight decay $=0$} \\
+
+        Projector learning rate
+        & $10^{-3}$
+        & $2\times10^{-5}$ \\
+
+        LLM learning rate
+        & Not applicable (frozen)
+        & $2\times10^{-5}$ \\
+
+        Effective global batch size
+        & 256
+        & 128 \\
+
+        Training duration
+        & 1 epoch
+        & 1 epoch \\
+
+        Learning-rate schedule
+        & Cosine decay; 3\% linear warmup
+        & Cosine decay; 3\% linear warmup \\
+
+        Precision / execution
+        & \multicolumn{2}{>{\raggedright\arraybackslash}p{\dimexpr.73\textwidth-2\tabcolsep\relax}@{}}{BF16 mixed precision; TF32 allowed; FlashAttention-2; DeepSpeed ZeRO-2} \\
+
+        Checkpoint selection
+        & End-of-training projector
+        & End-of-training model \\
+
+        \midrule
+        \multicolumn{3}{@{}l}{\textbf{Structural regularization}} \\
+        \addlinespace[2pt]
+
+        CKA targets, when enabled
+        & Projector output $Z$
+        & $Z$ and, for VSP, final decoder-block image-token output
+          $H_{\mathrm{img}}^{(L)}$ before final normalization \\
+
+        Projector coefficient
+        & $\lambda_{\mathrm{proj}}^{(1)}=0\,/\,0.1\,/\,0.1$
+        & $\lambda_{\mathrm{proj}}^{(2)}=0\,/\,0.1\,/\,0.1$ \\
+
+        Final-state coefficient
+        & $0$ (inactive)
+        & $\lambda_{\mathrm{final}}^{(2)}=0\,/\,0\,/\,0.1$ \\
+
+        Regularization schedule
+        & Active from the first step; constant coefficient
+        & Active from the first step; constant coefficients \\
+
+        CKA definition / reduction
+        & Centered linear CKA; per-image loss, then batch mean
+        & Centered linear CKA; projector: batch mean; final state: mean over eligible samples \\
+
+        Gradient flow
+        & Stop gradient through $V$; retain gradient through $Z$
+        & Stop gradient through $V$; retain gradients through $Z$ and $H_{\mathrm{img}}^{(L)}$ \\
+
+        \bottomrule
+    \end{tabularx}
+
+    \vspace{3pt}
+    \begin{minipage}{\textwidth}
+        \footnotesize
+        \textit{Notes.}
+        VSP-Proj and VSP apply the same projector-level objective in stage 1;
+        VSP adds $\mathcal L_{\mathrm{final}}$ only in stage 2.
+        The learning-rate warmup does not warm up the CKA coefficients.
+        Image-token and sequence-padding positions are excluded from
+        $\mathcal L_{\mathrm{LM}}$; stage 2 also masks prompt positions.
+        The sequence-length limit includes expanded image tokens.
+        Training CKA includes image-preprocessing padding patches;
+        text tokens and sequence-batching padding are excluded from final-state CKA.
+        No auxiliary prediction head or inference-time regularizer is added.
+    \end{minipage}
+\end{table*}

@@ -129,7 +129,7 @@ COMMAND+=(
     --logging_steps "${LOGGING_STEPS:-10}" \
     --tf32 True \
     --model_max_length 2048 \
-    --gradient_checkpointing False \
+    --gradient_checkpointing "${FINETUNE_GRADIENT_CHECKPOINTING:-${GRADIENT_CHECKPOINTING:-False}}" \
     --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-16}" \
     --lazy_preprocess True \
     --report_to "${REPORT_TO:-wandb}" \

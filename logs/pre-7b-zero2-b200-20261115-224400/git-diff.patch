@@ -1,0 +1,283 @@
+diff --git a/.gitignore b/.gitignore
+index 1eb3e1b..58107da 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -54,7 +54,10 @@ scripts
+ !/scripts/v1_5/7b/train_cka_two_stage.sh
+ !/scripts/v1_5/7b/train_qwen2_5_3b_baseline.sh
+ !/scripts/v1_5/7b/train_qwen2_5_3b_cka_ablations.sh
++!/scripts/v1_5/7b/train_qwen2_5_7b_cka_ablations.sh
+ !/scripts/v1_5/7b/finetune_cka_final_weight_sweep.sh
++!/scripts/v1_5/7b/finetune_pre.sh
++!/scripts/zero2_b200.json
+ !/scripts/v1_5/7b/CKA_ABLATIONS.md
+ !/scripts/v1_5/7b/pretrain_qwen2_5.sh
+ !/scripts/v1_5/7b/finetune_qwen2_5.sh
+diff --git a/llava/model/language_model/llava_llama.py b/llava/model/language_model/llava_llama.py
+index 5d648ca..e14c7cd 100644
+--- a/llava/model/language_model/llava_llama.py
++++ b/llava/model/language_model/llava_llama.py
+@@ -29,6 +29,7 @@
+ from transformers.generation.utils import GenerateOutput
+ 
+ from llava.constants import IGNORE_INDEX
++from ..predictive_regularization import compute_predictive_regularization_loss, validate_pre_config
+ from ..llava_arch import (
+     LlavaMetaModel,
+     LlavaMetaForCausalLM,
+@@ -841,6 +842,12 @@ def forward(
+         cache_position: Optional[torch.LongTensor] = None,
+     ) -> Union[Tuple, CausalLMOutputWithPast]:
+         cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
++        pre_enabled = self.get_model().training and getattr(self.config, 'pre_loss', False)
++        if pre_enabled:
++            validate_pre_config(self.config)
++        self.last_pre_loss = None
++        self.last_pre_text_loss = None
++        self.last_pre_num_patches = None
+         vision_feature_mask = None
+         subset_vision_feature_mask = None
+         pre_post_cka_loss = None
+@@ -856,7 +863,7 @@ def forward(
+         self.last_cka_projector_output = None
+ 
+         if inputs_embeds is None:
+-            if cka_enabled:
++            if cka_enabled or pre_enabled:
+                 # CKA-enabled multimodal prep also returns the image-token mask and
+                 # projector CKA metadata aligned to the final input sequence.
+                 (
+@@ -976,6 +983,22 @@ def capture_attention_subset_from_layer(module, module_inputs, module_kwargs):
+                     with_kwargs=True,
+                 )
+ 
++        pre_hidden = None
++        pre_hook_handle = None
++        if pre_enabled and labels is not None:
++            if self.get_model().gradient_checkpointing and torch.is_grad_enabled():
++                checkpoint_fn = getattr(self.get_model(), '_gradient_checkpointing_func', None)
++                if getattr(checkpoint_fn, 'keywords', {}).get('use_reentrant', True):
++                    raise ValueError("PRe requires gradient_checkpointing_kwargs={'use_reentrant': False}.")
++
++            def capture_pre_hidden(_module, _inputs, block_output):
++                nonlocal pre_hidden
++                pre_hidden = block_output[0] if isinstance(block_output, (tuple, list)) else block_output
++
++            pre_hook_handle = self.get_model().layers[self.config.pre_loss_layer - 1].register_forward_hook(
++                capture_pre_hidden
++            )
++
+         forward_kwargs = dict(
+             input_ids=input_ids,
+             attention_mask=attention_mask,
+@@ -986,7 +1009,7 @@ def capture_attention_subset_from_layer(module, module_inputs, module_kwargs):
+             use_cache=use_cache,
+             output_attentions=should_output_attentions,
+             output_hidden_states=should_output_hidden_states,
+-            return_dict=return_dict,
++            return_dict=True if pre_enabled else return_dict,
+         )
+         if cache_position is not None and _LLAMA_FORWARD_SUPPORTS_CACHE_POSITION:
+             forward_kwargs["cache_position"] = cache_position
+@@ -994,6 +1017,8 @@ def capture_attention_subset_from_layer(module, module_inputs, module_kwargs):
+         try:
+             output = super().forward(**forward_kwargs)
+         finally:
++            if pre_hook_handle is not None:
++                pre_hook_handle.remove()
+             if norm_pre_hook_handle is not None:
+                 norm_pre_hook_handle.remove()
+             if attention_subset_hook_handle is not None:
+@@ -1001,6 +1026,26 @@ def capture_attention_subset_from_layer(module, module_inputs, module_kwargs):
+             for hook_handle in cka_layer_hook_handles:
+                 hook_handle.remove()
+ 
++        if pre_enabled and output.loss is not None:
++            if pre_hidden is None:
++                raise RuntimeError("Missing PRe decoder-block activation.")
++            if vision_feature_mask is None:
++                # Pure text batches have no visual anchors. Retain a zero
++                # predictor graph so ZeRO/DDP sees the same parameter set.
++                vision_feature_mask = torch.zeros(pre_hidden.shape[:2], device=pre_hidden.device, dtype=torch.bool)
++                pre_anchor = pre_hidden.detach()
++            else:
++                pre_anchor = inputs_embeds.detach()
++            pre_loss = compute_predictive_regularization_loss(
++                self.get_model().pre_predictor, pre_hidden, pre_anchor, vision_feature_mask,
++            )
++            self.last_pre_text_loss = output.loss.detach()
++            self.last_pre_loss = pre_loss.detach()
++            self.last_pre_num_patches = vision_feature_mask.sum().detach()
++            output.loss = output.loss + float(self.config.pre_loss_weight) * pre_loss
++        if pre_enabled and not (return_dict if return_dict is not None else self.config.use_return_dict):
++            return output.to_tuple()
++
+         if (
+             llm_cka_enabled
+             and subset_select_layer is not None
+diff --git a/llava/model/llava_arch.py b/llava/model/llava_arch.py
+index ba9ebdf..e2b0a4a 100644
+--- a/llava/model/llava_arch.py
++++ b/llava/model/llava_arch.py
+@@ -225,6 +225,22 @@ def __init__(self, config):
+                 )
+ 
+         self.initialize_cka_final_mlp_head()
++        self.initialize_pre_predictor()
++
++    def initialize_pre_predictor(self):
++        if not getattr(self.config, 'pre_loss', False):
++            return None
++        from .predictive_regularization import validate_pre_config
++        validate_pre_config(self.config)
++        if getattr(self, 'pre_predictor', None) is None:
++            # The paper specifies two MLP layers, but does not publish its
++            # width/activation. H -> H -> H with GELU is an explicit assumption.
++            width = self.config.hidden_size
++            reference = next(self.parameters())
++            self.pre_predictor = nn.Sequential(
++                nn.Linear(width, width), nn.GELU(), nn.Linear(width, width),
++            ).to(device=reference.device, dtype=reference.dtype)
++        return self.pre_predictor
+ 
+     def initialize_cka_final_mlp_head(self):
+         """Register the optional auxiliary head before optimizer/checkpoint setup.
+@@ -500,8 +516,12 @@ def prepare_inputs_labels_for_multimodal(
+         images, image_sizes=None
+     ):
+         vision_tower = self.get_vision_tower()
++        needs_image_mask = self.get_model().training and (
++            getattr(self.get_model().config, 'cka_loss', False)
++            or getattr(self.get_model().config, 'pre_loss', False)
++        )
+         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+-            if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
++            if needs_image_mask:
+                 return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None, None
+             return input_ids, position_ids, attention_mask, past_key_values, None, labels
+ 
+@@ -611,7 +631,7 @@ def prepare_inputs_labels_for_multimodal(
+ 
+         new_input_embeds = []
+         new_labels = []
+-        new_vision_feature_masks = [] if (self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)) else None
++        new_vision_feature_masks = [] if needs_image_mask else None
+         # These raw vision features follow the same insertion, truncation, and padding
+         # path as projected image embeddings so later CKA can align token positions.
+         new_pre_projector_features = [] if pre_projector_image_features is not None else None
+@@ -783,7 +803,7 @@ def prepare_inputs_labels_for_multimodal(
+         if _position_ids is None:
+             position_ids = None
+ 
+-        if self.get_model().training and getattr(self.get_model().config, 'cka_loss', False):
++        if needs_image_mask:
+             return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, vision_feature_mask_padded, pre_post_cka_loss, pre_projector_features_padded
+         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+ 
+diff --git a/llava/train/llava_trainer.py b/llava/train/llava_trainer.py
+index 8ca6022..8aa863a 100644
+--- a/llava/train/llava_trainer.py
++++ b/llava/train/llava_trainer.py
+@@ -1640,6 +1640,15 @@ def log(self, logs, *args, **kwargs):
+             return super().log(logs, *args, **kwargs)
+         model = self.model.module if hasattr(self.model, 'module') else self.model
+ 
++        for attribute, metric in (
++            ('last_pre_loss', 'loss/pre_loss'),
++            ('last_pre_text_loss', 'loss/pre_text_loss'),
++            ('last_pre_num_patches', 'pre/num_patches'),
++        ):
++            value = getattr(model, attribute, None)
++            if value is not None:
++                logs[metric] = value.item() if torch.is_tensor(value) else float(value)
++
+         if hasattr(self, '_last_cka_schedule_active'):
+             logs['cka/schedule_active'] = float(self._last_cka_schedule_active)
+             logs['cka/schedule_start_step'] = float(self._last_cka_schedule_start_step)
+diff --git a/llava/train/train.py b/llava/train/train.py
+index 0611557..ec028d4 100644
+--- a/llava/train/train.py
++++ b/llava/train/train.py
+@@ -120,6 +120,9 @@ class ModelArguments:
+     guided_text_select_layer: Optional[int] = field(default=None)
+     mtd_topk: Optional[int] = field(default=None)
+     cka_loss: bool = field(default=False)
++    pre_loss: bool = field(default=False, metadata={"help": "Stage-2-only patch-level Predictive Regularization (arXiv:2603.20808), independent of CKA."})
++    pre_loss_layer: int = field(default=16, metadata={"help": "1-based decoder block whose visual tokens predict the detached post-projector anchor."})
++    pre_loss_weight: float = field(default=0.5)
+     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
+     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
+     vsp_asymmetric_pcgrad: bool = field(default=False, metadata={"help": "Protect the LM gradient and project only conflicting weighted VSP/CKA auxiliary gradients."})
+@@ -1224,6 +1227,21 @@ def train(attn_implementation=None):
+     parser = transformers.HfArgumentParser(
+         (ModelArguments, DataArguments, TrainingArguments))
+     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
++    if model_args.pre_loss:
++        incompatible = (
++            model_args.cka_loss or model_args.use_pcgrad
++            or model_args.vsp_gradient_diagnostics or model_args.vsp_asymmetric_pcgrad
++            or model_args.vsp_norm_cap or model_args.freeze_backbone
++            or model_args.tune_mm_mlp_adapter or training_args.freeze_mm_mlp_adapter
++            or training_args.lora_enable or training_args.bits != 16
++            or getattr(training_args, "protected_cka_refinement", False)
++            or getattr(training_args, "protected_stage2", False)
++        )
++        if incompatible or model_args.vision_tower is None:
++            raise ValueError("PRe requires stage-2 full finetuning with a vision tower, trainable LLM/projector, 16-bit weights, and CKA/PCGrad/LoRA/Protected modes disabled.")
++        # Trainer seeds after model construction. Seed this new predictor before
++        # from_pretrained initializes its missing weights as well.
++        transformers.set_seed(training_args.seed)
+     model_args.mm_projector_init_seed = validate_mm_projector_init_seed(
+         getattr(model_args, "mm_projector_init_seed", None))
+     model_args.cka_loss_geometry = validate_cka_loss_geometry_args(model_args, training_args)
+@@ -1265,7 +1283,7 @@ def train(attn_implementation=None):
+     validate_vsp_gradient_config(model_args)
+     if vsp_gradient_requested and not model_args.cka_loss:
+         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
+-    if (vsp_gradient_requested or model_args.cka_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
++    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
+         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
+             raise ValueError(
+                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
+@@ -1273,7 +1291,7 @@ def train(attn_implementation=None):
+             )
+         checkpointing_kwargs = dict(training_args.gradient_checkpointing_kwargs or {})
+         if checkpointing_kwargs.get("use_reentrant", True):
+-            rank0_print("CKA/VSP: setting gradient checkpointing to use_reentrant=False.")
++            rank0_print("Auxiliary loss: setting gradient checkpointing to use_reentrant=False.")
+         checkpointing_kwargs["use_reentrant"] = False
+         training_args.gradient_checkpointing_kwargs = checkpointing_kwargs
+     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+@@ -1284,6 +1302,8 @@ def train(attn_implementation=None):
+         force_download=model_args.force_download,
+     )
+     family = backbone_type(backbone_config)
++    if model_args.pre_loss and family != "llama":
++        raise ValueError("PRe reproduction currently supports the LLaVA-1.5 LLaMA/Vicuna backbone only.")
+     validate_cka_final_mlp_head_args(model_args, training_args, family=family)
+     is_llama3_model = is_llama3(backbone_config)
+     if model_args.version == "auto":
+@@ -1320,6 +1340,11 @@ def train(attn_implementation=None):
+         # Construct the optional head before loading its checkpoint weights.
+         # Explicitly disabling it keeps the legacy model architecture unchanged.
+         set_cka_final_mlp_head_config(config, model_args.cka_loss_final_mlp_head)
++        if model_args.pre_loss or hasattr(config, "pre_loss"):
++            config.pre_loss = model_args.pre_loss
++            config.pre_loss_layer = model_args.pre_loss_layer
++            config.pre_loss_weight = model_args.pre_loss_weight
++            config.cka_loss = model_args.cka_loss
+         if family == "mpt":
+             config.attn_config["attn_impl"] = training_args.mpt_attn_impl
+         else:
+@@ -1640,6 +1665,11 @@ def make_inputs_require_grad(module, input, output):
+             cka_final_mlp_head.requires_grad_(model_args.cka_loss_final_mlp_head)
+             cka_final_mlp_head.to(dtype=compute_dtype, device=training_args.device)
+ 
++        pre_predictor = model.get_model().initialize_pre_predictor()
++        if pre_predictor is not None:
++            pre_predictor.requires_grad_(True)
++            pre_predictor.to(dtype=compute_dtype, device=training_args.device)
++
+         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
+         model.config.mm_projector_lr = training_args.mm_projector_lr
+         training_args.use_im_start_end = model_args.mm_use_im_start_end

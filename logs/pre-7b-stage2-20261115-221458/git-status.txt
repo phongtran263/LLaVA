@@ -1,0 +1,19 @@
+ M .gitignore
+ M llava/model/language_model/llava_llama.py
+ M llava/model/llava_arch.py
+ M llava/train/llava_trainer.py
+ M llava/train/train.py
+ m lmms-eval
+ M scripts/v1_5/7b/CKA_ABLATIONS.md
+ M scripts/v1_5/7b/finetune_qwen2_5.sh
+ M scripts/v1_5/7b/pretrain_qwen2_5.sh
+?? "CVPR_2027_Draft (5).pdf"
+?? docs/appendix_training_details.tex
+?? docs/training_configuration_vsp.tex
+?? llava/model/predictive_regularization.py
+?? logs/pre-7b-stage2-20261115-221458/
+?? scripts/v1_5/7b/PRE_REPRODUCTION.md
+?? scripts/v1_5/7b/finetune_pre.sh
+?? scripts/v1_5/7b/train_qwen2_5_7b_cka_ablations.sh
+?? tests/test_predictive_regularization.py
+?? tests/test_qwen7b_cka_script.py
