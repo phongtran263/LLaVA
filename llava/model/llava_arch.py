@@ -210,6 +210,71 @@ def compute_linear_cka_loss(x, y, eps=1e-8, tau=0.0, geometry="linear"):
         cka = (hsic_xy / denom).clamp(0.0, 1.0)
         return cka_similarity_to_loss(cka, tau=tau).mean()
 
+
+RELATION_LOSS_MODES = ("cka", "cosrel", "cosrel_uka", "cosrel_uka_rkdd")
+
+
+def compute_relation_loss(x, y, mode, cos_weight=1.0, uka_weight=1.0,
+                          rkdd_weight=1.0, eps=1e-8):
+    """Match visual-token relations within each image, without feature-width matching.
+
+    CosRel is off-diagonal cosine-Gram MSE. UKA is the Frobenius cosine of
+    *uncentered* linear Grams (diagonal included). RKD-D follows distance-wise
+    RKD: off-diagonal Euclidean distances divided by their own per-image mean,
+    then Smooth L1. All three use the same token set and are averaged per image.
+    """
+    if mode not in RELATION_LOSS_MODES[1:]:
+        raise ValueError(f"Unknown relation loss mode: {mode!r}")
+    if x.ndim != 3 or y.ndim != 3 or x.shape[:2] != y.shape[:2]:
+        raise ValueError("Relation loss expects aligned (batch, visual-token, feature) tensors.")
+    if x.shape[0] == 0 or x.shape[1] < 2:
+        return y.float().sum() * 0.0
+    eps = validate_cka_eps(eps)
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        x, y = x.float(), y.float()
+        x_norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+        y_norm = torch.linalg.vector_norm(y, dim=-1, keepdim=True)
+        x_unit = x / x_norm.clamp_min(eps)
+        y_unit = y / y_norm.clamp_min(eps)
+        x_cos = torch.bmm(x_unit, x_unit.transpose(1, 2))
+        y_cos = torch.bmm(y_unit, y_unit.transpose(1, 2))
+        rows, cols = torch.triu_indices(x.shape[1], x.shape[1], offset=1, device=x.device)
+        loss = cos_weight * (x_cos[:, rows, cols] - y_cos[:, rows, cols]).square().mean(dim=1)
+
+        if mode != "cosrel":
+            # Reuse cosine Grams; raw Gram_ij = cos_ij * ||token_i|| * ||token_j||.
+            x_gram = x_cos * torch.bmm(x_norm, x_norm.transpose(1, 2))
+            y_gram = y_cos * torch.bmm(y_norm, y_norm.transpose(1, 2))
+            numerator = (x_gram * y_gram).sum(dim=(1, 2))
+            denominator = torch.linalg.vector_norm(x_gram, dim=(1, 2)) * torch.linalg.vector_norm(y_gram, dim=(1, 2))
+            uka = 1.0 - (numerator / denominator.clamp_min(eps)).clamp(0.0, 1.0)
+            loss = loss + uka_weight * uka
+
+            if mode == "cosrel_uka_rkdd":
+                x_sq = x_norm.squeeze(-1).square()
+                y_sq = y_norm.squeeze(-1).square()
+                x_dist = (x_sq[:, rows] + x_sq[:, cols] - 2 * x_gram[:, rows, cols]).clamp_min(eps * eps).sqrt()
+                y_dist = (y_sq[:, rows] + y_sq[:, cols] - 2 * y_gram[:, rows, cols]).clamp_min(eps * eps).sqrt()
+                x_dist = x_dist / x_dist.mean(dim=1, keepdim=True).clamp_min(eps)
+                y_dist = y_dist / y_dist.mean(dim=1, keepdim=True).clamp_min(eps)
+                rkdd = torch.nn.functional.smooth_l1_loss(y_dist, x_dist, reduction="none", beta=1.0).mean(dim=1)
+                loss = loss + rkdd_weight * rkdd
+        return loss.mean()
+
+
+def compute_visual_structure_loss(x, y, config):
+    """Dispatch the existing CKA pipeline to a selected relational ablation."""
+    mode = getattr(config, "cka_loss_objective", "cka")
+    if mode == "cka":
+        return compute_linear_cka_loss(x, y, tau=getattr(config, "cka_loss_tau", 0.0),
+                                       geometry=getattr(config, "cka_loss_geometry", "linear"))
+    return compute_relation_loss(
+        x, y, mode,
+        cos_weight=getattr(config, "relation_cos_weight", 1.0),
+        uka_weight=getattr(config, "relation_uka_weight", 1.0),
+        rkdd_weight=getattr(config, "relation_rkdd_weight", 1.0),
+    )
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -241,6 +306,32 @@ class LlavaMetaModel:
                 nn.Linear(width, width), nn.GELU(), nn.Linear(width, width),
             ).to(device=reference.device, dtype=reference.dtype)
         return self.pre_predictor
+
+    def initialize_ross_modules(self, load_vae=False):
+        """Attach the official Ross-D head after HF initializes the backbone.
+
+        Fresh comparison runs construct this head after from_pretrained returns,
+        preserving DiT's Xavier/adaLN-Zero initialization. Saved Ross configs
+        rebuild it in the language-model constructor before loading its weights.
+        The frozen VAE is needed only for training, so inference has no external
+        VAE-file dependency.
+        """
+        if not getattr(self.config, 'ross_enable', False):
+            return None
+        from .ross import build_ross_denoiser, FrozenFluxAutoencoder
+        if getattr(self, 'mm_inv_projector', None) is None:
+            reference = next(self.parameters())
+            self.mm_inv_projector = build_ross_denoiser(self.config).to(
+                device=reference.device, dtype=reference.dtype,
+            )
+            self.config.ross_head_initialized = True
+        if load_vae and getattr(self, 'pixel_decoder', None) is None:
+            self.pixel_decoder = FrozenFluxAutoencoder(self.config).to(
+                device=next(self.parameters()).device,
+            )
+            if self.pixel_decoder.latent_dim != self.config.mm_inv_hidden_size:
+                raise ValueError('ROSS VAE latent channels do not match the reconstruction head.')
+        return self.mm_inv_projector
 
     def initialize_cka_final_mlp_head(self):
         """Register the optional auxiliary head before optimizer/checkpoint setup.
@@ -448,11 +539,8 @@ class LlavaMetaForCausalLM(ABC):
             if float(projector_weight) != 0.0:
                 # Projector CKA term: keep the projected image embeddings
                 # structurally close to the selected vision-anchor features.
-                cka_loss = compute_linear_cka_loss(
-                    projector_anchor_features.detach(),
-                    projected_image_features,
-                    tau=getattr(config, 'cka_loss_tau', 0.0),
-                    geometry=getattr(config, 'cka_loss_geometry', 'linear'),
+                cka_loss = compute_visual_structure_loss(
+                    projector_anchor_features.detach(), projected_image_features, config,
                 )
             final_hidden_weight = getattr(config, "cka_loss_final_hidden_weight", None)
             if final_hidden_weight is None:
@@ -519,6 +607,7 @@ class LlavaMetaForCausalLM(ABC):
         needs_image_mask = self.get_model().training and (
             getattr(self.get_model().config, 'cka_loss', False)
             or getattr(self.get_model().config, 'pre_loss', False)
+            or getattr(self.get_model().config, 'ross_enable', False)
         )
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             if needs_image_mask:

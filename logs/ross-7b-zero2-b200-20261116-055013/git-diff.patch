@@ -1,0 +1,331 @@
+diff --git a/.gitignore b/.gitignore
+index 58107da..ec21dc1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -57,6 +57,8 @@ scripts
+ !/scripts/v1_5/7b/train_qwen2_5_7b_cka_ablations.sh
+ !/scripts/v1_5/7b/finetune_cka_final_weight_sweep.sh
+ !/scripts/v1_5/7b/finetune_pre.sh
++!/scripts/v1_5/7b/finetune_ross.sh
++/.deps/
+ !/scripts/zero2_b200.json
+ !/scripts/v1_5/7b/CKA_ABLATIONS.md
+ !/scripts/v1_5/7b/pretrain_qwen2_5.sh
+diff --git a/llava/model/language_model/llava_llama.py b/llava/model/language_model/llava_llama.py
+index e14c7cd..0b31a03 100644
+--- a/llava/model/language_model/llava_llama.py
++++ b/llava/model/language_model/llava_llama.py
+@@ -74,6 +74,8 @@ def __init__(self, config):
+ 
+         # Initialize weights and apply final processing
+         self.post_init()
++        if getattr(config, 'ross_enable', False) and getattr(config, 'ross_head_initialized', False):
++            self.get_model().initialize_ross_modules(load_vae=False)
+ 
+     def get_model(self):
+         return self.model
+@@ -843,11 +845,17 @@ def forward(
+     ) -> Union[Tuple, CausalLMOutputWithPast]:
+         cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
+         pre_enabled = self.get_model().training and getattr(self.config, 'pre_loss', False)
++        ross_enabled = self.get_model().training and getattr(self.config, 'ross_enable', False)
++        if ross_enabled and (pre_enabled or cka_enabled):
++            raise ValueError('ROSS comparison requires PRe and CKA to be disabled.')
+         if pre_enabled:
+             validate_pre_config(self.config)
+         self.last_pre_loss = None
+         self.last_pre_text_loss = None
+         self.last_pre_num_patches = None
++        self.last_ross_loss = None
++        self.last_ross_text_loss = None
++        self.last_ross_num_images = None
+         vision_feature_mask = None
+         subset_vision_feature_mask = None
+         pre_post_cka_loss = None
+@@ -863,7 +871,7 @@ def forward(
+         self.last_cka_projector_output = None
+ 
+         if inputs_embeds is None:
+-            if cka_enabled or pre_enabled:
++            if cka_enabled or pre_enabled or ross_enabled:
+                 # CKA-enabled multimodal prep also returns the image-token mask and
+                 # projector CKA metadata aligned to the final input sequence.
+                 (
+@@ -985,6 +993,16 @@ def capture_attention_subset_from_layer(module, module_inputs, module_kwargs):
+ 
+         pre_hidden = None
+         pre_hook_handle = None
++        ross_hidden = None
++        ross_hook_handle = None
++        if ross_enabled and labels is not None:
++            def capture_ross_hidden(_module, _inputs, normalized_output):
++                nonlocal ross_hidden
++                ross_hidden = normalized_output
++
++            # Official ROSS conditions on LlamaModel.outputs[0], after the final
++            # RMSNorm. A hook avoids retaining the entire hidden-state tuple.
++            ross_hook_handle = self.get_model().norm.register_forward_hook(capture_ross_hidden)
+         if pre_enabled and labels is not None:
+             if self.get_model().gradient_checkpointing and torch.is_grad_enabled():
+                 checkpoint_fn = getattr(self.get_model(), '_gradient_checkpointing_func', None)
+@@ -1009,7 +1027,7 @@ def capture_pre_hidden(_module, _inputs, block_output):
+             use_cache=use_cache,
+             output_attentions=should_output_attentions,
+             output_hidden_states=should_output_hidden_states,
+-            return_dict=True if pre_enabled else return_dict,
++            return_dict=True if (pre_enabled or ross_enabled) else return_dict,
+         )
+         if cache_position is not None and _LLAMA_FORWARD_SUPPORTS_CACHE_POSITION:
+             forward_kwargs["cache_position"] = cache_position
+@@ -1017,6 +1035,8 @@ def capture_pre_hidden(_module, _inputs, block_output):
+         try:
+             output = super().forward(**forward_kwargs)
+         finally:
++            if ross_hook_handle is not None:
++                ross_hook_handle.remove()
+             if pre_hook_handle is not None:
+                 pre_hook_handle.remove()
+             if norm_pre_hook_handle is not None:
+@@ -1043,7 +1063,37 @@ def capture_pre_hidden(_module, _inputs, block_output):
+             self.last_pre_loss = pre_loss.detach()
+             self.last_pre_num_patches = vision_feature_mask.sum().detach()
+             output.loss = output.loss + float(self.config.pre_loss_weight) * pre_loss
+-        if pre_enabled and not (return_dict if return_dict is not None else self.config.use_return_dict):
++        if ross_enabled and output.loss is not None:
++            if ross_hidden is None:
++                raise RuntimeError('Missing final normalized LLM representation for ROSS.')
++            from ..ross import compute_ross_reconstruction_loss
++            backbone = self.get_model()
++            if not hasattr(backbone, 'mm_inv_projector') or not hasattr(backbone, 'pixel_decoder'):
++                raise RuntimeError('ROSS denoiser and frozen VAE must be initialized before training.')
++            batch_size, _, width = ross_hidden.shape
++            patches = int(getattr(self.config, 'image_embed_len', 576))
++            if vision_feature_mask is None:
++                vision_feature_mask = torch.zeros(ross_hidden.shape[:2], device=ross_hidden.device, dtype=torch.bool)
++            counts = vision_feature_mask.sum(dim=1)
++            if bool(((counts != 0) & (counts != patches)).any()):
++                raise ValueError('ROSS requires one complete visual patch grid per image sample; truncated/multiple images are unsupported in this profile.')
++            valid_images = counts == patches
++            visual_hidden = ross_hidden.new_zeros((batch_size, patches, width))
++            visual_hidden[valid_images] = ross_hidden[vision_feature_mask].reshape(-1, patches, width)
++            ross_images = images
++            if ross_images is None:
++                ross_images = ross_hidden.new_zeros((batch_size, 3, 336, 336))
++            if not torch.is_tensor(ross_images) or ross_images.ndim != 4 or ross_images.shape[0] != batch_size:
++                raise ValueError('ROSS matched setting requires images as [B,3,336,336], with one image or a text dummy per sample.')
++            reconstruction_loss = compute_ross_reconstruction_loss(
++                backbone.mm_inv_projector, backbone.pixel_decoder,
++                visual_hidden, ross_images, valid_images, config=self.config,
++            )
++            self.last_ross_text_loss = output.loss.detach()
++            self.last_ross_loss = reconstruction_loss.detach()
++            self.last_ross_num_images = valid_images.sum().detach()
++            output.loss = output.loss + float(getattr(self.config, 'ross_loss_weight', 1.0)) * reconstruction_loss
++        if (pre_enabled or ross_enabled) and not (return_dict if return_dict is not None else self.config.use_return_dict):
+             return output.to_tuple()
+ 
+         if (
+diff --git a/llava/model/llava_arch.py b/llava/model/llava_arch.py
+index e2b0a4a..19bc9de 100644
+--- a/llava/model/llava_arch.py
++++ b/llava/model/llava_arch.py
+@@ -242,6 +242,32 @@ def initialize_pre_predictor(self):
+             ).to(device=reference.device, dtype=reference.dtype)
+         return self.pre_predictor
+ 
++    def initialize_ross_modules(self, load_vae=False):
++        """Attach the official Ross-D head after HF initializes the backbone.
++
++        Fresh comparison runs construct this head after from_pretrained returns,
++        preserving DiT's Xavier/adaLN-Zero initialization. Saved Ross configs
++        rebuild it in the language-model constructor before loading its weights.
++        The frozen VAE is needed only for training, so inference has no external
++        VAE-file dependency.
++        """
++        if not getattr(self.config, 'ross_enable', False):
++            return None
++        from .ross import build_ross_denoiser, FrozenFluxAutoencoder
++        if getattr(self, 'mm_inv_projector', None) is None:
++            reference = next(self.parameters())
++            self.mm_inv_projector = build_ross_denoiser(self.config).to(
++                device=reference.device, dtype=reference.dtype,
++            )
++            self.config.ross_head_initialized = True
++        if load_vae and getattr(self, 'pixel_decoder', None) is None:
++            self.pixel_decoder = FrozenFluxAutoencoder(self.config).to(
++                device=next(self.parameters()).device,
++            )
++            if self.pixel_decoder.latent_dim != self.config.mm_inv_hidden_size:
++                raise ValueError('ROSS VAE latent channels do not match the reconstruction head.')
++        return self.mm_inv_projector
++
+     def initialize_cka_final_mlp_head(self):
+         """Register the optional auxiliary head before optimizer/checkpoint setup.
+ 
+@@ -519,6 +545,7 @@ def prepare_inputs_labels_for_multimodal(
+         needs_image_mask = self.get_model().training and (
+             getattr(self.get_model().config, 'cka_loss', False)
+             or getattr(self.get_model().config, 'pre_loss', False)
++            or getattr(self.get_model().config, 'ross_enable', False)
+         )
+         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+             if needs_image_mask:
+diff --git a/llava/train/llava_trainer.py b/llava/train/llava_trainer.py
+index dfc5629..1bc69fa 100644
+--- a/llava/train/llava_trainer.py
++++ b/llava/train/llava_trainer.py
+@@ -35,7 +35,7 @@
+ 
+ 
+ def backward_pre_deepspeed_loss(accelerator, loss, gradient_accumulation_steps):
+-    """Normalize the complete PRe objective once, bypassing output GAS hooks.
++    """Normalize the complete PRe/ROSS objective once, bypassing output GAS hooks.
+ 
+     DeepSpeed 0.18.9 registers GAS division hooks on every returned tensor.
+     CausalLMOutput exposes both loss and logits, so automatic scaling can divide
+@@ -1613,7 +1613,10 @@ def _training_step_with_cka_runtime_state(self, model, inputs, num_items_in_batc
+                         engine = self._get_deepspeed_engine(model)
+                         if engine is not None:
+                             engine.set_gradient_accumulation_boundary(bool(self.accelerator.sync_gradients))
+-                    if self.is_deepspeed_enabled and getattr(self.model.config, 'pre_loss', False):
++                    if self.is_deepspeed_enabled and (
++                        getattr(self.model.config, 'pre_loss', False)
++                        or getattr(self.model.config, 'ross_enable', False)
++                    ):
+                         backward_pre_deepspeed_loss(
+                             self.accelerator, backward_loss, self.args.gradient_accumulation_steps,
+                         )
+@@ -1661,7 +1664,8 @@ def log(self, logs, *args, **kwargs):
+             return super().log(logs, *args, **kwargs)
+         model = self.model.module if hasattr(self.model, 'module') else self.model
+ 
+-        if getattr(getattr(model, 'config', None), 'pre_loss', False) and torch.cuda.is_available():
++        if (getattr(getattr(model, 'config', None), 'pre_loss', False)
++                or getattr(getattr(model, 'config', None), 'ross_enable', False)) and torch.cuda.is_available():
+             parameter = next(model.parameters(), None)
+             if parameter is not None and parameter.device.type == 'cuda':
+                 memory = torch.cuda.memory_stats(parameter.device)
+@@ -1677,6 +1681,9 @@ def log(self, logs, *args, **kwargs):
+             ('last_pre_loss', 'loss/pre_loss'),
+             ('last_pre_text_loss', 'loss/pre_text_loss'),
+             ('last_pre_num_patches', 'pre/num_patches'),
++            ('last_ross_loss', 'loss/ross_loss'),
++            ('last_ross_text_loss', 'loss/ross_text_loss'),
++            ('last_ross_num_images', 'ross/num_images'),
+         ):
+             value = getattr(model, attribute, None)
+             if value is not None:
+diff --git a/llava/train/train.py b/llava/train/train.py
+index ec028d4..88ed4ab 100644
+--- a/llava/train/train.py
++++ b/llava/train/train.py
+@@ -19,6 +19,7 @@
+ from dataclasses import dataclass, field
+ import json
+ import logging
++import math
+ import pathlib
+ from typing import Dict, Optional, Sequence, List
+ 
+@@ -123,6 +124,9 @@ class ModelArguments:
+     pre_loss: bool = field(default=False, metadata={"help": "Stage-2-only patch-level Predictive Regularization (arXiv:2603.20808), independent of CKA."})
+     pre_loss_layer: int = field(default=16, metadata={"help": "1-based decoder block whose visual tokens predict the detached post-projector anchor."})
+     pre_loss_weight: float = field(default=0.5)
++    ross_enable: bool = field(default=False, metadata={"help": "Ross-D reconstruction objective with the shared baseline stage-1 projector."})
++    ross_vae_path: Optional[str] = field(default=None, metadata={"help": "Local directory containing the frozen FLUX AutoencoderKL config and safetensors."})
++    ross_loss_weight: float = field(default=1.0)
+     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
+     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
+     vsp_asymmetric_pcgrad: bool = field(default=False, metadata={"help": "Protect the LM gradient and project only conflicting weighted VSP/CKA auxiliary gradients."})
+@@ -1227,6 +1231,23 @@ def train(attn_implementation=None):
+     parser = transformers.HfArgumentParser(
+         (ModelArguments, DataArguments, TrainingArguments))
+     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
++    if model_args.ross_enable:
++        incompatible = (
++            model_args.pre_loss or model_args.cka_loss or model_args.use_pcgrad
++            or model_args.vsp_gradient_diagnostics or model_args.vsp_asymmetric_pcgrad
++            or model_args.vsp_norm_cap or model_args.freeze_backbone
++            or model_args.tune_mm_mlp_adapter or training_args.freeze_mm_mlp_adapter
++            or training_args.lora_enable or training_args.bits != 16
++            or getattr(training_args, 'protected_cka_refinement', False)
++            or getattr(training_args, 'protected_stage2', False)
++        )
++        if incompatible or model_args.vision_tower is None or model_args.ross_vae_path is None:
++            raise ValueError('ROSS requires full stage-2 finetuning, a frozen vision tower and FLUX VAE, with PRe/CKA/LoRA/controllers disabled.')
++        if not math.isfinite(model_args.ross_loss_weight) or model_args.ross_loss_weight < 0:
++            raise ValueError('ross_loss_weight must be finite and nonnegative.')
++        if model_args.mm_patch_merge_type != 'flat':
++            raise ValueError('The matched ROSS comparison requires flat CLIP visual patches.')
++        transformers.set_seed(training_args.seed)
+     if model_args.pre_loss:
+         incompatible = (
+             model_args.cka_loss or model_args.use_pcgrad
+@@ -1283,7 +1304,7 @@ def train(attn_implementation=None):
+     validate_vsp_gradient_config(model_args)
+     if vsp_gradient_requested and not model_args.cka_loss:
+         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
+-    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
++    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or model_args.ross_enable or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
+         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
+             raise ValueError(
+                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
+@@ -1304,6 +1325,8 @@ def train(attn_implementation=None):
+     family = backbone_type(backbone_config)
+     if model_args.pre_loss and family != "llama":
+         raise ValueError("PRe reproduction currently supports the LLaVA-1.5 LLaMA/Vicuna backbone only.")
++    if model_args.ross_enable and family != 'llama':
++        raise ValueError('The matched ROSS implementation currently supports LLaMA/Vicuna only.')
+     validate_cka_final_mlp_head_args(model_args, training_args, family=family)
+     is_llama3_model = is_llama3(backbone_config)
+     if model_args.version == "auto":
+@@ -1345,6 +1368,13 @@ def train(attn_implementation=None):
+             config.pre_loss_layer = model_args.pre_loss_layer
+             config.pre_loss_weight = model_args.pre_loss_weight
+             config.cka_loss = model_args.cka_loss
++        if model_args.ross_enable or hasattr(config, 'ross_enable'):
++            config.ross_enable = model_args.ross_enable
++            config.ross_loss_weight = model_args.ross_loss_weight
++            config.mm_pixel_decoder = model_args.ross_vae_path
++            config.mm_inv_projector_type = 'denoiser_vit3x'
++            config.mm_inv_hidden_size = 64
++            config.image_embed_len = 576
+         if family == "mpt":
+             config.attn_config["attn_impl"] = training_args.mpt_attn_impl
+         else:
+@@ -1670,6 +1700,17 @@ def make_inputs_require_grad(module, input, output):
+             pre_predictor.requires_grad_(True)
+             pre_predictor.to(dtype=compute_dtype, device=training_args.device)
+ 
++        if model_args.ross_enable:
++            model.config.image_embed_len = vision_tower.num_patches
++            model.config.image_mean = vision_tower.image_processor.image_mean
++            model.config.image_std = vision_tower.image_processor.image_std
++            model.config.decode_image_size = math.isqrt(vision_tower.num_patches) * 16
++            ross_head = model.get_model().initialize_ross_modules(load_vae=True)
++            # DiT's sine/cosine positional embedding is deliberately frozen;
++            # keep the trainability assigned by the official constructor.
++            ross_head.to(dtype=compute_dtype, device=training_args.device)
++            model.get_model().pixel_decoder.requires_grad_(False)
++
+         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
+         model.config.mm_projector_lr = training_args.mm_projector_lr
+         training_args.use_im_start_end = model_args.mm_use_im_start_end
+diff --git a/lmms-eval b/lmms-eval
+--- a/lmms-eval
++++ b/lmms-eval
+@@ -1 +1 @@
+-Subproject commit 047ec52003590fd8f9540b8e9aabb82e889159cf
++Subproject commit 047ec52003590fd8f9540b8e9aabb82e889159cf-dirty
+diff --git a/pyproject.toml b/pyproject.toml
+index e8a34a8..09743c8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -28,6 +28,7 @@ dependencies = [
+ 
+ [project.optional-dependencies]
+ train = ["deepspeed==0.18.9", "ninja==1.13.0", "wandb==0.25.1"]
++ross = ["diffusers==0.30.0"]
+ build = ["build", "twine"]
+ 
+ [project.urls]

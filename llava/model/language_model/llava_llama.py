@@ -34,6 +34,7 @@ from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
     cka_similarity_to_loss,
+    compute_relation_loss,
     normalize_centered_cka_features,
     normalize_cka_token_rows,
     validate_cka_eps,
@@ -74,6 +75,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         # Initialize weights and apply final processing
         self.post_init()
+        if getattr(config, 'ross_enable', False) and getattr(config, 'ross_head_initialized', False):
+            self.get_model().initialize_ross_modules(load_vae=False)
 
     def get_model(self):
         return self.model
@@ -160,6 +163,23 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )).to(target_device)
             x = transformed.new_zeros((*x.shape[:2], transformed.shape[-1]))
             x[compact_mask] = transformed
+
+        objective = getattr(self.get_model().config, "cka_loss_objective", "cka")
+        if objective != "cka":
+            config = self.get_model().config
+            # Different samples can have different numbers of visual tokens.
+            # Gather each valid sample before forming its pairwise relations.
+            losses = [
+                compute_relation_loss(
+                    y[i:i + 1, compact_mask[i]], x[i:i + 1, compact_mask[i]],
+                    objective,
+                    cos_weight=getattr(config, "relation_cos_weight", 1.0),
+                    uka_weight=getattr(config, "relation_uka_weight", 1.0),
+                    rkdd_weight=getattr(config, "relation_rkdd_weight", 1.0),
+                )
+                for i in range(x.shape[0]) if bool(valid_samples[i].item())
+            ]
+            return torch.stack(losses).mean()
 
         # As in projector CKA, explicitly disable autocast for Gram/HSIC math.
         with torch.autocast(device_type=target_device.type, enabled=False):
@@ -843,11 +863,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         cka_enabled = self.get_model().training and getattr(self.get_model().config, 'cka_loss', False)
         pre_enabled = self.get_model().training and getattr(self.config, 'pre_loss', False)
+        ross_enabled = self.get_model().training and getattr(self.config, 'ross_enable', False)
+        if ross_enabled and (pre_enabled or cka_enabled):
+            raise ValueError('ROSS comparison requires PRe and CKA to be disabled.')
         if pre_enabled:
             validate_pre_config(self.config)
         self.last_pre_loss = None
         self.last_pre_text_loss = None
         self.last_pre_num_patches = None
+        self.last_ross_loss = None
+        self.last_ross_text_loss = None
+        self.last_ross_num_images = None
         vision_feature_mask = None
         subset_vision_feature_mask = None
         pre_post_cka_loss = None
@@ -863,7 +889,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.last_cka_projector_output = None
 
         if inputs_embeds is None:
-            if cka_enabled or pre_enabled:
+            if cka_enabled or pre_enabled or ross_enabled:
                 # CKA-enabled multimodal prep also returns the image-token mask and
                 # projector CKA metadata aligned to the final input sequence.
                 (
@@ -985,6 +1011,16 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         pre_hidden = None
         pre_hook_handle = None
+        ross_hidden = None
+        ross_hook_handle = None
+        if ross_enabled and labels is not None:
+            def capture_ross_hidden(_module, _inputs, normalized_output):
+                nonlocal ross_hidden
+                ross_hidden = normalized_output
+
+            # Official ROSS conditions on LlamaModel.outputs[0], after the final
+            # RMSNorm. A hook avoids retaining the entire hidden-state tuple.
+            ross_hook_handle = self.get_model().norm.register_forward_hook(capture_ross_hidden)
         if pre_enabled and labels is not None:
             if self.get_model().gradient_checkpointing and torch.is_grad_enabled():
                 checkpoint_fn = getattr(self.get_model(), '_gradient_checkpointing_func', None)
@@ -1009,7 +1045,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=should_output_attentions,
             output_hidden_states=should_output_hidden_states,
-            return_dict=True if pre_enabled else return_dict,
+            return_dict=True if (pre_enabled or ross_enabled) else return_dict,
         )
         if cache_position is not None and _LLAMA_FORWARD_SUPPORTS_CACHE_POSITION:
             forward_kwargs["cache_position"] = cache_position
@@ -1017,6 +1053,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         try:
             output = super().forward(**forward_kwargs)
         finally:
+            if ross_hook_handle is not None:
+                ross_hook_handle.remove()
             if pre_hook_handle is not None:
                 pre_hook_handle.remove()
             if norm_pre_hook_handle is not None:
@@ -1043,7 +1081,37 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             self.last_pre_loss = pre_loss.detach()
             self.last_pre_num_patches = vision_feature_mask.sum().detach()
             output.loss = output.loss + float(self.config.pre_loss_weight) * pre_loss
-        if pre_enabled and not (return_dict if return_dict is not None else self.config.use_return_dict):
+        if ross_enabled and output.loss is not None:
+            if ross_hidden is None:
+                raise RuntimeError('Missing final normalized LLM representation for ROSS.')
+            from ..ross import compute_ross_reconstruction_loss
+            backbone = self.get_model()
+            if not hasattr(backbone, 'mm_inv_projector') or not hasattr(backbone, 'pixel_decoder'):
+                raise RuntimeError('ROSS denoiser and frozen VAE must be initialized before training.')
+            batch_size, _, width = ross_hidden.shape
+            patches = int(getattr(self.config, 'image_embed_len', 576))
+            if vision_feature_mask is None:
+                vision_feature_mask = torch.zeros(ross_hidden.shape[:2], device=ross_hidden.device, dtype=torch.bool)
+            counts = vision_feature_mask.sum(dim=1)
+            if bool(((counts != 0) & (counts != patches)).any()):
+                raise ValueError('ROSS requires one complete visual patch grid per image sample; truncated/multiple images are unsupported in this profile.')
+            valid_images = counts == patches
+            visual_hidden = ross_hidden.new_zeros((batch_size, patches, width))
+            visual_hidden[valid_images] = ross_hidden[vision_feature_mask].reshape(-1, patches, width)
+            ross_images = images
+            if ross_images is None:
+                ross_images = ross_hidden.new_zeros((batch_size, 3, 336, 336))
+            if not torch.is_tensor(ross_images) or ross_images.ndim != 4 or ross_images.shape[0] != batch_size:
+                raise ValueError('ROSS matched setting requires images as [B,3,336,336], with one image or a text dummy per sample.')
+            reconstruction_loss = compute_ross_reconstruction_loss(
+                backbone.mm_inv_projector, backbone.pixel_decoder,
+                visual_hidden, ross_images, valid_images, config=self.config,
+            )
+            self.last_ross_text_loss = output.loss.detach()
+            self.last_ross_loss = reconstruction_loss.detach()
+            self.last_ross_num_images = valid_images.sum().detach()
+            output.loss = output.loss + float(getattr(self.config, 'ross_loss_weight', 1.0)) * reconstruction_loss
+        if (pre_enabled or ross_enabled) and not (return_dict if return_dict is not None else self.config.use_return_dict):
             return output.to_tuple()
 
         if (

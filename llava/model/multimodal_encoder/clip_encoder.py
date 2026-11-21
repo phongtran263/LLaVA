@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig, SiglipVisionModel, SiglipImageProcessor, SiglipConfig
 
 
 class CLIPVisionTower(nn.Module):
@@ -192,3 +192,37 @@ class CLIPVisionTowerS2(CLIPVisionTower):
     @property
     def hidden_size(self):
         return self.config.hidden_size * len(self.s2_scales)
+
+
+class SiglipVisionTower(CLIPVisionTower):
+    """Fixed-resolution SigLIP/SigLIP2 vision tower (patch tokens, no CLS token)."""
+
+    def __init__(self, vision_tower, args, delay_load=False):
+        nn.Module.__init__(self)
+        self.is_loaded = False
+        self.vision_tower_name = vision_tower
+        self.select_layer = args.mm_vision_select_layer
+        self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        if self.select_feature != 'patch':
+            raise ValueError('SigLIP vision tower supports patch features only (no CLS token).')
+        if not delay_load or getattr(args, 'unfreeze_mm_vision_tower', False):
+            self.load_model()
+        else:
+            self.cfg_only = SiglipConfig.from_pretrained(vision_tower).vision_config
+
+    def load_model(self, device_map=None):
+        if self.is_loaded:
+            return
+        self.image_processor = SiglipImageProcessor.from_pretrained(self.vision_tower_name)
+        # LLaVA's text-only examples use crop_size to construct a dummy image.
+        self.image_processor.crop_size = dict(self.image_processor.size)
+        self.vision_tower = SiglipVisionModel.from_pretrained(
+            self.vision_tower_name,
+            config=SiglipConfig.from_pretrained(self.vision_tower_name).vision_config,
+            device_map=device_map)
+        self.vision_tower.requires_grad_(False)
+        self.is_loaded = True
+
+    def feature_select(self, image_forward_outs, layer=None):
+        # SigLIP has no CLS token: all 27x27 states are image patches.
+        return image_forward_outs.hidden_states[self.select_layer if layer is None else layer]

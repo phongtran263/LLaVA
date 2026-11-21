@@ -84,6 +84,7 @@ for setting in "${settings[@]}"; do
     seen_settings["${setting}"]=1
 done
 [[ -f "${PRETRAIN_SCRIPT}" && -f "${FINETUNE_SCRIPT}" ]] || fail "Both training scripts must exist beside this launcher."
+bash -n "${PRETRAIN_SCRIPT}" && bash -n "${FINETUNE_SCRIPT}" || fail "A training script has invalid Bash syntax."
 
 # Plan each required Stage-1 producer once, before its first consumer. This
 # also handles final-only selections and reversed CKA setting order.
@@ -125,12 +126,12 @@ fi
 COMMON_ENV=(
     "MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}"
     "MM_PROJECTOR_TYPE=${MM_PROJECTOR_TYPE}"
-    "VISION_TOWER=openai/clip-vit-large-patch14-336"
-    "MM_VISION_SELECT_LAYER=-2"
+    "VISION_TOWER=${VISION_TOWER:-openai/clip-vit-large-patch14-336}"
+    "MM_VISION_SELECT_LAYER=${MM_VISION_SELECT_LAYER:--2}"
     "CONVERSATION_VERSION=${CONVERSATION_VERSION:-auto}"
     "SEED=42"
     "DRY_RUN=${DRY_RUN}"
-    "DEEPSPEED_CONFIG=./scripts/zero2.json"
+    "DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-./scripts/zero2.json}"
     "SAVE_STRATEGY=no"
     "DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-16}"
     "REPORT_TO=${REPORT_TO:-wandb}"
@@ -173,6 +174,7 @@ launch() {
         fresh_output "${output}"
         [[ "${stage}" == pretrain ]] || require_adapter "${adapter}"
     fi
+    bash -n "${child}" || fail "Invalid Bash syntax before launching ${label}: ${child}"
     env -u WANDB_RUN_ID -u WANDB_RESUME \
         PYTHONNOUSERSITE=1 \
         "${COMMON_ENV[@]}" \
@@ -192,7 +194,7 @@ launch() {
         "CKA_PROJECTOR_WEIGHT=${projector_weight}" \
         "CKA_FINAL_HIDDEN_WEIGHT=${final_weight}" \
         "CKA_LAYERS=${layers}" \
-        bash "${child}"
+        bash -s -- < "${child}"
 }
 
 if [[ "${#settings[@]}" == 1 && "${settings[0]}" == baseline ]]; then

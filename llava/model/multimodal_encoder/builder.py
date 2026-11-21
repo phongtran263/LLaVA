@@ -1,6 +1,6 @@
 from copy import deepcopy
 import os
-from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2, CLIPVisionConfig
+from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2, CLIPVisionConfig, SiglipVisionTower
 from .pix2struct_encoder import Pix2StructVisionTower
 from .dinov2_encoder import DINOv2VisionTower
 from .owl_encoder import OwlVisionTower
@@ -18,6 +18,10 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         else:
             mul_args.input_image_size = 576
         return MultiEncoders(vision_tower, args=mul_args, **kwargs).to(device='cuda')
+    elif 'siglip2' in vision_tower.lower():
+        if use_s2:
+            raise ValueError('SigLIP2 does not support the CLIP S2 tower.')
+        return SiglipVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
     elif is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion") or "ShareGPT4V" in vision_tower:
         if use_s2:
             return CLIPVisionTowerS2(vision_tower, args=vision_tower_cfg, **kwargs)

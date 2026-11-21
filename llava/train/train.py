@@ -19,6 +19,7 @@ import copy
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import pathlib
 from typing import Dict, Optional, Sequence, List
 
@@ -57,7 +58,7 @@ from llava.model.backbones import (
     is_llama3, use_fast_tokenizer,
 )
 from llava.model.llava_arch import (
-    validate_cka_loss_geometry, validate_cka_loss_tau, validate_cka_vision_anchor,
+    RELATION_LOSS_MODES, validate_cka_loss_geometry, validate_cka_loss_tau, validate_cka_vision_anchor,
     validate_mm_projector_init_seed,
 )
 from llava.mm_utils import tokenizer_image_token
@@ -123,6 +124,9 @@ class ModelArguments:
     pre_loss: bool = field(default=False, metadata={"help": "Stage-2-only patch-level Predictive Regularization (arXiv:2603.20808), independent of CKA."})
     pre_loss_layer: int = field(default=16, metadata={"help": "1-based decoder block whose visual tokens predict the detached post-projector anchor."})
     pre_loss_weight: float = field(default=0.5)
+    ross_enable: bool = field(default=False, metadata={"help": "Ross-D reconstruction objective with the shared baseline stage-1 projector."})
+    ross_vae_path: Optional[str] = field(default=None, metadata={"help": "Local directory containing the frozen FLUX AutoencoderKL config and safetensors."})
+    ross_loss_weight: float = field(default=1.0)
     use_pcgrad: bool = field(default=False, metadata={"help": "Legacy alias for --vsp_asymmetric_pcgrad True."})
     vsp_gradient_diagnostics: bool = field(default=False, metadata={"help": "Log gradient-conflict diagnostics for LM vs weighted VSP/CKA losses without changing the update."})
     vsp_asymmetric_pcgrad: bool = field(default=False, metadata={"help": "Protect the LM gradient and project only conflicting weighted VSP/CKA auxiliary gradients."})
@@ -136,6 +140,10 @@ class ModelArguments:
     vsp_grad_eps: float = field(default=1e-12)
     cka_loss_tau: float = field(default=0.0, metadata={"help": "Tolerated raw CKA loss tau in [0, 1]. Uses max(0, 1 - CKA - tau); tau=0 preserves the legacy objective."})
     cka_loss_geometry: str = field(default="linear", metadata={"choices": ["linear", "row_normalized"], "help": "Centered linear CKA on original features, or per-token L2 normalization before centered linear CKA. Defaults to the unchanged legacy geometry."})
+    cka_loss_objective: str = field(default="cka", metadata={"choices": RELATION_LOSS_MODES, "help": "Auxiliary visual-structure objective: original CKA, pairwise cosine matching, cosine + uncentered kernel alignment, or cosine + UKA + RKD-D."})
+    relation_cos_weight: float = field(default=1.0)
+    relation_uka_weight: float = field(default=1.0)
+    relation_rkdd_weight: float = field(default=1.0)
     cka_loss_weight: float = field(default=1.0)
     cka_loss_projector_weight: Optional[float] = field(default=None, metadata={"help": "Weight for the projector CKA loss. Defaults to cka_loss_weight for backward compatibility."})
     cka_loss_final_hidden_weight: Optional[float] = field(default=None, metadata={"help": "Weight for selected-layer CKA(sg(A), H_k), where A is the configured anchor. The legacy flag name is retained for compatibility; defaults to cka_loss_weight."})
@@ -1221,12 +1229,47 @@ def validate_cka_loss_geometry_args(model_args, training_args):
     return geometry
 
 
+def validate_relation_loss_args(model_args, training_args):
+    if model_args.cka_loss_objective not in RELATION_LOSS_MODES:
+        raise ValueError(f"Unknown --cka_loss_objective: {model_args.cka_loss_objective!r}")
+    if model_args.cka_loss_objective == "cka":
+        return
+    if not model_args.cka_loss:
+        raise ValueError("Relational objectives require --cka_loss True to enable the existing auxiliary-loss path.")
+    if (getattr(training_args, "protected_cka_refinement", False)
+            or getattr(training_args, "protected_stage2", False)):
+        raise ValueError("Relational objectives are not supported by Protected CKA training.")
+    if model_args.cka_loss_tau != 0 or model_args.cka_loss_geometry != "linear":
+        raise ValueError("Relational objectives require --cka_loss_tau 0 and --cka_loss_geometry linear.")
+    for name in ("relation_cos_weight", "relation_uka_weight", "relation_rkdd_weight"):
+        value = getattr(model_args, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"--{name} must be finite and nonnegative.")
+
+
 def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.ross_enable:
+        incompatible = (
+            model_args.pre_loss or model_args.cka_loss or model_args.use_pcgrad
+            or model_args.vsp_gradient_diagnostics or model_args.vsp_asymmetric_pcgrad
+            or model_args.vsp_norm_cap or model_args.freeze_backbone
+            or model_args.tune_mm_mlp_adapter or training_args.freeze_mm_mlp_adapter
+            or training_args.lora_enable or training_args.bits != 16
+            or getattr(training_args, 'protected_cka_refinement', False)
+            or getattr(training_args, 'protected_stage2', False)
+        )
+        if incompatible or model_args.vision_tower is None or model_args.ross_vae_path is None:
+            raise ValueError('ROSS requires full stage-2 finetuning, a frozen vision tower and FLUX VAE, with PRe/CKA/LoRA/controllers disabled.')
+        if not math.isfinite(model_args.ross_loss_weight) or model_args.ross_loss_weight < 0:
+            raise ValueError('ross_loss_weight must be finite and nonnegative.')
+        if model_args.mm_patch_merge_type != 'flat':
+            raise ValueError('The matched ROSS comparison requires flat CLIP visual patches.')
+        transformers.set_seed(training_args.seed)
     if model_args.pre_loss:
         incompatible = (
             model_args.cka_loss or model_args.use_pcgrad
@@ -1245,6 +1288,7 @@ def train(attn_implementation=None):
     model_args.mm_projector_init_seed = validate_mm_projector_init_seed(
         getattr(model_args, "mm_projector_init_seed", None))
     model_args.cka_loss_geometry = validate_cka_loss_geometry_args(model_args, training_args)
+    validate_relation_loss_args(model_args, training_args)
     validate_cka_final_mlp_head_args(model_args, training_args)
     validate_protected_cka_config(model_args, data_args, training_args)
     validate_protected_cka_stage2_config(model_args, data_args, training_args)
@@ -1283,7 +1327,7 @@ def train(attn_implementation=None):
     validate_vsp_gradient_config(model_args)
     if vsp_gradient_requested and not model_args.cka_loss:
         rank0_print("Warning: VSP gradient diagnostics/controller has no effect unless --cka_loss is enabled.")
-    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
+    if (vsp_gradient_requested or model_args.cka_loss or model_args.pre_loss or model_args.ross_enable or getattr(training_args, "protected_stage2", False)) and training_args.gradient_checkpointing:
         if not hasattr(training_args, "gradient_checkpointing_kwargs"):
             raise ValueError(
                 "VSP gradient diagnostics/controller with gradient checkpointing requires a Transformers version "
@@ -1304,6 +1348,8 @@ def train(attn_implementation=None):
     family = backbone_type(backbone_config)
     if model_args.pre_loss and family != "llama":
         raise ValueError("PRe reproduction currently supports the LLaVA-1.5 LLaMA/Vicuna backbone only.")
+    if model_args.ross_enable and family != 'llama':
+        raise ValueError('The matched ROSS implementation currently supports LLaMA/Vicuna only.')
     validate_cka_final_mlp_head_args(model_args, training_args, family=family)
     is_llama3_model = is_llama3(backbone_config)
     if model_args.version == "auto":
@@ -1345,6 +1391,13 @@ def train(attn_implementation=None):
             config.pre_loss_layer = model_args.pre_loss_layer
             config.pre_loss_weight = model_args.pre_loss_weight
             config.cka_loss = model_args.cka_loss
+        if model_args.ross_enable or hasattr(config, 'ross_enable'):
+            config.ross_enable = model_args.ross_enable
+            config.ross_loss_weight = model_args.ross_loss_weight
+            config.mm_pixel_decoder = model_args.ross_vae_path
+            config.mm_inv_projector_type = 'denoiser_vit3x'
+            config.mm_inv_hidden_size = 64
+            config.image_embed_len = 576
         if family == "mpt":
             config.attn_config["attn_impl"] = training_args.mpt_attn_impl
         else:
@@ -1376,6 +1429,13 @@ def train(attn_implementation=None):
     model.config.guided_text_select_layer = model_args.guided_text_select_layer
     model_args.text_hidden_size = model.config.hidden_size
     model.config.cka_loss = model_args.cka_loss
+    # Keep legacy/Protected CKA config signatures unchanged unless this
+    # explicitly requested relational ablation is enabled.
+    if model_args.cka_loss_objective != "cka":
+        model.config.cka_loss_objective = model_args.cka_loss_objective
+        model.config.relation_cos_weight = model_args.relation_cos_weight
+        model.config.relation_uka_weight = model_args.relation_uka_weight
+        model.config.relation_rkdd_weight = model_args.relation_rkdd_weight
     set_cka_loss_geometry_config(model.config, model_args.cka_loss_geometry)
     set_cka_final_mlp_head_config(model.config, model_args.cka_loss_final_mlp_head)
     if getattr(training_args, "protected_cka_refinement", False):
@@ -1669,6 +1729,17 @@ def train(attn_implementation=None):
         if pre_predictor is not None:
             pre_predictor.requires_grad_(True)
             pre_predictor.to(dtype=compute_dtype, device=training_args.device)
+
+        if model_args.ross_enable:
+            model.config.image_embed_len = vision_tower.num_patches
+            model.config.image_mean = vision_tower.image_processor.image_mean
+            model.config.image_std = vision_tower.image_processor.image_std
+            model.config.decode_image_size = math.isqrt(vision_tower.num_patches) * 16
+            ross_head = model.get_model().initialize_ross_modules(load_vae=True)
+            # DiT's sine/cosine positional embedding is deliberately frozen;
+            # keep the trainability assigned by the official constructor.
+            ross_head.to(dtype=compute_dtype, device=training_args.device)
+            model.get_model().pixel_decoder.requires_grad_(False)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr

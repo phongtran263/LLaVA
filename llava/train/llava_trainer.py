@@ -35,7 +35,7 @@ CKA_FINAL_MLP_HEAD_NAME = "cka_final_mlp_head.bin"
 
 
 def backward_pre_deepspeed_loss(accelerator, loss, gradient_accumulation_steps):
-    """Normalize the complete PRe objective once, bypassing output GAS hooks.
+    """Normalize the complete PRe/ROSS objective once, bypassing output GAS hooks.
 
     DeepSpeed 0.18.9 registers GAS division hooks on every returned tensor.
     CausalLMOutput exposes both loss and logits, so automatic scaling can divide
@@ -1613,7 +1613,10 @@ class LLaVATrainer(Trainer):
                         engine = self._get_deepspeed_engine(model)
                         if engine is not None:
                             engine.set_gradient_accumulation_boundary(bool(self.accelerator.sync_gradients))
-                    if self.is_deepspeed_enabled and getattr(self.model.config, 'pre_loss', False):
+                    if self.is_deepspeed_enabled and (
+                        getattr(self.model.config, 'pre_loss', False)
+                        or getattr(self.model.config, 'ross_enable', False)
+                    ):
                         backward_pre_deepspeed_loss(
                             self.accelerator, backward_loss, self.args.gradient_accumulation_steps,
                         )
@@ -1661,7 +1664,8 @@ class LLaVATrainer(Trainer):
             return super().log(logs, *args, **kwargs)
         model = self.model.module if hasattr(self.model, 'module') else self.model
 
-        if getattr(getattr(model, 'config', None), 'pre_loss', False) and torch.cuda.is_available():
+        if (getattr(getattr(model, 'config', None), 'pre_loss', False)
+                or getattr(getattr(model, 'config', None), 'ross_enable', False)) and torch.cuda.is_available():
             parameter = next(model.parameters(), None)
             if parameter is not None and parameter.device.type == 'cuda':
                 memory = torch.cuda.memory_stats(parameter.device)
@@ -1677,6 +1681,9 @@ class LLaVATrainer(Trainer):
             ('last_pre_loss', 'loss/pre_loss'),
             ('last_pre_text_loss', 'loss/pre_text_loss'),
             ('last_pre_num_patches', 'pre/num_patches'),
+            ('last_ross_loss', 'loss/ross_loss'),
+            ('last_ross_text_loss', 'loss/ross_text_loss'),
+            ('last_ross_num_images', 'ross/num_images'),
         ):
             value = getattr(model, attribute, None)
             if value is not None:
@@ -1704,6 +1711,15 @@ class LLaVATrainer(Trainer):
             logs['loss/cka_pre_final_loss'] = cka_pre_final_loss.item() if torch.is_tensor(cka_pre_final_loss) else float(cka_pre_final_loss)
         if cka_layers_loss is not None:
             logs['loss/cka_layers_loss'] = cka_layers_loss.item() if torch.is_tensor(cka_layers_loss) else float(cka_layers_loss)
+        if getattr(getattr(model, 'config', None), 'cka_loss_objective', 'cka') != 'cka':
+            # The existing CKA keys are retained for old dashboards, but make
+            # the actual relational objective explicit for new ablation runs.
+            if cka_loss is not None:
+                logs['loss/relation_loss'] = logs['loss/cka_loss']
+            if cka_projector_loss is not None:
+                logs['loss/relation_projector_loss'] = logs['loss/cka_projector_loss']
+            if cka_layers_loss is not None:
+                logs['loss/relation_hidden_loss'] = logs['loss/cka_layers_loss']
         if isinstance(cka_per_layer_losses, dict):
             for layer_name, layer_loss in sorted(cka_per_layer_losses.items()):
                 logs[f'loss/cka_layers/{layer_name}'] = layer_loss.item() if torch.is_tensor(layer_loss) else float(layer_loss)

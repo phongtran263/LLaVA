@@ -36,6 +36,18 @@ fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/pretrain-baseline/${RUN_NAME}-1/llava-pretrain}"
 OPTIONAL_CKA_ARGS=()
+if [[ -n "${OPTIM:-}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--optim "${OPTIM}")
+fi
+if [[ -n "${DATALOADER_PREFETCH_FACTOR:-}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--dataloader_prefetch_factor "${DATALOADER_PREFETCH_FACTOR}")
+fi
+if [[ -n "${DATALOADER_PERSISTENT_WORKERS:-}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--dataloader_persistent_workers "${DATALOADER_PERSISTENT_WORKERS}")
+fi
+if [[ -n "${ACCELERATOR_CONFIG:-}" ]]; then
+    OPTIONAL_CKA_ARGS+=(--accelerator_config "${ACCELERATOR_CONFIG}")
+fi
 if [[ -n "${MM_PROJECTOR_INIT_SEED:-}" ]]; then
     OPTIONAL_CKA_ARGS+=(--mm_projector_init_seed "${MM_PROJECTOR_INIT_SEED}")
 fi
@@ -62,8 +74,8 @@ if [[ -n "${WANDB_RUN_GROUP:-}" ]]; then
     COMMAND+=("WANDB_RUN_GROUP=${WANDB_RUN_GROUP}")
 fi
 COMMAND+=(
-    "${DEEPSPEED_BIN}" --include "${GPU_INCLUDE}" llava/train/train_mem.py \
-    --deepspeed ./scripts/zero2.json \
+    "${DEEPSPEED_BIN}" --include "${GPU_INCLUDE}" --master_port "${MASTER_PORT:-29500}" llava/train/train_mem.py \
+    --deepspeed "${DEEPSPEED_CONFIG:-./scripts/zero2.json}" \
     --model_name_or_path "${MODEL_NAME_OR_PATH}" \
     --force_download False \
     --version plain \
@@ -84,7 +96,7 @@ COMMAND+=(
     --bf16 True \
     --output_dir "${OUTPUT_DIR}" \
     --seed "${SEED:-42}" \
-    --num_train_epochs 1 \
+    --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
@@ -103,6 +115,10 @@ COMMAND+=(
     --report_to "${REPORT_TO:-wandb}" \
     --run_name "${RUN_NAME}" \
     --cka_loss "${CKA_LOSS_ENABLED}" \
+    --cka_loss_objective "${CKA_LOSS_OBJECTIVE:-cka}" \
+    --relation_cos_weight "${RELATION_COS_WEIGHT:-1.0}" \
+    --relation_uka_weight "${RELATION_UKA_WEIGHT:-1.0}" \
+    --relation_rkdd_weight "${RELATION_RKDD_WEIGHT:-1.0}" \
     --cka_loss_final_mlp_head "${CKA_FINAL_MLP_HEAD}" \
     --cka_loss_geometry linear \
     --cka_loss_tau "${CKA_LOSS_TAU}" \

@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 train = ["deepspeed==0.18.9", "ninja==1.13.0", "wandb==0.25.1"]
+ross = ["diffusers==0.30.0"]
 build = ["build", "twine"]
 
 [project.urls]
